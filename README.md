@@ -29,6 +29,16 @@ Works with **Claude Code**, **Cursor**, **OpenCode**, **Pi**, **Windsurf**, and 
 
 <br>
 
+> **ℹ️ Fork notice — `rpmalouin/donsetch`.** This is a deployment fork of
+> [dondai44423/donsetch](https://github.com/dondai44423/donsetch) (upstream),
+> maintained for the homelab VM (Hermes agent web research). It tracks upstream
+> `master` with **no changes to the upstream source tree** — the fork carries
+> deployment glue only: an ONNX Runtime/glibc-2.35 compatibility shim
+> (`LD_PRELOAD`), the Hermes MCP registration, and agent tooling.
+> See [FORK.md](FORK.md) for the full story.
+
+<br>
+
 ```bash
 npm install -g donsetch
 ```
