@@ -38,3 +38,23 @@ tests/pdf-corpus/*.pdf
 .cache/
 npm/binaries/
 bench/regression-results.json
+# Added by code-review-graph
+.code-review-graph/
+
+# Agent tooling — machine-specific, installed by code-review-graph
+# (AGENTS.md is committed as the canonical copy; the rest are
+# byte-identical per-machine boilerplate and MCP launcher configs)
+.claude/
+.codebuddy/
+.cursorrules
+.gemini/
+.kiro/
+.mcp.json
+opencode.jsonc
+.qoder/
+.windsurfrules
+.github/code-review-graph.instruction.md
+CLAUDE.md
+CODEBUDDY.md
+GEMINI.md
+QODER.md
