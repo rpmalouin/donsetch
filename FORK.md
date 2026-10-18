@@ -21,7 +21,7 @@ VM), which needs:
    compatibility shim, and per-machine agent tooling must live somewhere
    versioned. The fork is that place — committed and pushed with the code,
    exactly like the Yamtrack fork pattern.
-3. **Tag mirroring.** Upstream tags releases (`v2.4.1` … `v3.4.0`); the fork
+3. **Tag mirroring.** Upstream tags releases (`v2.4.1` … `v4.10.1`); the fork
    mirrors them so the local deployment can pin/roll back by tag.
 
 ## What this fork adds vs upstream
@@ -84,7 +84,17 @@ LD_PRELOAD=/opt/onnxruntime/libisoc23shim.so target/release/donsetch search "que
 - **OCR** (`extract` of scanned PDFs): `oar-ocr` downloads its models on
   first use; if its ONNX Runtime build also needs glibc ≥ 2.38, the same
   LD_PRELOAD shim covers it (untested).
-- **`web_crawl`**: uses the same core transport as search/fetch — not yet
-  exercised from this deployment.
+- **`web_crawl`**: uses the same core transport as search/fetch — verified
+  end-to-end on this deployment 2026-10-18 (example.com, 1 page, 1.2s).
+- **`web_screenshot`** (new in v4): untested here; it needs a launchable
+  Chromium, and this host runs as root, where Chrome refuses to start without
+  `--no-sandbox` (`browser.no_sandbox` / `DONGHOST_NO_SANDBOX=1`, opt-in only).
 - **Docker**: `docker-compose.yml` (upstream) builds a stdio MCP container;
   this deployment runs the native binary instead.
+
+## Sync log
+
+| Date | Upstream | Notes |
+|------|----------|-------|
+| 2026-10-18 | `v4.10.1` (752 commits past v3.4.0) | Merge, not rebase. Conflicts only in `README.md`, `AGENTS.md`, `.gitignore`; source tree byte-identical to upstream afterwards. Rebuild 4m01s, live verification (search/fetch/crawl + MCP handshake) under the LD_PRELOAD shim. Rollback: tag `pre-sync-v4.10.1`, binary at `/root/backups/donsetch-pre-v4-20261018/donsetch-v3.4.0`. |
+
