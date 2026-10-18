@@ -1,6 +1,6 @@
 [package]
 name = "donsetch"
-version = "3.4.0"
+version = "4.10.1"
 edition = "2024"
 license = "AGPL-3.0-only"
 description = "Web fetch, search and crawl for AI agents. Custom stealthy HTTP fetch tier on BoringSSL."
@@ -10,30 +10,41 @@ boring = { version = "5", features = ["mlkem"] }
 boring-sys = "5"
 foreign-types = "0.5"
 tokio-boring = "5"
+# QUIC + HTTP/3 (phase 5.1). Donsetch fork of quiche 0.29.3 with the boring
+# dep raised to ^5 so the QUIC handshake forges share one boringssl build
+# (boring/boring-sys 5.2) with tier-1 h1/h2. Upstream tag: 0.29.3; fork tag
+# donsetch-v0.29.3-1 = "quiche + boring 5" only.
+quiche = { git = "https://github.com/dondai44423/quiche", tag = "donsetch-v0.29.3-1", default-features = false, features = ["boringssl-boring-crate"] }
 tokio = { version = "1", features = ["full"] }
 url = "2"
-brotli = "8"
+brotli = "9"
+memchr = "2"
 flate2 = "1"
-zstd = "0.13"
+zstd = "0.14"
 rustls-native-certs = "0.8"
 scraper = "0.27.0"
 encoding_rs = "0.8.35"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+httpdate = "1.0.3"
+config = { version = "0.15", default-features = false, features = ["toml"] }
 tokio-tungstenite = "0.30"
 futures-util = "0.3"
 # HTTP server for MCP HTTP transport (axum, SSE). Optional: gates
 # the --http flag. Adds significant compile time (axum + tower-http).
-axum = { version = "0.7", default-features = false, features = ["http1", "tokio", "json"], optional = true }
-tower-http = { version = "0.5", features = ["cors", "trace"], optional = true }
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json"], optional = true }
+tower-http = { version = "0.6", features = ["cors", "trace"], optional = true }
 libc = "0.2"
 dirs = "6"
 unicode-bidi = "0.3"
 # OCR tier (Tier B) — PP-OCR via ONNX Runtime, lazy model cache.
 oar-ocr = { version = "0.9", default-features = false, features = ["download-binaries", "simd"], optional = true }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"], optional = true }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "blocking"] }
 sha2 = "0.11"
+base64 = "0.23"
+ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
+zip = { version = "2", default-features = false, features = ["deflate"] }
 # Probe mode (must_contain): pattern verification against fetched
 # content. Pure Rust, no unsafe.
 regex = "1"
@@ -42,39 +53,128 @@ tar = "0.4"
 semver = "1"
 # Agent CLI: spec-driven command generation (builder API, no derive).
 clap = { version = "4", default-features = false, features = ["std", "help", "usage", "error-context", "suggestions"] }
-psl = { version = "=2.1.226" }
-# Semantic reranker — cross-encoder via ONNX Runtime, shares ort with OCR.
-ort = { version = "=2.0.0-rc.12", default-features = false, features = ["load-dynamic", "ndarray", "api-24"], optional = true }
+psl = { version = "=2.1.239" }
+# OCR/rerank support deps. `ort` itself goes ONLY in the per-target section
+# below, never here: Cargo unions features across every matching target
+# section, so declaring it in more than one place is how `load-dynamic` once
+# leaked onto macOS and silently stripped ONNX from those builds (the 3.3.0
+# bug — full story in src/onnx.rs). One section, one feature set, since #316.
 tokenizers = { version = "0.23", default-features = false, features = ["onig"], optional = true }
 ndarray = { version = "0.17", optional = true }
 num_cpus = { version = "1.17", optional = true }
 
-[target.'cfg(not(target_os = "linux"))'.dependencies]
-ort = { version = "=2.0.0-rc.12", default-features = false, features = ["std", "ndarray", "download-binaries", "tls-native", "copy-dylibs", "api-24"], optional = true }
+# Every ONNX target dlopen's Microsoft's shared library at runtime: the
+# prebuilt static archives run unguarded AVX in C++ global constructors and
+# SIGILL pre-`main` on non-AVX CPUs (#57, #277), and one `load-dynamic`
+# config removes the feature-union hazard the old Linux/Windows vs macOS
+# split carried (#316). build.rs pins the version (1.24.2 Linux/Windows;
+# 1.23.2 macOS, the last Developer-ID-signed macOS build) and its sha256,
+# and the library sits beside the binary, loaded from there at runtime.
+[target.'cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))'.dependencies]
+ort = { version = "=2.0.0-rc.12", default-features = false, features = ["load-dynamic", "ndarray", "api-23"], optional = true }
 
 [features]
 # No default features — the core tool (fetch, search, crawl, PDF)
 # works standalone. OCR and semantic reranking pull in ONNX Runtime,
 # a heavy C++ dependency whose static global constructors can deadlock
-# on some platforms (notably aarch64 Linux, see issue #9). CI and release
-# builds explicitly enable both with `--features ocr,rerank`.
+# on some platforms (notably aarch64 Linux, see issue #9). `http` adds the
+# axum HTTP transport. CI and release builds pick features per target: the
+# full `--features ocr,rerank,http` where supported, fewer or none elsewhere
+# (see the matrices in .github/workflows/ci.yml and release.yml).
 default = []
 ocr = ["dep:oar-ocr", "dep:image", "reqwest/blocking"]
 rerank = ["dep:ort", "dep:tokenizers", "dep:ndarray", "dep:num_cpus", "reqwest/blocking"]
 http = ["dep:axum", "dep:tower-http"]
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_System_JobObjects", "Win32_System_Threading", "Win32_Security", "Win32_Foundation", "Win32_System_Console", "Win32_System_Registry"] }
+windows-sys = { version = "0.61", features = ["Win32_System_JobObjects", "Win32_System_Threading", "Win32_Security", "Win32_Foundation", "Win32_System_Console", "Win32_System_Registry", "Win32_System_Pipes"] }
 
 [dev-dependencies]
+# The owned-browser pixel test decodes a PNG; the optional runtime dep
+# rides the ocr feature, and no-feature test builds (CI linux-aarch64,
+# windows) must still compile the test.
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+rcgen = "0.14"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "gzip", "brotli"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls-pki-types = { version = "1", default-features = false }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+# Paused-time tests (Builder::start_paused via #[tokio::test]): the
+# stall-vs-wall semantics run against the real 30s constants without
+# sleeping 30 real seconds.
+tokio = { version = "1", features = ["test-util"] }
 
 [build-dependencies]
 sha2 = "0.11"
-lzma-rust2 = "0.15"
+flate2 = "1"
+# Microsoft ships the Windows ONNX Runtime as a zip; same pin as the
+# runtime dependency above, so the lock is unchanged.
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+# cfg() on build-dependencies resolves against the HOST, not the target, so this
+# only applies when building *on* Windows -- matching the #[cfg(windows)] gate on
+# the version-resource code in build.rs. Cross-compiling to Windows from another
+# host therefore yields an exe with no version resource; if that is ever needed,
+# move this to the plain [build-dependencies] above and drop the #[cfg(windows)]
+# in build.rs.
+[target.'cfg(windows)'.build-dependencies]
+# default-features = false drops the "toml" feature, which only exists to parse
+# [package.metadata.winresource]; build.rs sets every field programmatically.
+winresource = { version = "0.1", default-features = false }
+
+# Every diagnostic goes through `diag!` (src/diag.rs): std's stderr
+# print macros panic when the write fails, and the shipped profile is
+# `panic = "abort"`, so a closed stderr pipe aborted the MCP daemon
+# mid-session (#364). Denied at the package level so a raw stderr print
+# cannot come back -- `just lint` and CI fail on one. `writeln!` to
+# stderr is what `diag!` expands to, so it is not flagged.
+[lints.clippy]
+print_stderr = "deny"
 
 [profile.release]
 lto = "fat"
 codegen-units = 1
 strip = true
 panic = "abort"
+
+# The LOCAL loop profile: the default for `just check`, `just t`,
+# `just lint` and `just bin`. Debug codegen for this crate (an edit
+# rebuilds in seconds instead of the 8-12 min an opt-level-3 whole-crate
+# recompile cost under the RAM-bounded job cap), deps at opt-level 1
+# (unoptimized deps made the suite crawl, and the debug graph hit 21G),
+# no debuginfo (linking 91k LOC + 512 deps with full DWARF is its own
+# tax), incremental for the edit-test loop.
+#
+# CI still runs the `ci` profile below: release opts, panic=abort, the
+# same shape the binary ships. `just tci` / `just bin-ci` use it when the
+# question is release-profile behavior specifically, and `just heavy`
+# (soak, corpus, landmarks, live) runs there because those tests measure
+# time and memory.
+[profile.fast]
+inherits = "dev"
+debug = 0
+incremental = true
+
+[profile.fast.package."*"]
+opt-level = 1
+
+# Test/workflow profile: release optimizations minus fat LTO.
+#
+# Fat LTO makes every test-binary link minutes long (111 binaries
+# in this repo). Tests don't need cross-crate inlining; the shipped
+# binary still gets full fat LTO via the `release` profile built
+# only at release time. `panic = "abort"` is inherited so the
+# daemon-abort behavior stays faithful in tests, and opt-level 3
+# keeps runtime-sensitive tests honest.
+[profile.ci]
+inherits = "release"
+lto = false
+codegen-units = 256
+
+# Dependencies compile at opt-level 1: cold-graph rebuilds (each
+# dependabot bump or feature flip recompiles the whole deps tree,
+# the 90% of the pain) get ~2-3x faster codegen. The local crate
+# keeps the inherited opt-level 3 so the runtime-sensitive tests
+# stay honest. Test binaries run on opt-1 dep object code only.
+[profile.ci.package."*"]
+opt-level = 1

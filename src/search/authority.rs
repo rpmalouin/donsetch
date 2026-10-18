@@ -1,9 +1,9 @@
-//! authority.rs — the decisive top-placement layer.
+//! authority.rs : the decisive top-placement layer.
 //!
 //! History: v1 ranking had excellent top-5 recall (23/25 in the
 //! 50-case benchmark) but weak top-1/top-3 placement (6/25 top-1
-//! vs hound's 13/25). The recall machinery — cross-engine
-//! consensus, family-deduped RRF, BM25, coverage penalties —
+//! vs hound's 13/25). The recall machinery : cross-engine
+//! consensus, family-deduped RRF, BM25, coverage penalties :
 //! reliably puts the RIGHT result IN the list, but nothing made
 //! a decisive #1 choice: the domain prior was a flat +0.15 on
 //! the wrong scale, and the cross-encoder blend (60/40, min-max
@@ -14,8 +14,8 @@
 //! final blended score) and multiplies in three signals:
 //!
 //! 1. **Query-aware official domains.** A "rust ownership" query
-//!    maps to rust-lang.org/docs.rs — the OFFICIAL sources for
-//!    the thing the query names — via a curated registry of
+//!    maps to rust-lang.org/docs.rs : the OFFICIAL sources for
+//!    the thing the query names : via a curated registry of
 //!    tech-token → official-domain mappings. Generic
 //!    (non-query-aware) authority tables from `intent::domain_prior`
 //!    get a smaller lift.
@@ -41,6 +41,9 @@ use super::rank::{Merged, host_of};
 /// combined (next + js, spring + boot, go + concurrency) are
 /// encoded as multi-token entries so they can't fire alone.
 const OFFICIAL: &[(&[&str], &[&str])] = &[
+    // Product names require context: "uplift" alone is ordinary prose.
+    (&["uplift", "desk"], &["upliftdesk.com"]),
+    (&["vari", "desk"], &["vari.com"]),
     // ── Languages & runtimes ──
     (
         &["rust"],
@@ -222,7 +225,7 @@ const OFFICIAL: &[(&[&str], &[&str])] = &[
 ];
 
 /// Meta-words about the SEARCH ITSELF, never about the target
-/// entity — excluded from title-coverage requirements. "docs"
+/// entity : excluded from title-coverage requirements. "docs"
 /// and "news" describe what the agent wants, not what the page
 /// is about; requiring them in titles would punish the best
 /// results (official doc pages often don't say "docs" in the
@@ -281,7 +284,7 @@ const TITLE_STOPWORDS: &[&str] = &[
     "when",
 ];
 
-/// Docs-seeking queries amplify the official boost — when the
+/// Docs-seeking queries amplify the official boost : when the
 /// agent explicitly asks for documentation, official sources are
 /// near-certain to be the intended #1.
 const DOCS_WORDS: &[&str] = &[
@@ -341,7 +344,7 @@ fn query_tokens(query: &str) -> Vec<String> {
 }
 
 /// Official domains for THIS query: registry entries whose token
-/// set ⊆ query tokens. Empty when nothing matches — the layer
+/// set ⊆ query tokens. Empty when nothing matches : the layer
 /// then no-ops (non-tech queries are untouched).
 pub fn official_domains(query: &str) -> Vec<&'static str> {
     let toks = query_tokens(query);
@@ -353,6 +356,31 @@ pub fn official_domains(query: &str) -> Vec<&'static str> {
         }
     }
     out
+}
+
+/// Bounded operator-only recall: preserve the caller's words and retrieve
+/// actual engine hits from matching primary sources. Explicit site wins.
+pub(super) fn official_queries(compiled: &super::query::CompiledQuery) -> Vec<String> {
+    if compiled.has_operators() {
+        return Vec::new();
+    }
+    let mut domains: Vec<&str> = Vec::new();
+    for domain in official_domains(&compiled.text) {
+        if domains
+            .iter()
+            .any(|parent| domain == *parent || domain.ends_with(&format!(".{parent}")))
+        {
+            continue;
+        }
+        domains.push(domain);
+        if domains.len() == 2 {
+            break;
+        }
+    }
+    domains
+        .into_iter()
+        .map(|domain| format!("{} site:{domain}", compiled.text))
+        .collect()
 }
 
 fn docs_seeking(query: &str) -> bool {
@@ -371,7 +399,7 @@ fn host_matches(host: &str, domain: &str) -> bool {
 
 /// Fraction of query ENTITY terms present in the title.
 /// Meta-words (TITLE_STOPWORDS) are excluded from both sides of
-/// the ratio — the signal is entity match, not filler match.
+/// the ratio : the signal is entity match, not filler match.
 fn title_terms_ratio(query: &str, title: &str) -> f64 {
     let q = query.to_lowercase();
     let terms: Vec<&str> = q
@@ -413,7 +441,11 @@ fn freshness_mult(published: &Option<String>) -> f64 {
         return 1.0;
     };
     match days_old {
-        0..=1 => 1.5,
+        // Negative = future-dated (a GMT pubDate ahead of a local
+        // clock near midnight): fresh, not stale. The lower-open arm
+        // is what makes iso_days_ago's "clamped to fresh" true; a
+        // `0..=1` arm sent every negative value to the stale 0.85.
+        ..=1 => 1.5,
         2..=3 => 1.3,
         4..=7 => 1.15,
         8..=30 => 1.0,
@@ -428,7 +460,11 @@ fn iso_days_ago(iso: &str) -> Option<i64> {
     let y: i64 = it.next()?.parse().ok()?;
     let m: i64 = it.next()?.parse().ok()?;
     let d: i64 = it.next()?.parse().ok()?;
-    if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+    // The year is provider text (an RSS pubDate token, parsed as
+    // i64): days_from_civil does era * 146_097 on it, which
+    // overflows past ~6e13 and wraps into a garbage age in release.
+    // A date outside the Gregorian range is not a date.
+    if !(1..=9999).contains(&y) || !(1..=12).contains(&m) || !(1..=31).contains(&d) {
         return None;
     }
     let then = days_from_civil(y, m, d);
@@ -436,7 +472,7 @@ fn iso_days_ago(iso: &str) -> Option<i64> {
     Some(now - then)
 }
 
-/// Howard Hinnant's days_from_civil — proleptic Gregorian.
+/// Howard Hinnant's days_from_civil : proleptic Gregorian.
 fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };
     let era = if y >= 0 { y } else { y - 399 } / 400;
@@ -472,12 +508,23 @@ fn civil_from_days(z: i64) -> String {
 
 /// The decisive top-placement layer. Called from
 /// `rank::merge` AFTER rerank + coverage, BEFORE the final
-/// sort — the same slot the coverage penalty proved effective
+/// sort : the same slot the coverage penalty proved effective
 /// in (the layer the cross-encoder blend cannot wash out).
 pub fn apply(query: &str, intent: Intent, results: &mut [Merged]) {
     let official = official_domains(query);
     let docs_seek = docs_seeking(query);
     let paper_seek = paper_seeking(query);
+    let query_words: Vec<_> = query
+        .split(|c: char| !c.is_alphanumeric())
+        .map(str::to_lowercase)
+        .collect();
+    let wants_benchmark = intent == Intent::Paper
+        && query_words
+            .iter()
+            .any(|w| matches!(w.as_str(), "benchmark" | "benchmarks"))
+        && !query_words
+            .iter()
+            .any(|w| matches!(w.as_str(), "survey" | "surveys" | "review" | "reviews"));
     for r in results.iter_mut() {
         let host = host_of(&r.url);
         let mut m = 1.0;
@@ -501,7 +548,7 @@ pub fn apply(query: &str, intent: Intent, results: &mut [Merged]) {
             m *= PAPER_SEEK_MULT;
         }
 
-        // Title decisiveness — the placement signal the 60/40
+        // Title decisiveness : the placement signal the 60/40
         // blend dilutes. Applied to every result: it reorders
         // results by entity-title match, independent of domain.
         let ratio = title_terms_ratio(query, &r.title);
@@ -517,6 +564,17 @@ pub fn apply(query: &str, intent: Intent, results: &mut [Merged]) {
             m *= freshness_mult(&r.published);
         }
 
+        // A survey about benchmarks is useful background, but does not
+        // replace the evaluation the caller asked for. Explicit survey
+        // queries retain their normal ranking; no domain is blacklisted.
+        if wants_benchmark
+            && r.title
+                .split(|c: char| !c.is_alphanumeric())
+                .any(|w| w.eq_ignore_ascii_case("survey") || w.eq_ignore_ascii_case("review"))
+        {
+            m *= 0.65;
+        }
+
         r.score *= m;
     }
 }
@@ -524,6 +582,58 @@ pub fn apply(query: &str, intent: Intent, results: &mut [Merged]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A Google News pubDate is provider text; rss_date_to_iso copies
+    // its year token verbatim. i64::MAX as a year overflowed
+    // days_from_civil's era * 146_097 (panic under overflow checks,
+    // a wrapped garbage age in release).
+    #[test]
+    fn wave450_official_recall_is_bounded_and_respects_explicit_operators() {
+        let queries = official_queries(&super::super::query::compile(
+            "best standing desk 2026 Uplift vs Vari",
+        ));
+        assert_eq!(queries.len(), 2);
+        assert!(queries.iter().any(|q| q.ends_with("site:upliftdesk.com")));
+        assert!(queries.iter().any(|q| q.ends_with("site:vari.com")));
+        assert!(
+            queries
+                .iter()
+                .all(|q| q.starts_with("best standing desk 2026 Uplift vs Vari "))
+        );
+        assert!(
+            official_queries(&super::super::query::compile(
+                "uplift in economic productivity"
+            ))
+            .is_empty()
+        );
+        assert!(
+            official_queries(&super::super::query::compile(
+                "rust ownership site:example.com"
+            ))
+            .is_empty()
+        );
+        let queries = official_queries(&super::super::query::compile("rust tokio documentation"));
+        assert_eq!(queries.len(), 2);
+        assert!(
+            !queries.iter().any(|q| q.contains("site:doc.rust-lang.org")),
+            "a parent-domain query already covers the subdomain"
+        );
+    }
+
+    #[test]
+    fn an_absurd_year_is_not_a_date_and_does_not_overflow() {
+        assert_eq!(iso_days_ago("9223372036854775807-01-01"), None);
+        assert_eq!(iso_days_ago("-9223372036854775808-01-01"), None);
+        assert_eq!(iso_days_ago("99999999999-06-15"), None);
+        assert_eq!(iso_days_ago("0-01-01"), None);
+        assert!(iso_days_ago("2026-01-01").is_some());
+        assert!(iso_days_ago("9999-12-31").is_some());
+        let iso = crate::search::verticals::rss_date_to_iso(
+            "Thu, 01 Jan 9223372036854775807 00:00:00 GMT",
+        )
+        .unwrap();
+        assert_eq!(iso_days_ago(&iso), None);
+    }
 
     #[test]
     fn official_domains_simple_token() {
@@ -571,6 +681,40 @@ mod tests {
             score,
             published: None,
         }
+    }
+
+    #[test]
+    fn wave450_benchmark_queries_prefer_evaluations_but_keep_requested_surveys() {
+        let mut rs = vec![
+            merged("RAG benchmarks survey", "https://arxiv.org/abs/one", 0.8),
+            merged(
+                "RAG benchmarks evaluation",
+                "https://arxiv.org/abs/two",
+                0.7,
+            ),
+        ];
+        apply("RAG benchmarks", Intent::Paper, &mut rs);
+        assert!(
+            rs[1].score > rs[0].score,
+            "benchmark evidence must beat a similarly relevant survey"
+        );
+        let mut rs = vec![
+            merged("RAG benchmarks survey", "https://arxiv.org/abs/one", 0.8),
+            merged(
+                "RAG benchmarks evaluation",
+                "https://arxiv.org/abs/two",
+                0.7,
+            ),
+        ];
+        apply("RAG benchmarks survey", Intent::Paper, &mut rs);
+        assert!(rs[0].score > rs[1].score);
+    }
+
+    #[test]
+    fn wave450_desk_vendor_sources_require_product_context() {
+        assert!(official_domains("Uplift vs Vari standing desk").contains(&"upliftdesk.com"));
+        assert!(official_domains("Uplift vs Vari standing desk").contains(&"vari.com"));
+        assert!(official_domains("uplift in economic productivity").is_empty());
     }
 
     #[test]
@@ -654,7 +798,7 @@ mod tests {
 
     #[test]
     fn freshness_prefers_recent() {
-        // Relative check — no pinned "today".
+        // Relative check : no pinned "today".
         let now = epoch_days_now();
         let iso_now = civil_from_days(now);
         let iso_old = civil_from_days(now - 400);
@@ -667,14 +811,38 @@ mod tests {
 
     #[test]
     fn freshness_tiers_parse_iso_prefix() {
-        // "2026-08-16" is a recent date → some freshness tier boost.
-        let f = freshness_mult(&Some("2026-08-16".into()));
-        assert!(
-            f >= 1.0,
-            "freshness should be >= 1.0 for a parseable date, got {f}"
-        );
+        // Relative to today: a literal date here silently walks out
+        // of the 30-day neutral tier and starts failing the build
+        // (the previous "2026-08-16" would have from 2026-09-16).
+        let now = epoch_days_now();
+        let tiers = [
+            (0, 1.5),
+            (1, 1.5),
+            (2, 1.3),
+            (3, 1.3),
+            (4, 1.15),
+            (7, 1.15),
+            (8, 1.0),
+            (30, 1.0),
+            (31, 0.85),
+            (400, 0.85),
+        ];
+        for (age, want) in tiers {
+            let iso = civil_from_days(now - age);
+            let got = freshness_mult(&Some(iso.clone()));
+            assert_eq!(got, want, "{age} days old ({iso})");
+        }
         // Unparseable → neutral.
         assert_eq!(freshness_mult(&Some("garbage".into())), 1.0);
+    }
+
+    #[test]
+    fn freshness_treats_future_dates_as_fresh() {
+        let now = epoch_days_now();
+        for ahead in [1, 2, 30] {
+            let iso = civil_from_days(now + ahead);
+            assert_eq!(freshness_mult(&Some(iso.clone())), 1.5, "{iso}");
+        }
     }
 
     #[test]

@@ -22,6 +22,13 @@
 // of the downloaded tarball is verified against a pinned map and is
 // required — builds refuse to download when no pinned hash exists.
 
+// The package lint denies raw stderr prints so a failed diagnostic write
+// can never abort the shipped process (src/diag.rs, #364). A build script
+// cannot reach the library's `diag!`, and it is not that process: its
+// stderr is cargo's own progress channel, and a failed write there fails
+// the build loudly rather than aborting a live session.
+#![allow(clippy::print_stderr)]
+
 use std::env;
 use std::fs;
 use std::io::Read;
@@ -199,6 +206,10 @@ fn main() {
     // always re-runs this build script and triggers the download.
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=vendor/pdfium/lib");
+    // The version resource is derived from these two files alone, so a version
+    // bump or a rename must re-run this script or the exe keeps a stale one.
+    println!("cargo:rerun-if-changed=Cargo.toml");
+    println!("cargo:rerun-if-changed=src/display_name.rs");
 
     // ── LLD auto-detection (Linux) ────────────────────────────
     //
@@ -254,6 +265,10 @@ fn main() {
         }
     }
 
+    // ── Windows version resource ──────────────────────────────
+    // The metadata Explorer, Task Manager and Get-Command read off the exe.
+    stamp_version_resource(&os);
+
     // ── aarch64 + ONNX note ──────────────────────────────────
     //
     // ONNX Runtime is now dynamically loaded (ort load-dynamic).
@@ -279,31 +294,65 @@ fn main() {
         env::var_os("CARGO_FEATURE_OCR").is_some() || env::var_os("CARGO_FEATURE_RERANK").is_some();
     if has_onnx {
         if let Some(info) = onnx_target_info(&os, &arch) {
-            // Linux x86_64: build shared lib for dynamic loading.
-            build_onnx_shared_lib(info, &manifest);
+            // Every ONNX target fetches Microsoft's shared library
+            // for dynamic loading and places it beside the binary
+            // (dev builds included, #298 review; macOS since #316).
+            fetch_onnx_prebuilt(info, &manifest);
         } else {
-            // macOS/Windows: ort crate uses download-binaries (static
-            // linking). No shared library build needed.
-            eprintln!("donsetch build: OCR/rerank enabled, ort static link for {os}-{arch}");
+            // Anything without a pinned prebuilt (aarch64 Linux's
+            // loader deadlocks; Android is unsupported): the
+            // features compile and report unavailable at runtime.
+            eprintln!(
+                "donsetch build: OCR/rerank enabled, no pinned ONNX prebuilt for {os}-{arch}"
+            );
         }
     }
 
     // ── Compile-time metadata for `donsetch -v` ────────────────
     // Captured here so the binary self-reports its build identity.
 
-    // Git short hash (best-effort — may not be a git repo).
-    if let Ok(out) = Command::new("git")
+    // Git resolves linked worktrees and packed refs; watching .git alone
+    // misses commits on an existing branch and caches an old build identity.
+    let branch = Command::new("git")
+        .args(["symbolic-ref", "-q", "HEAD"])
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .and_then(|out| String::from_utf8(out.stdout).ok());
+    for name in ["HEAD", "packed-refs"]
+        .into_iter()
+        .chain(branch.as_deref().map(str::trim))
+    {
+        if let Ok(out) = Command::new("git")
+            .args(["rev-parse", "--git-path", name])
+            .output()
+            && out.status.success()
+            && let Ok(path) = String::from_utf8(out.stdout)
+        {
+            let path = Path::new(path.trim());
+            // Cargo treats a missing watched file as perpetually changed.
+            // A packed branch watches its existing parent for a new loose ref.
+            let watched = if name == "packed-refs" {
+                path.exists().then_some(path)
+            } else {
+                path.ancestors().find(|parent| parent.exists())
+            };
+            if let Some(watched) = watched {
+                println!("cargo:rerun-if-changed={}", watched.display());
+            }
+        }
+    }
+    let hash = Command::new("git")
         .args(["rev-parse", "--short", "HEAD"])
         .output()
-    {
-        if let Ok(s) = String::from_utf8(out.stdout) {
-            println!("cargo:rustc-env=DONSHEET_GIT_HASH={}", s.trim());
-        } else {
-            println!("cargo:rustc-env=DONSHEET_GIT_HASH=unknown");
-        }
-    } else {
-        println!("cargo:rustc-env=DONSHEET_GIT_HASH=unknown");
-    }
+        .ok()
+        .filter(|out| out.status.success())
+        .and_then(|out| String::from_utf8(out.stdout).ok())
+        .filter(|hash| !hash.trim().is_empty());
+    println!(
+        "cargo:rustc-env=DONSETCH_GIT_HASH={}",
+        hash.as_deref().map(str::trim).unwrap_or("unknown")
+    );
 
     // PDFium variant string.
     let pdfium_tag = if is_shared {
@@ -312,7 +361,7 @@ fn main() {
         PDFIUM_STATIC_TAG
     };
     let pdfium_kind = if is_shared { "shared" } else { "static" };
-    println!("cargo:rustc-env=DONSHEET_PDFIUM={pdfium_kind}, {pdfium_tag}");
+    println!("cargo:rustc-env=DONSETCH_PDFIUM={pdfium_kind}, {pdfium_tag}");
 
     // Target triple.
     let triple = match (os.as_str(), arch.as_str()) {
@@ -326,22 +375,47 @@ fn main() {
         ("windows", "aarch64") => "aarch64-pc-windows-msvc",
         _ => "unknown",
     };
-    println!("cargo:rustc-env=DONSHEET_TARGET={triple}");
+    println!("cargo:rustc-env=DONSETCH_TARGET={triple}");
 
     // Enabled feature flags.
-    let mut feats = Vec::new();
-    if env::var_os("CARGO_FEATURE_OCR").is_some() {
-        feats.push("ocr");
-    }
-    if env::var_os("CARGO_FEATURE_RERANK").is_some() {
-        feats.push("rerank");
-    }
+    //
+    // Read from the environment rather than a hand-written list: Cargo sets
+    // CARGO_FEATURE_<NAME> for every enabled feature of this package, so a
+    // feature added to Cargo.toml shows up in `--version` without touching
+    // this code. The old hardcoded pair is why `http` was never reported.
+    //
+    // The name is recovered by lowercasing, which cannot distinguish a
+    // feature spelled with `-` from one spelled with `_` (Cargo maps both to
+    // `_`). Every feature here is a single word; a hyphenated one would be
+    // displayed with an underscore.
+    //
+    // Names are restricted to the characters Cargo can produce here. The value
+    // of a `cargo:rustc-env=` line runs to the end of the line and has no
+    // escape syntax, so a name carrying a newline would inject a second
+    // directive; `vars_os` is used because `vars` panics on an environment
+    // holding any non-UTF-8 entry, feature-related or not.
+    let mut feats: Vec<String> = env::vars_os()
+        .filter_map(|(k, _)| {
+            let name = k.to_str()?.strip_prefix("CARGO_FEATURE_")?;
+            // `default` is a feature like any other and Cargo exports it, but
+            // it is empty here: it would only report whether
+            // --no-default-features was passed. Any member it ever gains is
+            // listed on its own.
+            if name == "DEFAULT" {
+                return None;
+            }
+            (!name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'))
+                .then(|| name.to_ascii_lowercase())
+        })
+        .collect();
+    // Deterministic order: env iteration order is not guaranteed.
+    feats.sort();
     let feats_display = if feats.is_empty() {
         "(none)".to_string()
     } else {
         feats.join(", ")
     };
-    println!("cargo:rustc-env=DONSHEET_FEATURES={feats_display}");
+    println!("cargo:rustc-env=DONSETCH_FEATURES={feats_display}");
 }
 
 fn target_pair(os: &str, arch: &str) -> &'static str {
@@ -465,50 +539,108 @@ fn fetch_pdfium(os: &str, arch: &str, vendored: &Path) {
 }
 
 /// Pinned ONNX Runtime tarball info per platform.
-/// Source: pyke CDN (cdn.pyke.io), ort-sys 2.0.0-rc.12.
-/// Hashes verified from the ort-sys dist.txt.
+/// Source: microsoft/onnxruntime official GitHub releases: v1.24.2 for
+/// Linux/Windows (the prebuilt shared library; built against older
+/// glibc than the pyke archive relink we used before, GLIBC_2.27 max
+/// required vs 2.38, and free of `__isoc23_*`/2.38-only imports, so
+/// OCR/rerank work on every distro from Ubuntu 18.04 onward), and
+/// v1.23.2 for macOS (#316: the last Developer-ID-signed macOS build;
+/// 1.24.2+ mac tarballs are ad-hoc signed and raise the minimum to
+/// macOS 14, while 1.23.2 asks 13.4). SHA256 pins verified at download.
 struct OnnxTarget {
     url: &'static str,
     sha256: &'static str,
-    /// Static archive filename inside the tarball.
-    archive_name: &'static str,
-    /// Shared library filename to produce.
+    /// Path of the real shared library inside the archive.
+    inner_lib: &'static str,
+    /// File name we ship it as, next to the binary.
     shared_name: &'static str,
+    /// How Microsoft packaged this target's release.
+    archive: OnnxArchive,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OnnxArchive {
+    /// `.tgz` (Linux): a gzip'd tar.
+    Tgz,
+    /// `.zip` (Windows).
+    Zip,
 }
 
 /// Return ONNX target info if a prebuilt is available for this platform.
-/// Only Linux x86_64 uses dynamic loading. macOS/Windows use static
-/// linking (no shared library build needed).
+/// Every ONNX target uses runtime dlopen of the official prebuilt: Linux
+/// x86_64 and Windows x64 since #298, both macOS arches since #316.
+/// Linux aarch64 is deliberately absent (the official aarch64 prebuilt
+/// deadlocks in the loader; see the NOTE in the match below).
 fn onnx_target_info(os: &str, arch: &str) -> Option<OnnxTarget> {
-    let (url, sha256, archive_name, shared_name) = match (os, arch) {
+    let (url, sha256, inner_lib, shared_name, archive) = match (os, arch) {
         ("linux", "x86_64") => (
-            "https://cdn.pyke.io/0/pyke:ort-rs/ms@1.24.2/x86_64-unknown-linux-gnu.tar.lzma2",
-            "acc1cba79c337594ead1d88ca72516147aa60054c84217b53399a31caa5ba671",
-            "libonnxruntime.a",
+            "https://github.com/microsoft/onnxruntime/releases/download/v1.24.2/onnxruntime-linux-x64-1.24.2.tgz",
+            "43725474ba5663642e17684717946693850e2005efbd724ac72da278fead25e6",
+            "onnxruntime-linux-x64-1.24.2/lib/libonnxruntime.so.1.24.2",
             "libonnxruntime.so",
+            OnnxArchive::Tgz,
         ),
+        // Windows x64: the same release, Microsoft's CPU-only build
+        // (no DirectML import). Loaded at runtime like the Linux .so
+        // (#277, #298); the exe no longer links ONNX statically.
+        ("windows", "x86_64") => (
+            "https://github.com/microsoft/onnxruntime/releases/download/v1.24.2/onnxruntime-win-x64-1.24.2.zip",
+            "8e3e9c826375352e29cb2614fe44f3d7a4b0ff7b8028ad7a456af9d949a7e8b0",
+            "onnxruntime-win-x64-1.24.2/lib/onnxruntime.dll",
+            "onnxruntime.dll",
+            OnnxArchive::Zip,
+        ),
+        // macOS (#316), both arches: Microsoft's last signed mac
+        // builds. 1.24.2+ mac tarballs exist but are ad-hoc signed
+        // only and raise the minimum to macOS 14; 1.23.2 is the last
+        // Developer-ID-signed release and asks 13.4 (verified in
+        // review: CMS blob, Microsoft Corporation UBF8T346G9). The
+        // crate's api-23 floor serves it, the GetApi table is
+        // append-only.
+        ("macos", "aarch64") => (
+            "https://github.com/microsoft/onnxruntime/releases/download/v1.23.2/onnxruntime-osx-arm64-1.23.2.tgz",
+            "b4d513ab2b26f088c66891dbbc1408166708773d7cc4163de7bdca0e9bbb7856",
+            "onnxruntime-osx-arm64-1.23.2/lib/libonnxruntime.1.23.2.dylib",
+            "libonnxruntime.dylib",
+            OnnxArchive::Tgz,
+        ),
+        ("macos", "x86_64") => (
+            "https://github.com/microsoft/onnxruntime/releases/download/v1.23.2/onnxruntime-osx-x86_64-1.23.2.tgz",
+            "d10359e16347b57d9959f7e80a225a5b4a66ed7d7e007274a15cae86836485a6",
+            "onnxruntime-osx-x86_64-1.23.2/lib/libonnxruntime.1.23.2.dylib",
+            "libonnxruntime.dylib",
+            OnnxArchive::Tgz,
+        ),
+        // NOTE: onnxruntime-linux-aarch64-1.24.2 exists but dlopen'ing
+        // it from this binary deadlocks inside the loader on native
+        // aarch64 (proven by the CI payload probe timing out at its
+        // exact 15s guard in the v3.4.2 arm64 experiment). Same
+        // family as pykeio/ort #579. ARM64 therefore ships without
+        // OCR/rerank (doctor reports "not compiled"; the honest
+        // guard message explains it where relevant).
         _ => return None,
     };
     Some(OnnxTarget {
         url,
         sha256,
-        archive_name,
+        inner_lib,
         shared_name,
+        archive,
     })
 }
 
-/// Download the ONNX tarball, decompress (custom LZMA2), extract the
-/// static archive, build a shared library from it, and copy to the
-/// output directory. This replaces ort-sys's static linking with a
-/// runtime dlopen approach to avoid SIGILL on non-AVX CPUs.
-fn build_onnx_shared_lib(info: OnnxTarget, manifest: &Path) {
+/// Download the official ONNX Runtime prebuilt, verify its SHA256, and
+/// copy it next to the binary for runtime dlopen. Used on every ONNX
+/// target (Linux x86_64 and Windows x64 since #298; both macOS arches
+/// since #316): the ort-sys static relink is gone, so builds no longer
+/// need a working C toolchain or pay a 110MB static extraction.
+fn fetch_onnx_prebuilt(info: OnnxTarget, manifest: &Path) {
     let vendored = manifest.join("vendor").join("onnx");
     let _ = fs::create_dir_all(&vendored);
-    let archive_path = vendored.join(info.archive_name);
     let shared_path = vendored.join(info.shared_name);
 
-    // If the shared library already exists, skip the download+build.
-    // The vendored dir is cleaned on `cargo clean`.
+    // If the shared library already exists, skip the download. The
+    // vendored dir is cleaned on `cargo clean`.
     if shared_path.exists() {
         eprintln!(
             "donsetch build: ONNX shared lib already present at {}",
@@ -518,55 +650,99 @@ fn build_onnx_shared_lib(info: OnnxTarget, manifest: &Path) {
         return;
     }
 
-    // 1. Download the tarball.
-    let tarball = vendored.join("onnx.tar.lzma2");
-    if !archive_path.exists() {
-        eprintln!("donsetch build: fetching ONNX Runtime from {}", info.url);
-        let status = Command::new("curl")
-            .args([
-                "-fSL",
-                "--proto",
-                "=https",
-                "--proto-redir",
-                "=https",
-                "--retry",
-                "3",
-                "-o",
-            ])
-            .arg(&tarball)
-            .arg(info.url)
-            .status()
-            .unwrap_or_else(|e| panic!("ONNX: failed to spawn curl ({e})"));
-        if !status.success() {
-            panic!("ONNX: curl download failed for {}", info.url);
-        }
-
-        // 2. Verify SHA-256.
-        let mut f = fs::File::open(&tarball).expect("ONNX: cannot open tarball");
-        let mut buf = Vec::with_capacity(8 * 1024 * 1024);
-        f.read_to_end(&mut buf).expect("ONNX: cannot read tarball");
-        let got = sha256_hex(&buf);
-        assert_eq!(
-            got, info.sha256,
-            "ONNX: sha256 mismatch (expected {}, got {})",
-            info.sha256, got
-        );
-
-        // 3. Decompress custom LZMA2 format (pyke uses lzma-rust2, not standard xz).
-        let decompressed = lzma2_decompress(&buf);
-
-        // 4. Parse tar to extract the static archive.
-        let entry = extract_tar_entry(&decompressed, info.archive_name)
-            .unwrap_or_else(|| panic!("ONNX: {} not found in tarball", info.archive_name));
-        fs::write(&archive_path, &entry).expect("ONNX: cannot write archive");
-        let _ = fs::remove_file(&tarball);
+    // 1. Download the archive.
+    let tarball = vendored.join(match info.archive {
+        OnnxArchive::Tgz => "onnx.tgz",
+        OnnxArchive::Zip => "onnx.zip",
+    });
+    eprintln!("donsetch build: fetching ONNX Runtime from {}", info.url);
+    let status = Command::new("curl")
+        .args([
+            "-fSL",
+            "--proto",
+            "=https",
+            "--proto-redir",
+            "=https",
+            "--retry",
+            "3",
+            "-o",
+        ])
+        .arg(&tarball)
+        .arg(info.url)
+        .status()
+        .unwrap_or_else(|e| panic!("ONNX: failed to spawn curl ({e})"));
+    if !status.success() {
+        panic!("ONNX: curl download failed for {}", info.url);
     }
 
-    // 5. Build the shared library from the static archive.
-    build_shared_from_archive(&archive_path, &shared_path, info.shared_name);
+    // 2. Verify SHA-256.
+    let mut f = fs::File::open(&tarball).expect("ONNX: cannot open tarball");
+    let mut buf = Vec::with_capacity(16 * 1024 * 1024);
+    f.read_to_end(&mut buf).expect("ONNX: cannot read tarball");
+    let got = sha256_hex(&buf);
+    assert_eq!(
+        got, info.sha256,
+        "ONNX: sha256 mismatch (expected {}, got {})",
+        info.sha256, got
+    );
 
-    // 6. Copy to output directories.
+    // 3. Extract the shared library from the archive.
+    let entry = match info.archive {
+        OnnxArchive::Tgz => extract_tarball_entry(&buf, info.inner_lib),
+        OnnxArchive::Zip => extract_zip_entry(&buf, info.inner_lib),
+    }
+    .unwrap_or_else(|| panic!("ONNX: {} not found in archive", info.inner_lib));
+    fs::write(&shared_path, &entry).expect("ONNX: cannot write shared lib");
+
+    // 4. Sanity: the file must be a plausible shared library of its
+    // platform's format (ELF .so, PE DLL, Mach-O dylib).
+    assert!(
+        entry.len() > 10 * 1024 * 1024,
+        "ONNX: extracted lib is implausibly small ({} bytes)",
+        entry.len()
+    );
+    let magic_ok = match info.shared_name {
+        "onnxruntime.dll" => &entry[..2] == b"MZ",
+        // Little-endian 64-bit thin Mach-O in practice (`cf fa ed
+        // fe`, both macOS dylibs checked); the other byte orders and
+        // the fat magics match too rather than failing a valid
+        // library over packaging drift.
+        "libonnxruntime.dylib" => matches!(
+            &entry[..4],
+            [0xcf, 0xfa, 0xed, 0xfe]
+                | [0xfe, 0xed, 0xfa, 0xcf]
+                | [0xce, 0xfa, 0xed, 0xfe]
+                | [0xfe, 0xed, 0xfa, 0xce]
+                | [0xca, 0xfe, 0xba, 0xbe]
+                | [0xbe, 0xba, 0xfe, 0xca]
+        ),
+        _ => &entry[..4] == b"\x7fELF",
+    };
+    assert!(magic_ok, "ONNX: extracted file is not a shared library");
+
+    let _ = fs::remove_file(&tarball);
+
+    // 5. Copy to output directories.
     copy_onnx_shared_lib(&shared_path);
+}
+
+/// Extract one entry from a zip archive (Microsoft's Windows release).
+fn extract_zip_entry(data: &[u8], wanted: &str) -> Option<Vec<u8>> {
+    let cursor = std::io::Cursor::new(data);
+    let mut archive = zip::ZipArchive::new(cursor).ok()?;
+    let mut file = archive.by_name(wanted).ok()?;
+    let mut out = Vec::with_capacity(file.size() as usize);
+    file.read_to_end(&mut out).ok()?;
+    Some(out)
+}
+
+/// Extract one entry from a gzip-compressed tar archive (plain
+/// gzip, unlike the removed pyke LZMA2 custom format).
+fn extract_tarball_entry(data: &[u8], wanted: &str) -> Option<Vec<u8>> {
+    use flate2::read::GzDecoder;
+    let mut tar_bytes = Vec::new();
+    GzDecoder::new(data).read_to_end(&mut tar_bytes).ok()?;
+    extract_tar_entry(&tar_bytes, wanted)
 }
 
 /// Copy the ONNX shared library to all locations where the binary
@@ -591,19 +767,6 @@ fn copy_onnx_shared_lib(shared_path: &Path) {
     }
 }
 
-/// Decompress pyke's custom LZMA2 format using lzma-rust2.
-fn lzma2_decompress(data: &[u8]) -> Vec<u8> {
-    use std::io::Read;
-    let mut reader = lzma_rust2::Lzma2Reader::new(data, 1 << 26, None);
-    let mut out = Vec::with_capacity(90 * 1024 * 1024);
-    reader
-        .read_to_end(&mut out)
-        .expect("ONNX: LZMA2 decompression failed");
-    out
-}
-
-/// Simple tar parser: find and extract a single file by name.
-/// Tar format: 512-byte header blocks, file data padded to 512-byte boundaries.
 fn extract_tar_entry(data: &[u8], name: &str) -> Option<Vec<u8>> {
     let mut pos = 0;
     while pos + 512 <= data.len() {
@@ -612,9 +775,12 @@ fn extract_tar_entry(data: &[u8], name: &str) -> Option<Vec<u8>> {
         if header.iter().all(|&b| b == 0) {
             break;
         }
-        // File name: bytes 0-99, null-terminated.
+        // File name: bytes 0-99, null-terminated. Microsoft's macOS
+        // tarballs store GNU-style `./`-prefixed member names; the
+        // wanted paths are written without them.
         let entry_name = header.split(|&b| b == 0).next().unwrap_or(&[]);
         let entry_name = String::from_utf8_lossy(entry_name);
+        let entry_name = entry_name.trim_start_matches("./");
         // File size: bytes 124-135, octal string.
         let size_str = header[124..136]
             .split(|&b| b == 0 || b == b' ')
@@ -644,28 +810,97 @@ fn extract_tar_entry(data: &[u8], name: &str) -> Option<Vec<u8>> {
 /// duplicate protobuf symbols in the ONNX archive, and -z noexecstack
 /// to clear the executable stack flag (ONNX assembly objects lack
 /// .note.GNU-stack, which defaults to execstack on Linux).
-fn build_shared_from_archive(archive: &Path, output: &Path, _shared_name: &str) {
-    eprintln!(
-        "donsetch build: building ONNX shared lib from {}",
-        archive.display()
-    );
-    let status = Command::new("cc")
-        .args(["-shared", "-z", "noexecstack", "-o"])
-        .arg(output)
-        .arg("-Wl,--whole-archive,--allow-multiple-definition")
-        .arg(archive)
-        .arg("-Wl,--no-whole-archive")
-        .args(["-lstdc++", "-lpthread", "-ldl", "-lm"])
-        .status()
-        .unwrap_or_else(|e| panic!("ONNX: failed to spawn linker ({e})"));
-    if !status.success() {
-        panic!("ONNX: shared library build failed");
-    }
-}
-
-/// SHA-256 hex digest of a byte slice (build-time, no external tool).
 fn sha256_hex(data: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let hash = Sha256::digest(data);
     hash.iter().map(|b| format!("{b:02x}")).collect()
 }
+
+// Shared with the crate : see src/display_name.rs. Item position: include!
+// cannot expand items inside a function body.
+#[cfg(windows)]
+include!("src/display_name.rs");
+
+/// Publisher shown by Explorer, Task Manager and UAC elevation prompts.
+///
+/// The Win32 spec marks CompanyName as required, but there is no company or
+/// publisher behind this project to claim, and an invented one would be worse
+/// than none. Maintainer: set this to `Some("...")` -- a name or handle -- and
+/// it is stamped into every Windows build; leave it `None` to omit the field.
+#[cfg(windows)]
+const COMPANY_NAME: Option<&str> = None;
+
+/// Stamp a Windows version resource (`VERSIONINFO`) into the executable.
+///
+/// Without one the binary reports no publisher, description or version in
+/// Explorer, Task Manager or `Get-Command`. Every field is derived from
+/// `Cargo.toml`, so nothing has to be maintained alongside a release. Best
+/// effort: a missing resource compiler downgrades to a warning rather than
+/// failing the build.
+///
+/// `os` is the target: a Windows host can still be building for something else.
+/// The `#[cfg(windows)]` gate is the host : see the `winresource` entry in
+/// Cargo.toml.
+#[cfg(windows)]
+fn stamp_version_resource(os: &str) {
+    if os != "windows" {
+        return;
+    }
+
+    use winresource::{VersionInfo, WindowsResource};
+
+    // `new()` already fills ProductName from the package name and both version
+    // strings from the full package version.
+    let mut res = WindowsResource::new();
+
+    // FileDescription is a short label shown to users -- Task Manager treats it
+    // as the app name -- so it takes the display title. The prose belongs in
+    // Comments, which is specified as "additional information ... for
+    // diagnostic purposes".
+    res.set("FileDescription", DISPLAY_NAME);
+    if let Some(company) = COMPANY_NAME {
+        res.set("CompanyName", company);
+    }
+    if let Ok(description) = env::var("CARGO_PKG_DESCRIPTION")
+        && !description.is_empty()
+    {
+        res.set("Comments", &description);
+    }
+    if let Ok(license) = env::var("CARGO_PKG_LICENSE")
+        && !license.is_empty()
+    {
+        res.set("LegalCopyright", &license);
+    }
+
+    // The numeric FILEVERSION is four 16-bit words, so it carries only
+    // MAJOR.MINOR.PATCH; the string field keeps the full version verbatim.
+    // Anything trailing the numbers means this is not an upstream release:
+    // rc/beta are pre-releases, anything else is a private build.
+    let version = env::var("CARGO_PKG_VERSION").unwrap_or_default();
+    let numeric = format!(
+        "{}.{}.{}",
+        env::var("CARGO_PKG_VERSION_MAJOR").unwrap_or_default(),
+        env::var("CARGO_PKG_VERSION_MINOR").unwrap_or_default(),
+        env::var("CARGO_PKG_VERSION_PATCH").unwrap_or_default(),
+    );
+    let suffix = version.strip_prefix(&numeric).unwrap_or_default();
+    if !suffix.is_empty() {
+        let suffix = suffix.to_ascii_lowercase();
+        if suffix.contains("rc") || suffix.contains("beta") {
+            res.set_version_info(VersionInfo::FILEFLAGS, VersionInfo::VS_FF_PRERELEASE);
+        } else {
+            // VS_FF_PRIVATEBUILD requires the PrivateBuild string to be set.
+            res.set("PrivateBuild", &version);
+            res.set_version_info(VersionInfo::FILEFLAGS, VersionInfo::VS_FF_PRIVATEBUILD);
+        }
+    }
+
+    if let Err(e) = res.compile() {
+        println!("cargo:warning=skipping Windows version resource: {e}");
+    }
+}
+
+/// No-op off Windows: `winresource` is a host-gated build-dependency, so it is
+/// not even in the graph here.
+#[cfg(not(windows))]
+fn stamp_version_resource(_os: &str) {}

@@ -1,7 +1,7 @@
 {
   "name": "donsetch",
-  "version": "3.4.0",
-  "description": "Web fetch, search and crawl for AI agents. Zero API keys. Chrome-true TLS.",
+  "version": "4.10.1",
+  "description": "MCP server that gives AI agents the web: fetch, search, crawl and screenshot from one local Rust binary. Zero API keys, zero accounts, Chrome-true TLS.",
   "license": "AGPL-3.0-only",
   "author": "Bishesh Bhandari",
   "repository": {
@@ -9,43 +9,58 @@
     "url": "https://github.com/dondai44423/donsetch"
   },
   "homepage": "https://github.com/dondai44423/donsetch#readme",
+  "funding": {
+    "type": "individual",
+    "url": "https://ko-fi.com/G5Y624N5RE"
+  },
   "bugs": {
     "url": "https://github.com/dondai44423/donsetch/issues"
   },
   "keywords": [
     "pi-package",
     "mcp",
-    "web-fetch",
-    "search",
-    "crawl",
+    "mcp-server",
+    "model-context-protocol",
     "ai-agent",
-    "scraper",
+    "agent-tools",
+    "web-fetch",
+    "web-search",
+    "web-scraping",
+    "web-crawler",
+    "web-research",
+    "screenshot",
+    "markdown",
+    "pdf",
+    "ocr",
+    "extraction",
+    "anti-bot",
     "tls",
     "chrome",
-    "anti-bot",
-    "pdf",
-    "extraction"
+    "stealth",
+    "no-api-key",
+    "claude",
+    "cursor",
+    "rust"
   ],
   "pi": {
     "extensions": ["./pi-extension.ts"]
-  },
-  "peerDependencies": {
-    "@earendil-works/pi-coding-agent": "*",
-    "typebox": "*"
   },
   "bin": {
     "donsetch": "bin/donsetch.js"
   },
   "scripts": {
-    "postinstall": "node install.js"
+    "postinstall": "node install.js",
+    "test": "node --test --test-timeout=90000 tests/*.test.js"
   },
   "files": [
     "install.js",
+    "resolve-binary.js",
     "bin/donsetch.js",
     "pi-extension.ts",
-    "README.md"
+    "README.md",
+    "LICENSE"
   ],
   "engines": {
-    "node": ">=14"
+    "node": ">=18"
   }
 }

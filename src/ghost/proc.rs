@@ -3,23 +3,23 @@
 //! **Unix (Linux + macOS):** process groups + SIGSTOP/SIGCONT/SIGKILL.
 //! The whole browser tree (browser + renderers + GPU) shares one
 //! process group, so a single signal suspends/resumes/kills it all.
-//! Linux additionally gets `PR_SET_PDEATHSIG` — the kernel reaps the
+//! Linux additionally gets `PR_SET_PDEATHSIG` : the kernel reaps the
 //! child if donsetch dies hard. macOS has no `prctl` equivalent; the
 //! Ghost Drop + kill path cover normal exit, only a hard parent crash
 //! could orphan (documented limitation).
 //!
 //! **Windows:** a Job Object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`
-//! owns the browser tree — the kernel kills every process in the job
+//! owns the browser tree : the kernel kills every process in the job
 //! when the last handle closes (including if donsetch crashes).
 //! Freeze/thaw enumerates ALL processes in the Job Object (not just
 //! the main browser) and suspends/resumes each one via
 //! `NtSuspendProcess`/`NtResumeProcess` (ntdll; the atomic
-//! whole-process pause, stable since XP — Sysinternals Process
+//! whole-process pause, stable since XP : Sysinternals Process
 //! Explorer, WinDbg, and Chrome's own crash handling all use it).
-//! Linked directly to ntdll via `#[link(name = "ntdll")]` — no
+//! Linked directly to ntdll via `#[link(name = "ntdll")]` : no
 //! `GetProcAddress` dance, no FARPROC type ambiguity.
 //! Without enumerating all PIDs, only the main Chrome process would
-//! be suspended — the renderer/GPU/utility processes keep running,
+//! be suspended : the renderer/GPU/utility processes keep running,
 //! burning CPU and RAM.
 
 use crate::error::FetchError;
@@ -37,15 +37,16 @@ use windows_sys::Win32::System::Threading as thr;
 
 /// Owned platform handle to the browser process tree.
 pub struct Proc {
+    killed: std::sync::atomic::AtomicBool,
     #[cfg(unix)]
     pid: i32,
     #[cfg(windows)]
     proc_handle: fnd::HANDLE,
     #[cfg(windows)]
-    job: fnd::HANDLE,
+    job: KillOnCloseJob,
 }
 
-// ntdll process suspend/resume — always loaded, linked directly.
+// ntdll process suspend/resume : always loaded, linked directly.
 #[cfg(windows)]
 #[link(name = "ntdll")]
 unsafe extern "system" {
@@ -53,10 +54,78 @@ unsafe extern "system" {
     fn NtResumeProcess(proc_handle: fnd::HANDLE) -> i32;
 }
 
+/// Owned Windows Job Object that terminates every assigned process when the
+/// handle closes. Both long-lived ghosts and short browser probes use this
+/// primitive so job creation, assignment, and teardown have one owner.
+#[cfg(windows)]
+pub(crate) struct KillOnCloseJob {
+    handle: fnd::HANDLE,
+}
+
+#[cfg(windows)]
+impl KillOnCloseJob {
+    pub(crate) fn new() -> Result<Self, String> {
+        unsafe {
+            let handle = job::CreateJobObjectW(std::ptr::null(), std::ptr::null());
+            if handle.is_null() {
+                return Err(format!("CreateJobObjectW failed: {}", fnd::GetLastError()));
+            }
+
+            let mut info: job::JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+            info.BasicLimitInformation.LimitFlags = job::JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            if job::SetInformationJobObject(
+                handle,
+                job::JobObjectExtendedLimitInformation,
+                &info as *const _ as *const _,
+                std::mem::size_of_val(&info) as u32,
+            ) == 0
+            {
+                let error = fnd::GetLastError();
+                fnd::CloseHandle(handle);
+                return Err(format!("SetInformationJobObject failed: {error}"));
+            }
+            Ok(Self { handle })
+        }
+    }
+
+    pub(crate) fn assign(&self, process: fnd::HANDLE) -> Result<(), u32> {
+        if unsafe { job::AssignProcessToJobObject(self.handle, process) } == 0 {
+            Err(unsafe { fnd::GetLastError() })
+        } else {
+            Ok(())
+        }
+    }
+
+    fn terminate(&self) {
+        unsafe {
+            job::TerminateJobObject(self.handle, 1);
+        }
+    }
+
+    fn raw(&self) -> fnd::HANDLE {
+        self.handle
+    }
+}
+
+#[cfg(windows)]
+impl Drop for KillOnCloseJob {
+    fn drop(&mut self) {
+        unsafe {
+            fnd::CloseHandle(self.handle);
+        }
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn resume_process(process: fnd::HANDLE) -> Result<(), i32> {
+    let status = unsafe { NtResumeProcess(process) };
+    if status < 0 { Err(status) } else { Ok(()) }
+}
+
 impl Proc {
     /// Configure a `Command` BEFORE spawn.
     /// Unix: own process group (freeze/thaw signal the whole tree).
-    /// Windows: nothing — the Job Object is attached post-spawn.
+    /// Windows: nothing : the Job Object is attached post-spawn.
     pub fn prepare_cmd(cmd: &mut tokio::process::Command) {
         #[cfg(unix)]
         cmd.process_group(0);
@@ -73,8 +142,18 @@ impl Proc {
     pub fn from_child(child: &Child) -> Result<Self, FetchError> {
         #[cfg(unix)]
         {
-            let pid = child.id().unwrap_or(0) as i32;
-            Ok(Self { pid })
+            // The pid is the process-group id every signal path uses
+            // (`kill(-pid, ...)`). A zero pid must never become a
+            // Proc: `kill(0, ...)` does not fail, it signals the
+            // CALLER's whole process group, so a pid-less child would
+            // stop or kill donsetch itself.
+            let pid = child.id().ok_or_else(|| {
+                FetchError::ghost("child has no pid (already reaped); refusing to own it")
+            })? as i32;
+            Ok(Self {
+                pid,
+                killed: std::sync::atomic::AtomicBool::new(false),
+            })
         }
         #[cfg(windows)]
         {
@@ -84,21 +163,20 @@ impl Proc {
 
     #[cfg(windows)]
     unsafe fn from_child_win(child: &Child) -> Result<Self, FetchError> {
-        use std::mem;
         let pid = child.id().unwrap_or(0);
 
         // SAFETY: all FFI calls in this function target well-documented
         // Windows kernel/ntdll APIs with correct parameter types. The
-        // `unsafe` block wraps the entire body — every call is audited.
+        // `unsafe` block wraps the entire body : every call is audited.
         unsafe {
             // Process handle with the access rights we need:
-            //   PROCESS_SUSPEND_RESUME  — NtSuspendProcess / NtResumeProcess
-            //   PROCESS_SET_QUOTA       — AssignProcessToJobObject
-            //   PROCESS_TERMINATE       — AssignProcessToJobObject also requires
+            //   PROCESS_SUSPEND_RESUME  : NtSuspendProcess / NtResumeProcess
+            //   PROCESS_SET_QUOTA       : AssignProcessToJobObject
+            //   PROCESS_TERMINATE       : AssignProcessToJobObject also requires
             //                             this; without it the call fails with
             //                             ERROR_ACCESS_DENIED and the job stays
             //                             empty, so KILL_ON_JOB_CLOSE kills nothing
-            //   PROCESS_QUERY_LIMITED_INFORMATION — status checks
+            //   PROCESS_QUERY_LIMITED_INFORMATION : status checks
             let proc_handle = thr::OpenProcess(
                 thr::PROCESS_SUSPEND_RESUME
                     | thr::PROCESS_SET_QUOTA
@@ -115,48 +193,31 @@ impl Proc {
             }
 
             // Job Object: kernel kills the whole tree if donsetch dies.
-            let job_h = job::CreateJobObjectW(std::ptr::null(), std::ptr::null());
-            if job_h.is_null() {
-                fnd::CloseHandle(proc_handle);
-                return Err(FetchError::ghost(format!(
-                    "CreateJobObjectW failed: {}",
-                    fnd::GetLastError()
-                )));
-            }
-            let mut info: job::JOBOBJECT_EXTENDED_LIMIT_INFORMATION = mem::zeroed();
-            info.BasicLimitInformation.LimitFlags = job::JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-            if job::SetInformationJobObject(
-                job_h,
-                job::JobObjectExtendedLimitInformation,
-                &info as *const _ as *const _,
-                mem::size_of::<job::JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-            ) == 0
-            {
-                fnd::CloseHandle(proc_handle);
-                fnd::CloseHandle(job_h);
-                return Err(FetchError::ghost(format!(
-                    "SetInformationJobObject failed: {}",
-                    fnd::GetLastError()
-                )));
-            }
+            let job = match KillOnCloseJob::new() {
+                Ok(job) => job,
+                Err(error) => {
+                    fnd::CloseHandle(proc_handle);
+                    return Err(FetchError::ghost(error));
+                }
+            };
             // Assign the child to the job. On Win8+ nested jobs are
             // allowed, so this succeeds even if the process is already
-            // in a job. If it fails we don't abort — freeze/thaw/kill
+            // in a job. If it fails we don't abort : freeze/thaw/kill
             // still work via the process handle; only the death-reap
             // safety net is lost.
-            if job::AssignProcessToJobObject(job_h, proc_handle) == 0 {
+            if let Err(error) = job.assign(proc_handle) {
                 // Non-fatal for the fetch itself, but the job is now empty:
                 // KILL_ON_JOB_CLOSE has nothing to kill, so the browser tree
                 // outlives donsetch and orphaned Chrome processes pile up.
-                // Warn unconditionally — silent degradation is what hid this.
-                eprintln!(
-                    "[ghost] AssignProcessToJobObject failed: {} — browser tree will not be reaped on exit, leaving orphaned Chrome processes",
-                    fnd::GetLastError()
+                // Warn unconditionally : silent degradation is what hid this.
+                crate::diag!(
+                    "[ghost] AssignProcessToJobObject failed: {error} : browser tree will not be reaped on exit, leaving orphaned Chrome processes"
                 );
             }
             Ok(Self {
                 proc_handle,
-                job: job_h,
+                job,
+                killed: std::sync::atomic::AtomicBool::new(false),
             })
         }
     }
@@ -164,8 +225,12 @@ impl Proc {
     /// Suspend the whole process tree. CPU → 0, RAM goes cold.
     pub fn freeze(&self) {
         #[cfg(unix)]
-        unsafe {
-            libc::kill(-self.pid, libc::SIGSTOP);
+        {
+            if self.pid > 0 {
+                unsafe {
+                    libc::kill(-self.pid, libc::SIGSTOP);
+                }
+            }
         }
         #[cfg(windows)]
         unsafe {
@@ -181,14 +246,18 @@ impl Proc {
     /// Resume the whole process tree.
     pub fn thaw(&self) {
         #[cfg(unix)]
-        unsafe {
-            libc::kill(-self.pid, libc::SIGCONT);
+        {
+            if self.pid > 0 {
+                unsafe {
+                    libc::kill(-self.pid, libc::SIGCONT);
+                }
+            }
         }
         #[cfg(windows)]
         unsafe {
             for pid in self.job_pids() {
                 if let Ok(h) = open_for_suspend(pid) {
-                    NtResumeProcess(h);
+                    let _ = resume_process(h);
                     fnd::CloseHandle(h);
                 }
             }
@@ -197,20 +266,27 @@ impl Proc {
 
     /// Kill the whole tree.
     pub fn kill_group(&self) {
+        if self.killed.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            return;
+        }
         #[cfg(unix)]
-        unsafe {
-            libc::kill(-self.pid, libc::SIGKILL);
+        {
+            if self.pid > 0 {
+                unsafe {
+                    libc::kill(-self.pid, libc::SIGKILL);
+                }
+            }
         }
         #[cfg(windows)]
-        unsafe {
-            // Kills every process in the job — the whole tree.
-            job::TerminateJobObject(self.job, 1);
+        {
+            // Kills every process in the job : the whole tree.
+            self.job.terminate();
         }
     }
 
     /// Enumerate all PIDs in the Job Object (Windows only).
     /// Chrome spawns renderer, GPU, and utility processes as
-    /// separate processes in the Job — the main process handle
+    /// separate processes in the Job : the main process handle
     /// only controls the browser process. To freeze/thaw the
     /// whole tree, we query the Job Object for all member PIDs.
     #[cfg(windows)]
@@ -228,7 +304,7 @@ impl Proc {
 
         let ok = unsafe {
             job::QueryInformationJobObject(
-                self.job,
+                self.job.raw(),
                 job::JobObjectBasicProcessIdList,
                 buf.as_mut_ptr() as *mut _,
                 buf_size as u32,
@@ -236,7 +312,7 @@ impl Proc {
             )
         };
         if ok == 0 {
-            // Query failed — fall back to just the main PID.
+            // Query failed : fall back to just the main PID.
             // The main process is still controlled by proc_handle.
             return Vec::new();
         }
@@ -255,22 +331,37 @@ impl Proc {
     }
 }
 
-/// `PR_SET_PDEATHSIG` — kernel kills the child if donsetch dies.
-/// Called in `pre_exec` (child context). Linux-only; macOS has no
-/// `prctl` equivalent.
+/// `PR_SET_PDEATHSIG` : kernel kills the child if donsetch dies.
+/// Returns the closure for `pre_exec` (child context). Linux-only;
+/// macOS has no `prctl` equivalent.
+///
+/// The signal arms only from the prctl call on: a parent that died
+/// between fork and prctl leaves a child that never gets it. The
+/// parent's pid is taken here, before the fork, and the child checks
+/// it is still its parent after arming, so that window fails the
+/// spawn instead of leaking an orphan.
 #[cfg(linux_like)]
-pub fn pdeath_pre_exec() -> std::io::Result<()> {
-    unsafe {
-        if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
-            return Err(std::io::Error::last_os_error());
+pub fn pdeath_pre_exec() -> impl FnMut() -> std::io::Result<()> + Send + Sync + 'static {
+    let parent = std::process::id();
+    move || {
+        // SAFETY: async-signal-safe calls only between fork and exec.
+        unsafe {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::getppid() as u32 != parent {
+                return Err(std::io::Error::other(
+                    "parent exited before the child started",
+                ));
+            }
         }
+        Ok(())
     }
-    Ok(())
 }
 
 /// Open a process handle for suspend/resume (Windows only).
 /// Returns Err if the process has already exited (race condition
-/// during freeze — child crashed between enumeration and open).
+/// during freeze : child crashed between enumeration and open).
 #[cfg(windows)]
 fn open_for_suspend(pid: u32) -> Result<fnd::HANDLE, ()> {
     unsafe {
@@ -290,14 +381,70 @@ unsafe impl Sync for Proc {}
 
 impl Drop for Proc {
     fn drop(&mut self) {
+        self.kill_group();
         #[cfg(windows)]
         unsafe {
             fnd::CloseHandle(self.proc_handle);
-            fnd::CloseHandle(self.job);
         }
         #[cfg(not(windows))]
         {
             let _ = self;
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    // The pid is the process-group id every signal path uses
+    // (`kill(-pid, ...)`), so a zero pid must never become a Proc:
+    // `kill(0, ...)` does not fail, it signals the CALLER's whole
+    // process group. A reaped child has no pid and is refused.
+    #[tokio::test]
+    async fn from_child_refuses_a_reaped_child() {
+        let mut child = tokio::process::Command::new("true").spawn().unwrap();
+        child.wait().await.unwrap();
+        assert!(child.id().is_none(), "a reaped child has no pid");
+        // `expect_err` would need Debug on Proc; match instead.
+        let err = match Proc::from_child(&child) {
+            Ok(_) => panic!("no-pid child must be refused"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("pid"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn from_child_keeps_a_live_pid_and_kill_group_reaps_the_tree() {
+        // The production shape: own process group, then the group
+        // signal; `kill(-pid)` only reaches the tree when the child
+        // leads its own group.
+        let mut cmd = tokio::process::Command::new("sleep");
+        cmd.arg("30");
+        Proc::prepare_cmd(&mut cmd);
+        let mut child = cmd.spawn().unwrap();
+        let proc = Proc::from_child(&child).expect("live child");
+        assert!(proc.pid > 0);
+        proc.kill_group();
+        let status = child.wait().await.unwrap();
+        assert!(!status.success(), "SIGKILLed child must not exit cleanly");
+    }
+
+    #[tokio::test]
+    async fn stealth_v3_dropping_launch_owner_reaps_child_without_completed_ghost() {
+        let mut cmd = tokio::process::Command::new("sleep");
+        cmd.arg("30");
+        Proc::prepare_cmd(&mut cmd);
+        let mut child = cmd.spawn().unwrap();
+        let owned = Proc::from_child(&child).unwrap();
+        assert!(child.try_wait().unwrap().is_none());
+        drop(owned);
+        let status = tokio::time::timeout(std::time::Duration::from_secs(2), child.wait())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!status.success());
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(status.signal(), Some(libc::SIGKILL));
     }
 }

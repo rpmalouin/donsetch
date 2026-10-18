@@ -74,10 +74,29 @@ fn web_scheme(url: &Url) -> bool {
     matches!(url.scheme(), "http" | "https")
 }
 
+/// Canonical scheme for a map entry: a same-host plain-http URL on the
+/// default port under an https seed is upgraded to https. A site serves
+/// one canonical scheme; a mixed-scheme inventory reads as the site's
+/// shape while naming unfetchable twins. Other hosts, explicit
+/// non-default ports, and matching schemes are left exactly as
+/// authored: the map cannot know another host's truth.
+pub fn canonical_scheme(url: &Url, seed: &Url) -> Url {
+    let mut u = url.clone();
+    let default_http_port = u.port().is_none() || u.port() == Some(80);
+    if u.scheme() == "http"
+        && seed.scheme() == "https"
+        && default_http_port
+        && u.host_str() == seed.host_str()
+    {
+        let _ = u.set_scheme("https");
+    }
+    u
+}
+
 /// Known locale codes that appear as the first path segment on
 /// multi-language sites (MDN, Wikipedia, React docs, etc.).
 /// When two URLs differ ONLY in this prefix, they are translations
-/// of the same content — fetching both wastes crawl budget.
+/// of the same content : fetching both wastes crawl budget.
 const LOCALE_PREFIXES: &[&str] = &[
     // ISO 639-1 two-letter codes
     "en", "de", "es", "fr", "ja", "ko", "ru", "it", "nl", "pl", "tr", "ar", "hi", "th", "vi", "id",
@@ -135,7 +154,11 @@ pub fn normalize(url: &Url) -> String {
     {
         let _ = u.set_port(None);
     }
-    // Strip tracking params, sort the survivors.
+    // Strip tracking params, sort the survivors. query_pairs()
+    // DECODES percent-escapes, so the rebuild must RE-encode:
+    // joining raw `{k}={v}` turned "?a=1%26b=2" into "?a=1&b=2"
+    // (a different resource) and collided distinct URLs in the
+    // seen-set, silently dropping pages.
     let pairs: Vec<(String, String)> = u
         .query_pairs()
         .filter(|(k, _)| !TRACKING_PARAMS.contains(&k.to_lowercase().as_str()))
@@ -146,11 +169,9 @@ pub fn normalize(url: &Url) -> String {
     if pairs.is_empty() {
         u.set_query(None);
     } else {
-        let qs = pairs
-            .iter()
-            .map(|(k, v)| format!("{k}={v}"))
-            .collect::<Vec<_>>()
-            .join("&");
+        let qs = url::form_urlencoded::Serializer::new(String::new())
+            .extend_pairs(pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+            .finish();
         u.set_query(Some(&qs));
     }
     if u.path().is_empty() {
@@ -226,29 +247,61 @@ pub fn glob_match(pat: &str, s: &str) -> bool {
     glob_at(pat.as_bytes(), s.as_bytes())
 }
 
-fn glob_at(pat: &[u8], s: &[u8]) -> bool {
-    if pat.is_empty() {
-        return s.is_empty();
-    }
-    match pat[0] {
-        b'*' => {
-            // '*' consumes zero or more.
-            for skip in 0..=s.len() {
-                if glob_at(&pat[1..], &s[skip..]) {
-                    return true;
-                }
-            }
-            false
+/// Iterative last-star matcher: O(n·m) on a non-matching pair. The
+/// recursive shape before it tried every split at every `*`, O(n^k)
+/// for k stars, and both inputs are attacker-influenced: the
+/// pattern is a caller's `include_paths` (a legitimate
+/// `/*/docs/*/api/*` has three) and the path is a link the fetched
+/// page chose, so one 8 KiB href held the crawl worker for hours.
+fn glob_at(p: &[u8], t: &[u8]) -> bool {
+    let (mut pi, mut ti) = (0usize, 0usize);
+    // The last `*` and the text position it currently covers up to;
+    // on a mismatch it eats one more character and we retry.
+    let mut star: Option<(usize, usize)> = None;
+    while ti < t.len() {
+        if pi < p.len() && p[pi] == b'*' {
+            star = Some((pi, ti));
+            pi += 1;
+        } else if pi < p.len() && p[pi] == t[ti] {
+            pi += 1;
+            ti += 1;
+        } else if let Some((sp, st)) = star {
+            pi = sp + 1;
+            ti = st + 1;
+            star = Some((sp, ti));
+        } else {
+            return false;
         }
-        c if !s.is_empty() && s[0] == c => glob_at(&pat[1..], &s[1..]),
-        _ => false,
     }
+    while pi < p.len() && p[pi] == b'*' {
+        pi += 1;
+    }
+    pi == p.len()
 }
 
 /// The crawl frontier: queued URLs with per-URL priority.
+/// Entries the queue keeps. One index page can carry 100 000 links,
+/// and the fetch body cap is 64 MiB; past this the lowest-scored
+/// entries go, and the crawl counts them as filtered out.
+pub const MAX_QUEUE: usize = 10_000;
+
+/// How far past the ceiling the heap may grow before one prune
+/// brings it back: a prune sorts the heap, so it must not run on
+/// every push.
+const PRUNE_SLACK: usize = MAX_QUEUE / 4;
+
 pub struct FrontierQueue {
     heap: BinaryHeap<Frontier>,
     seen: HashSet<String>,
+    /// Entries let go at the ceiling.
+    dropped: usize,
+    /// v4 phase 3 crawl-shape: pop a reader-like jitter inside the
+    /// head window instead of always the exact top, so repeated
+    /// crawls of the same site do not replay an identical,
+    /// score-eager fetch order to server logs. Ordering only.
+    shaper: bool,
+    /// xorshift64 state for the hop; a deliberate non-zero seed.
+    rng: u64,
 }
 
 impl Default for FrontierQueue {
@@ -256,12 +309,28 @@ impl Default for FrontierQueue {
         Self::new()
     }
 }
-
 impl FrontierQueue {
     pub fn new() -> Self {
         Self {
             heap: BinaryHeap::new(),
             seen: HashSet::new(),
+            dropped: 0,
+            shaper: false,
+            rng: 0x9e3779b97f4a7c15,
+        }
+    }
+
+    /// Construct a shaped frontier (reader-like pop jitter, default) or an unshaped one. The
+    /// unshaped (classic) heap behavior comes back when callers pass false - which is what
+    /// DONSETCH_NO_CRAWL_SHAPE does - and for tests that need deterministic score ordering.
+    /// The seed may be zero: xorshift non-zeroes it before use.
+    pub fn with_shaper(shaper_enabled: bool, seed: u64) -> Self {
+        Self {
+            heap: BinaryHeap::new(),
+            seen: HashSet::new(),
+            dropped: 0,
+            shaper: shaper_enabled,
+            rng: seed,
         }
     }
 
@@ -271,6 +340,13 @@ impl FrontierQueue {
     }
 
     /// Push a URL with a referer parent (the page that linked to it).
+    ///
+    /// A re-push of an already-seen URL normally dedups. When the URL
+    /// is still queued under a LOWER score, the new score RAISES the
+    /// entry instead: the sitemap flood queues a whole section at
+    /// recency scores before any page is read, and the seed page's
+    /// own links must be able to lift their targets above it (V10).
+    /// Fetched or pruned-away URLs stay seen and are never requeued.
     pub fn push_with_parent(
         &mut self,
         url: Url,
@@ -280,7 +356,22 @@ impl FrontierQueue {
     ) -> bool {
         let key = normalize(&url);
         if !self.seen.insert(key.clone()) {
-            return false;
+            let Some(cur) = self.heap.iter().find(|f| f.url == key).map(|f| f.score) else {
+                return false;
+            };
+            if score <= cur {
+                return false;
+            }
+            let mut items: Vec<Frontier> = std::mem::take(&mut self.heap).into_vec();
+            if let Some(f) = items.iter_mut().find(|f| f.url == key) {
+                f.score = score;
+                f.depth = f.depth.min(depth);
+                if parent.is_some() {
+                    f.parent = parent;
+                }
+            }
+            self.heap = items.into_iter().collect();
+            return true;
         }
         self.heap.push(Frontier {
             url: key,
@@ -289,11 +380,33 @@ impl FrontierQueue {
             retries: 0,
             parent,
         });
+        self.prune_over(MAX_QUEUE + PRUNE_SLACK);
         true
     }
 
+    /// Entries let go at the ceiling since the queue was made.
+    pub fn dropped(&self) -> usize {
+        self.dropped
+    }
+
+    /// Past `limit`, keep the best MAX_QUEUE. Pushes allow the slack
+    /// so this sorts rarely; a snapshot trims to the ceiling itself.
+    /// The dropped URLs stay in `seen`: a page that links to them
+    /// again does not get them back.
+    fn prune_over(&mut self, limit: usize) {
+        if self.heap.len() <= limit {
+            return;
+        }
+        let mut sorted = std::mem::take(&mut self.heap).into_sorted_vec();
+        // into_sorted_vec is ascending: the best are at the end.
+        let excess = sorted.len() - MAX_QUEUE;
+        sorted.drain(..excess);
+        self.dropped += excess;
+        self.heap = sorted.into_iter().collect();
+    }
+
     /// Requeue a popped item (e.g. host boxed, try later).
-    /// NOT dedup'd — the seen-set already knows it.
+    /// NOT dedup'd : the seen-set already knows it.
     pub fn requeue(&mut self, f: Frontier) {
         self.heap.push(f);
     }
@@ -330,13 +443,50 @@ impl FrontierQueue {
     }
 
     pub fn pop(&mut self) -> Option<Frontier> {
-        self.heap.pop()
+        if !self.shaper || self.heap.len() < 2 {
+            return self.heap.pop();
+        }
+        // Take a small head window, pick with weights decaying head-first
+        // (top twice more likely than second, halving down), put the
+        // un-picked back. Every promised item still gets fetched; only
+        // the order changes.
+        const WINDOW: usize = 4;
+        const WEIGHTS: [u32; WINDOW] = [8, 4, 2, 1];
+        let take = WINDOW.min(self.heap.len());
+        let mut head: Vec<Frontier> = (0..take).filter_map(|_| self.heap.pop()).collect();
+        let pick = {
+            let mut x = self.rng;
+            if x == 0 {
+                x = 0x9e3779b97f4a7c15;
+            }
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.rng = x;
+            let total: u32 = WEIGHTS[..take].iter().sum();
+            let mut r = (x % (total as u64)) as u32;
+            let mut idx = take - 1;
+            for (i, w) in WEIGHTS[..take].iter().enumerate() {
+                if r < *w {
+                    idx = i;
+                    break;
+                }
+                r -= *w;
+            }
+            idx
+        };
+        let chosen = head.swap_remove(pick);
+        for f in head {
+            self.heap.push(f);
+        }
+        Some(chosen)
     }
 
     /// Snapshot all queued entries (url, score, depth, retries,
-    /// parent) for a resume token. Does not drain — the seen-set
+    /// parent) for a resume token. Does not drain : the seen-set
     /// survives.
-    pub fn snapshot_entries(&self) -> Vec<(String, f64, u32, u8, Option<String>)> {
+    pub fn snapshot_entries(&mut self) -> Vec<(String, f64, u32, u8, Option<String>)> {
+        self.prune_over(MAX_QUEUE);
         self.heap
             .iter()
             .map(|f| (f.url.clone(), f.score, f.depth, f.retries, f.parent.clone()))
@@ -351,13 +501,24 @@ impl FrontierQueue {
         self.heap.is_empty()
     }
 
-    /// Mark a URL as seen without enqueuing it. Used for
+    /// Insert `key` into the seen set without touching the queue; true
+    /// when the key was new. `key` must be in `normalize` form, the
+    /// key `push_with_parent` dedups on. Unlike `mark_seen`, a key that
+    /// is already queued stays queued.
+    pub fn insert_seen(&mut self, key: String) -> bool {
+        self.seen.insert(key)
+    }
+
+    /// Mark a URL as seen and remove its pending alias. Used for
     /// canonical URL resolution: when a page declares a
     /// canonical URL different from its fetched URL, the
     /// canonical form is marked seen to prevent a separate
     /// fetch of the same content under a different URL.
     pub fn mark_seen(&mut self, url: String) {
-        self.seen.insert(url);
+        // A new key cannot already be queued. Scan only known aliases.
+        if !self.seen.insert(url.clone()) {
+            self.heap.retain(|item| item.url != url);
+        }
     }
 }
 
@@ -371,7 +532,7 @@ impl FrontierQueue {
 /// - Path not ending with `/` (page): use parent directory.
 ///   `/tokio-rs/tokio/wiki` -> `/tokio-rs/tokio/*`
 /// - Single-segment path (e.g. `/tokio`): scope to that segment.
-///   `/tokio` -> `/tokio/*` (NOT None — multi-tenant hosts like
+///   `/tokio` -> `/tokio/*` (NOT None : multi-tenant hosts like
 ///   docs.rs, crates.io, npmjs.com have each crate/package as
 ///   a top-level segment; returning None crawls the entire site).
 /// - Root path `/`: no scope (crawl the whole host).
@@ -397,7 +558,14 @@ pub fn auto_scope(seed_path: &str) -> Option<String> {
     // Page path: use parent directory.
     let prefix = match path.rfind('/') {
         Some(0) => {
-            // Single-segment path like `/tokio` — scope to
+            // A root-level FILE (`/p0.html`, `/index.php`) is a
+            // page whose section is the host: scoping it to
+            // `/p0.html/*` filtered every sibling link and the
+            // crawl ended empty, marked complete (#249).
+            if looks_like_file(&path[1..]) {
+                return None;
+            }
+            // Single-segment path like `/tokio` : scope to
             // `/tokio/*` instead of returning None. This is
             // critical for multi-tenant hosts (docs.rs,
             // crates.io, npmjs.com) where each top-level segment
@@ -413,6 +581,19 @@ pub fn auto_scope(seed_path: &str) -> Option<String> {
     }
 
     Some(format!("{prefix}*"))
+}
+
+/// `index.html`, `about.php`, `README.md`: a short alphabetic
+/// extension marks a page, not a section. `v1.2` (digit
+/// extension) and `tokio` (none) stay sections.
+fn looks_like_file(segment: &str) -> bool {
+    let Some((stem, ext)) = segment.rsplit_once('.') else {
+        return false;
+    };
+    !stem.is_empty()
+        && (1..=5).contains(&ext.len())
+        && ext.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
+        && ext.chars().all(|c| c.is_ascii_alphanumeric())
 }
 
 /// Common non-content path patterns. Safety net merged with
@@ -446,6 +627,48 @@ pub fn effective_excludes(user: &[String]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stealth_v3_observed_final_url_removes_only_its_queued_alias() {
+        let mut queue = FrontierQueue::new();
+        let final_url = Url::parse("https://ex.com/allowed/final").unwrap();
+        let other = Url::parse("https://ex.com/allowed/next").unwrap();
+        assert!(queue.push(final_url.clone(), 10.0, 1));
+        assert!(queue.push(other.clone(), 5.0, 1));
+        queue.mark_seen(normalize(&final_url));
+        assert_eq!(queue.pop().unwrap().url, normalize(&other));
+        assert!(queue.pop().is_none());
+        assert!(!queue.push(final_url, 10.0, 1));
+    }
+
+    // One index page can carry 100 000 links; each became a heap
+    // entry, and the whole heap was copied into every tool response
+    // and the resume token. The queue keeps the best MAX_QUEUE and
+    // counts what it let go.
+    #[test]
+    fn the_queue_keeps_the_best_entries_past_its_ceiling() {
+        let mut q = FrontierQueue::new();
+        let n = MAX_QUEUE * 3;
+        for i in 0..n {
+            let url = Url::parse(&format!("https://ex.com/p/{i}")).unwrap();
+            // Score rises with i: the last MAX_QUEUE pushed are the best.
+            q.push(url, i as f64, 1);
+        }
+        let snapshot = q.snapshot_entries().len();
+        assert!(
+            snapshot <= MAX_QUEUE,
+            "the queue holds {snapshot} entries over its ceiling of {MAX_QUEUE}"
+        );
+        assert_eq!(q.dropped() + q.len(), n, "every push is kept or counted");
+        let mut lowest = f64::MAX;
+        while let Some(f) = q.pop() {
+            lowest = lowest.min(f.score);
+        }
+        assert!(
+            lowest >= (n - MAX_QUEUE) as f64,
+            "a kept entry scored {lowest}, below the best {MAX_QUEUE}"
+        );
+    }
 
     #[test]
     fn normalize_strips_tracking() {
@@ -490,6 +713,35 @@ mod tests {
         assert!(glob_match("*", ""));
         assert!(glob_match("*/x", "a/b/x"));
         assert!(!glob_match("*/x", "a/b/y"));
+        assert!(glob_match("", ""));
+        assert!(!glob_match("", "a"));
+        assert!(!glob_match("a", ""));
+        assert!(glob_match("a**b", "ab"));
+        assert!(glob_match("/*/docs/*/api/*", "/v1/docs/x/api/y"));
+        assert!(!glob_match("/*/docs/*/api/*", "/v1/docs/x/apix/y"));
+        assert!(glob_match("*a*b*c", "xxaxxbxxc"));
+        assert!(!glob_match("*a*b*c", "xxaxxbxx"));
+    }
+
+    // Both inputs are attacker-influenced: a caller's multi-star
+    // include pattern against a link path the page chose must not
+    // take exponential time on a mismatch.
+    #[test]
+    fn glob_match_is_polynomial_on_a_hostile_pair() {
+        let pat = format!("/{}b", "*a".repeat(30));
+        let path = format!("/{}", "a".repeat(3000));
+        let started = std::time::Instant::now();
+        assert!(!glob_match(&pat, &path));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(20),
+            "{:?}",
+            started.elapsed()
+        );
+        // The documented three-star shape against an 8 KiB href.
+        let path = format!("/v1/docs/{}/apix/y", "x".repeat(8000));
+        let started = std::time::Instant::now();
+        assert!(!glob_match("/*/docs/*/api/*", &path));
+        assert!(started.elapsed() < std::time::Duration::from_secs(20));
     }
 
     #[test]
@@ -520,6 +772,118 @@ mod tests {
         q.push(u1, 1.0, 0);
         q.push(u2, 5.0, 0);
         assert!(q.pop().unwrap().url.ends_with("/b"));
+    }
+
+    // V10: the sitemap may queue a URL before the page that links to
+    // it is read; a later, higher-scored re-push must RAISE the
+    // queued entry, not be swallowed by the seen-set. Fetched or
+    // dropped URLs must stay gone.
+    #[test]
+    fn a_higher_score_reraises_a_queued_entry() {
+        let mut q = FrontierQueue::new();
+        let u = Url::parse("https://ex.com/topic").unwrap();
+        let other = Url::parse("https://ex.com/other").unwrap();
+        // Sitemap-style push, then a better link re-pushes the same URL.
+        assert!(q.push(u.clone(), -0.75, 1));
+        assert!(q.push(other.clone(), 0.5, 1));
+        assert!(q.push_with_parent(u.clone(), 0.75, 1, Some("https://ex.com/seed".into())));
+        let first = q.pop().unwrap();
+        assert_eq!(first.url, normalize(&u));
+        assert_eq!(first.score, 0.75);
+        assert_eq!(first.parent.as_deref(), Some("https://ex.com/seed"));
+        // A lower re-push never lowers a queued entry.
+        let mut q2 = FrontierQueue::new();
+        assert!(q2.push(u.clone(), 0.75, 1));
+        assert!(!q2.push(u.clone(), -0.75, 1));
+        // Once popped (fetched), a re-push stays dropped.
+        assert_eq!(q2.pop().unwrap().url, normalize(&u));
+        assert!(!q2.push(u.clone(), 5.0, 1));
+        assert!(q2.pop().is_none());
+    }
+
+    fn seed_urls(n: usize) -> Vec<(Url, f64)> {
+        (0..n)
+            .map(|i| {
+                (
+                    Url::parse(&format!("https://ex.com/p{i}")).unwrap(),
+                    10.0 - i as f64,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn shaper_is_deterministic_per_seed() {
+        // Same pushed list + same seed = same traversal order.
+        let urls = seed_urls(6);
+        let mut qa = FrontierQueue::with_shaper(true, 0x5eed);
+        let mut qb = FrontierQueue::with_shaper(true, 0x5eed);
+        for (u, s) in &urls {
+            qa.push(u.clone(), *s, 0);
+            qb.push(u.clone(), *s, 0);
+        }
+        for _ in 0..6 {
+            assert_eq!(qa.pop().unwrap().url, qb.pop().unwrap().url);
+        }
+        assert!(qa.pop().is_none());
+    }
+
+    #[test]
+    fn shape_kill_switch_path_matches_score_order() {
+        // Explicit kill switch == shaper off == classic heap order.
+        let urls = seed_urls(6);
+        let mut q = FrontierQueue::with_shaper(false, 0x5eed);
+        for (u, s) in &urls {
+            q.push(u.clone(), *s, 0);
+        }
+        for i in 0..6 {
+            assert!(
+                q.pop().unwrap().url.ends_with(&format!("/p{i}")),
+                "unshaped pop {i}"
+            );
+        }
+    }
+
+    #[test]
+    fn shaper_is_reader_biased_not_uniform() {
+        // The head window reordering is not a lottery: the exact top
+        // element is still picked a majority of the time across seeds.
+        // (Weights: 8/4/2/1 over the window.)
+        let urls = seed_urls(4);
+        let mut top = 0;
+        let mut second = 0;
+        for b in 1u64..41 {
+            let mut q = FrontierQueue::with_shaper(true, b * 0x9e37);
+            for (u, s) in &urls {
+                q.push(u.clone(), *s, 0);
+            }
+            let got = q.pop().unwrap().url.to_string();
+            if got.ends_with("/p0") {
+                top += 1;
+            } else if got.ends_with("/p1") {
+                second += 1;
+            }
+        }
+        assert!(top > second + 4, "top {top} vs second {second}");
+    }
+
+    #[test]
+    fn shaper_never_loses_items() {
+        // Requeue mechanics: every pushed URL still comes out exactly once.
+        let urls = seed_urls(9);
+        let mut q = FrontierQueue::with_shaper(true, 0x123456789);
+        for (u, s) in &urls {
+            q.push(u.clone(), *s, 0);
+        }
+        let mut got = Vec::new();
+        while let Some(f) = q.pop() {
+            got.push(f.url.to_string());
+        }
+        assert_eq!(got.len(), 9);
+        let mut sorted = got.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), 9);
     }
 
     #[test]
@@ -580,6 +944,22 @@ mod tests {
         assert_eq!(auto_scope("/docs/payments"), Some("/docs/*".into()));
     }
 
+    // #249: a page at the host root is not a project section.
+    // `/p0.html/*` matched nothing, so a crawl seeded on such a
+    // page filtered every sibling and returned empty.
+    #[test]
+    fn auto_scope_root_level_file_is_whole_host() {
+        assert_eq!(auto_scope("/p0.html"), None);
+        assert_eq!(auto_scope("/index.php"), None);
+        assert_eq!(auto_scope("/README.md"), None);
+        // Section-like single segments keep the multi-tenant rule.
+        assert_eq!(auto_scope("/tokio"), Some("/tokio/*".into()));
+        assert_eq!(auto_scope("/v1.2"), Some("/v1.2/*".into()));
+        assert_eq!(auto_scope("/.well-known"), Some("/.well-known/*".into()));
+        // Deeper files already used the parent directory.
+        assert_eq!(auto_scope("/docs/p0.html"), Some("/docs/*".into()));
+    }
+
     #[test]
     fn auto_scope_root_is_none() {
         assert_eq!(auto_scope("/"), None);
@@ -588,7 +968,7 @@ mod tests {
 
     #[test]
     fn auto_scope_single_segment_is_scope() {
-        // /tokio on docs.rs -> /tokio/* (NOT None — multi-tenant host)
+        // /tokio on docs.rs -> /tokio/* (NOT None : multi-tenant host)
         assert_eq!(auto_scope("/tokio"), Some("/tokio/*".into()));
         assert_eq!(auto_scope("/learn"), Some("/learn/*".into()));
         assert_eq!(auto_scope("/blog"), Some("/blog/*".into()));
@@ -601,5 +981,50 @@ mod tests {
         assert!(eff.contains(&"/api/*".to_string()));
         assert!(eff.contains(&"/login*".to_string()));
         assert!(eff.contains(&"/cart*".to_string()));
+    }
+
+    // The crawl's rules check records a denied URL once by inserting its
+    // key here. The insert must report a repeat, keep an already-queued
+    // entry (unlike mark_seen), and block a later push of the same URL.
+    #[test]
+    fn insert_seen_reports_new_keys_and_leaves_the_queue_alone() {
+        let mut q = FrontierQueue::new();
+        let denied: Url = "https://blocked.example/a#frag".parse().unwrap();
+        assert!(q.insert_seen(normalize(&denied)), "first insert is new");
+        assert!(!q.insert_seen(normalize(&denied)), "a repeat is not new");
+        assert!(q.is_empty(), "insert_seen never queues");
+        assert!(
+            !q.push(denied, 5.0, 1),
+            "a key already seen is never queued afterwards"
+        );
+        assert!(q.is_empty());
+
+        // Negative: a queued entry survives insert_seen of its own key.
+        let queued: Url = "https://ex.com/a".parse().unwrap();
+        assert!(q.push(queued.clone(), 1.0, 1));
+        assert!(!q.insert_seen(normalize(&queued)));
+        assert_eq!(q.len(), 1, "the queued entry stays queued");
+        assert_eq!(q.pop().map(|f| f.url), Some(normalize(&queued)));
+    }
+
+    #[test]
+    fn canonical_scheme_upgrades_same_host_default_http_only() {
+        let seed: Url = "https://ex.com/docs/".parse().unwrap();
+        let up = |s: &str| canonical_scheme(&s.parse().unwrap(), &seed).to_string();
+        assert_eq!(up("http://ex.com/a?b=1"), "https://ex.com/a?b=1");
+        // Other host: untouched.
+        assert_eq!(up("http://other.com/a"), "http://other.com/a");
+        // Explicit non-default port: untouched (https may not exist there).
+        assert_eq!(up("http://ex.com:8000/a"), "http://ex.com:8000/a");
+        // Explicit default port: parse normalizes it, then upgrade.
+        assert_eq!(up("http://ex.com:80/a"), "https://ex.com/a");
+        // Already https: untouched.
+        assert_eq!(up("https://ex.com/a"), "https://ex.com/a");
+        // An http seed gives no scheme evidence: untouched.
+        let http_seed: Url = "http://ex.com/".parse().unwrap();
+        assert_eq!(
+            canonical_scheme(&"https://ex.com/a".parse().unwrap(), &http_seed).to_string(),
+            "https://ex.com/a"
+        );
     }
 }

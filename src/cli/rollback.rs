@@ -1,4 +1,4 @@
-//! `donsetch --rollback` — revert to the previous binary version.
+//! `donsetch --rollback` : revert to the previous binary version.
 //!
 //! Swaps the current binary with the `.bak` backup saved by
 //! `--update`. The current binary becomes the new `.bak` (so
@@ -9,16 +9,18 @@
 //!   Unix:   atomic rename swap. The running process keeps its
 //!           inode open.
 //!   Windows: rename running .exe to .bak, copy old .bak to .exe.
-//!           Also swaps pdfium.dll if a .dll.bak exists.
+//!           Also swaps pdfium.dll and onnxruntime.dll if a .bak exists.
 
 use std::path::{Path, PathBuf};
 
+use crate::DISPLAY_NAME;
 use crate::cli;
 
 #[allow(clippy::needless_borrows_for_generic_args)]
-pub fn run() {
+pub fn run(args: &[String]) {
+    crate::cli::args::Spec::new("rollback", "donsetch rollback", &[]).reject(&args[2..]);
     cli::init();
-    cli::print_title("DonSeTch Rollback");
+    cli::print_title(&format!("{DISPLAY_NAME} Rollback"));
 
     let current = env!("CARGO_PKG_VERSION");
     cli::print_kv("current", current);
@@ -35,7 +37,7 @@ pub fn run() {
 
     let exe_dir = exe.parent().unwrap_or_else(|| Path::new("."));
 
-    // Borrow as &Path for fs operations — &Path is Copy, so it
+    // Borrow as &Path for fs operations : &Path is Copy, so it
     // won't move and won't trigger clippy::needless_borrows.
 
     // ── Locate backup ────────────────────────────────────────
@@ -110,50 +112,26 @@ pub fn run() {
 
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-
-        // Strategy: copy .bak to a temp, then atomic rename over exe.
-        // The old exe becomes the new .bak (for roll-forward).
-        let tmp = exe_dir.join(".donsetch.rollback.tmp");
-
-        // Copy backup to temp.
-        if let Err(e) = std::fs::copy(&bak_path, &tmp).map_err(|e| e.to_string()) {
-            println!("  {} Copy backup failed: {e}", cli::icon_fail());
-            std::process::exit(1);
-        }
-
-        // Set executable.
-        if let Err(e) = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))
-            .map_err(|e| e.to_string())
-        {
-            let _ = std::fs::remove_file(&tmp);
-            println!("  {} chmod failed: {e}", cli::icon_fail());
-            std::process::exit(1);
-        }
-
-        // Save current as new backup (for roll-forward).
-        if let Err(e) = std::fs::copy(&exe, &bak_path).map_err(|e| e.to_string()) {
-            let _ = std::fs::remove_file(&tmp);
-            println!("  {} Save current as backup failed: {e}", cli::icon_fail());
-            std::process::exit(1);
-        }
-
-        // Write new backup version (the version we just rolled away from).
-        let _ = std::fs::write(&bak_ver_path, current);
-
-        // Atomic replace.
-        if let Err(e) = std::fs::rename(&tmp, &exe).map_err(|e| e.to_string()) {
-            let _ = std::fs::remove_file(&tmp);
-            println!("  {} Atomic rename failed: {e}", cli::icon_fail());
-            if e.contains("Permission")
-                || e.contains("denied")
-                || e.contains("access")
-                || e.contains("read-only")
-            {
-                println!("    Try: sudo donsetch --rollback");
+        match swap_unix(&exe, &bak_path, &bak_ver_path, current) {
+            Ok(Some(warning)) => println!("  {} {warning}", cli::icon_warn()),
+            Ok(None) => {}
+            Err(e) => {
+                println!("  {} {e}", cli::icon_fail());
+                if e.contains("Permission")
+                    || e.contains("denied")
+                    || e.contains("access")
+                    || e.contains("read-only")
+                {
+                    println!("    Try: sudo donsetch --rollback");
+                }
+                std::process::exit(1);
             }
-            std::process::exit(1);
         }
+
+        // The previous binary gets its previous runtime back
+        // (update keeps each sibling as `<name>.bak`). Not fatal:
+        // the binary rollback above already succeeded.
+        restore_sibling_libs(exe_dir);
     }
 
     #[cfg(windows)]
@@ -162,8 +140,11 @@ pub fn run() {
         // copy .bak to .exe, then rename .rollback.tmp to .bak.
         let tmp = exe_dir.join(".donsetch.rollback.tmp");
 
-        // Remove stale temp from interrupted rollback.
-        let _ = std::fs::remove_file(&tmp);
+        // Recover (or drop) the stale temp from an interrupted
+        // rollback. Between the two steps below the binary lives ONLY
+        // at `.donsetch.rollback.tmp`; a crash there must not have the
+        // next rollback delete that last copy.
+        recover_stale_rollback_tmp(&exe, &tmp);
 
         // Rename current running exe to temp.
         if let Err(e) = std::fs::rename(&exe, &tmp).map_err(|e| e.to_string()) {
@@ -178,36 +159,32 @@ pub fn run() {
             e.to_string()
         }) {
             println!("  {} Copy backup failed: {e}", cli::icon_fail());
-            return;
+            // A plain `return` here reported success (exit 0) for
+            // a rollback that did not happen.
+            std::process::exit(1);
         }
 
         // Rename old current to .bak (new backup for roll-forward).
-        if let Err(e) = std::fs::rename(&tmp, &bak_path).map_err(|e| e.to_string()) {
-            // Not fatal — the rollback succeeded, we just couldn't
-            // save the roll-forward backup.
-            println!(
-                "  {} Rollback OK, but could not save roll-forward backup: {e}",
-                cli::icon_warn()
-            );
-        }
-
-        // Write new backup version.
-        let _ = std::fs::write(&bak_ver_path, current);
-
-        // Swap pdfium.dll if backups exist.
-        let dll_path = exe_dir.join("pdfium.dll");
-        let dll_bak = exe_dir.join("pdfium.dll.bak");
-        if dll_bak.exists() && dll_path.exists() {
-            let dll_tmp = exe_dir.join(".pdfium.rollback.tmp");
-            let _ = std::fs::remove_file(&dll_tmp);
-            if std::fs::rename(&dll_path, &dll_tmp).is_ok() {
-                if std::fs::copy(&dll_bak, &dll_path).is_ok() {
-                    let _ = std::fs::rename(&dll_tmp, &dll_bak);
-                } else {
-                    let _ = std::fs::rename(&dll_tmp, &dll_path);
-                }
+        match std::fs::rename(&tmp, &bak_path) {
+            // Write new backup version.
+            Ok(()) => {
+                let _ = std::fs::write(&bak_ver_path, current);
+            }
+            Err(e) => {
+                // Not fatal : the rollback succeeded, we just couldn't
+                // save the roll-forward backup. `.bak.ver` is left as
+                // is: it still describes what `.bak` holds.
+                println!(
+                    "  {} Rollback OK, but could not save roll-forward backup: {e}",
+                    cli::icon_warn()
+                );
             }
         }
+
+        // The previous binary gets its previous runtime back
+        // (update keeps each sibling as `<name>.bak`). Not fatal:
+        // the binary rollback above already succeeded.
+        restore_sibling_libs(exe_dir);
     }
 
     println!("  {} rolled back", cli::icon_pass());
@@ -221,5 +198,235 @@ pub fn run() {
         println!("  Rolled back {current} -> {bak_ver}");
     } else {
         println!("  Rolled back to previous version");
+    }
+}
+
+/// Put every sibling runtime `update` staged back beside the
+/// previous binary. One list (`SIBLING_LIBS`) drives this on every
+/// platform so a rolled-back binary never keeps a newer runtime
+/// (4.3.7's Windows branch restored `pdfium.dll` only).
+fn restore_sibling_libs(exe_dir: &std::path::Path) {
+    for name in crate::cli::update::SIBLING_LIBS {
+        if let Err(e) = crate::cli::update::swap_sibling_lib(exe_dir, name) {
+            println!(
+                "  {} Rolled back the binary, but could not restore {name}: {e}",
+                cli::icon_warn()
+            );
+        }
+    }
+}
+
+/// Recover a stale `.donsetch.rollback.tmp` from an interrupted
+/// rollback. On Windows the swap renames the running exe aside to
+/// `tmp` and only then copies the backup into place: a crash in
+/// between leaves the ONLY copy of the current binary at `tmp` and
+/// nothing at the exe path. The next rollback used to `remove_file`
+/// that temp outright -- destroying the last copy before discovering
+/// there was no exe to rename. Put it back instead; a temp next to a
+/// healthy exe is just debris and is dropped.
+#[cfg(any(windows, test))]
+fn recover_stale_rollback_tmp(exe: &Path, tmp: &Path) {
+    if !exe.exists() && tmp.exists() {
+        let _ = std::fs::rename(tmp, exe);
+    } else {
+        let _ = std::fs::remove_file(tmp);
+    }
+}
+
+/// Unix swap: the backup becomes the binary, the binary becomes the
+/// backup (for roll-forward). Returns `Ok(Some(warning))` when the
+/// rollback itself succeeded but the roll-forward backup could not
+/// be saved.
+///
+/// Ordering matters: the previous version exists only in `.bak`, so
+/// `.bak` must not be overwritten until the new binary is in place.
+/// The old sequence copied the current binary OVER `.bak` before the
+/// final rename and deleted its temp on rename failure -- a failed
+/// rename (sticky-bit dir, immutable file) destroyed the only copy
+/// of the previous version and left `.bak` holding the current one.
+#[cfg(unix)]
+fn swap_unix(
+    exe: &Path,
+    bak_path: &Path,
+    bak_ver_path: &Path,
+    current: &str,
+) -> Result<Option<String>, String> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let exe_dir = exe.parent().unwrap_or_else(|| Path::new("."));
+    let tmp = exe_dir.join(".donsetch.rollback.tmp");
+    let bak_tmp = exe_dir.join(".donsetch.bak.rollback.tmp");
+    let _ = std::fs::remove_file(&tmp);
+    let _ = std::fs::remove_file(&bak_tmp);
+
+    // Stage: the backup as the future binary, the current binary as
+    // the future backup. Nothing live is touched yet.
+    std::fs::copy(bak_path, &tmp).map_err(|e| format!("Copy backup failed: {e}"))?;
+    if let Err(e) = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("chmod failed: {e}"));
+    }
+    if let Err(e) = std::fs::copy(exe, &bak_tmp) {
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(&bak_tmp);
+        return Err(format!("Save current as backup failed: {e}"));
+    }
+
+    // Atomic replace. On failure both stages are discarded and the
+    // original `.bak` is untouched.
+    if let Err(e) = std::fs::rename(&tmp, exe) {
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(&bak_tmp);
+        return Err(format!("Atomic rename failed: {e}"));
+    }
+
+    // Only now does the previous backup get replaced. If this fails,
+    // `.bak.ver` is deliberately left alone: it still describes what
+    // `.bak` holds (the version now running), so the next --rollback
+    // correctly refuses with "same version" instead of swapping a
+    // binary with itself.
+    if let Err(e) = std::fs::rename(&bak_tmp, bak_path) {
+        let _ = std::fs::remove_file(&bak_tmp);
+        return Ok(Some(format!(
+            "Rollback OK, but could not save roll-forward backup: {e}"
+        )));
+    }
+    // Version metadata: the version we just rolled away from.
+    let _ = std::fs::write(bak_ver_path, current);
+    Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "donsetch-rollback-test-{}-{tag}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        dir
+    }
+
+    fn read(p: &Path) -> String {
+        std::fs::read_to_string(p).unwrap_or_default()
+    }
+
+    // restore_sibling_libs must cover every name the updater stages.
+    // 4.3.7's Windows rollback restored pdfium.dll only, so a
+    // rolled-back binary kept a newer onnxruntime.dll. This is the
+    // red proof: drop a name from the restore list and it fails.
+    #[test]
+    fn restore_sibling_libs_covers_every_staged_runtime() {
+        let dir = scratch("restore-libs");
+        for name in crate::cli::update::SIBLING_LIBS {
+            std::fs::write(dir.join(name), format!("new-{name}")).unwrap();
+            std::fs::write(dir.join(format!("{name}.bak")), format!("old-{name}")).unwrap();
+        }
+
+        restore_sibling_libs(&dir);
+
+        for name in crate::cli::update::SIBLING_LIBS {
+            assert_eq!(
+                read(&dir.join(name)),
+                format!("old-{name}"),
+                "{name} not restored"
+            );
+            assert_eq!(
+                read(&dir.join(format!("{name}.bak"))),
+                format!("new-{name}"),
+                "{name} roll-forward missing"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // An interrupted rollback leaves the ONLY copy of the current
+    // binary at `.donsetch.rollback.tmp` (the window between renaming
+    // the exe aside and copying the backup into place). The next
+    // rollback used to delete that temp outright, destroying the last
+    // copy. Red proof: the old `remove_file` leaves the exe missing.
+    #[test]
+    fn a_stale_rollback_tmp_is_restored_when_the_exe_is_gone() {
+        let dir = scratch("recover-gone");
+        let exe = dir.join("donsetch.exe");
+        let tmp = dir.join(".donsetch.rollback.tmp");
+        std::fs::write(&tmp, "current-bin").unwrap();
+
+        recover_stale_rollback_tmp(&exe, &tmp);
+
+        assert_eq!(read(&exe), "current-bin", "last copy of the binary lost");
+        assert!(!tmp.exists(), "temp left behind after recovery");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_stale_rollback_tmp_is_dropped_when_the_exe_is_present() {
+        let dir = scratch("recover-present");
+        let exe = dir.join("donsetch.exe");
+        let tmp = dir.join(".donsetch.rollback.tmp");
+        std::fs::write(&exe, "current-bin").unwrap();
+        std::fs::write(&tmp, "debris").unwrap();
+
+        recover_stale_rollback_tmp(&exe, &tmp);
+
+        assert_eq!(read(&exe), "current-bin");
+        assert!(!tmp.exists(), "debris kept next to a healthy exe");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn swap_exchanges_binary_and_backup() {
+        let dir = scratch("swap");
+        let exe = dir.join("donsetch");
+        let bak = dir.join("donsetch.bak");
+        let ver = dir.join("donsetch.bak.ver");
+        std::fs::write(&exe, "current").unwrap();
+        std::fs::write(&bak, "previous").unwrap();
+
+        let warn = swap_unix(&exe, &bak, &ver, "9.9.9").expect("swap");
+
+        assert_eq!(warn, None);
+        assert_eq!(read(&exe), "previous");
+        assert_eq!(read(&bak), "current");
+        assert_eq!(read(&ver), "9.9.9");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&exe).unwrap().permissions().mode();
+            assert!(mode & 0o111 != 0, "rolled-back binary not executable");
+        }
+        assert!(!dir.join(".donsetch.rollback.tmp").exists());
+        assert!(!dir.join(".donsetch.bak.rollback.tmp").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Any failure before the swap completes must leave `.bak` (the
+    // only copy of the previous version) untouched and no staging
+    // files behind. A rename-over-immutable-file failure can't be
+    // forced portably in a unit test; the reachable failure here is
+    // the current binary being unreadable as a file (a directory in
+    // its place), which trips the same invariant. The rename case
+    // is covered by ordering: `.bak` is not written until after the
+    // rename has succeeded.
+    #[cfg(unix)]
+    #[test]
+    fn failure_before_the_swap_leaves_the_backup_intact() {
+        let dir = scratch("stagefail");
+        let exe = dir.join("donsetch");
+        std::fs::create_dir_all(exe.join("occupied")).unwrap();
+        let bak = dir.join("donsetch.bak");
+        let ver = dir.join("donsetch.bak.ver");
+        std::fs::write(&bak, "previous").unwrap();
+
+        let err = swap_unix(&exe, &bak, &ver, "9.9.9").expect_err("must fail");
+        assert!(err.contains("failed"), "unexpected error shape: {err}");
+        assert_eq!(read(&bak), "previous", "backup was destroyed");
+        assert!(!ver.exists());
+        assert!(!dir.join(".donsetch.rollback.tmp").exists());
+        assert!(!dir.join(".donsetch.bak.rollback.tmp").exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

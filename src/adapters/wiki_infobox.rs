@@ -6,7 +6,7 @@
 
 use scraper::{ElementRef, Html, Selector};
 
-use crate::extract::{ContentKind, ExtractOptions, Extracted};
+use crate::extract::{ContentKind, ExtractOptions, Extracted, inline};
 
 pub fn extract(html: &str, url: &str, opts: &ExtractOptions) -> Option<Extracted> {
     if opts.selector.is_some() {
@@ -14,13 +14,22 @@ pub fn extract(html: &str, url: &str, opts: &ExtractOptions) -> Option<Extracted
     }
     let u = url::Url::parse(url).ok()?;
     let host = u.host_str()?;
-    // *.wikipedia.org only — the REST/mobile mirrors differ.
+    // *.wikipedia.org only : the REST/mobile mirrors differ.
     if !host.ends_with(".wikipedia.org") {
         return None;
     }
-    // Article pages only (/wiki/<title>, not /wiki/Special:...).
+    // Article pages only (/wiki/<title>). A colon inside a title is
+    // fine ("Star Trek: The Original Series" is an article); a
+    // NAMESPACE prefix (File:, Talk:, Special:, ...) is not. The
+    // old blanket `contains(':')` skipped every colon-titled
+    // article's infobox.
     let title = u.path().strip_prefix("/wiki/")?;
-    if title.is_empty() || title.contains(':') || u.path().contains("Special:") {
+    if title.is_empty() {
+        return None;
+    }
+    if let Some((prefix, _)) = title.split_once(':')
+        && is_namespace(prefix)
+    {
         return None;
     }
 
@@ -66,7 +75,7 @@ pub fn extract(html: &str, url: &str, opts: &ExtractOptions) -> Option<Extracted
 
     // Hand the rest to the generic pipeline, then prepend the
     // infobox. Reuse extract by calling the generic path with the
-    // infobox REMOVED from the html — simplest correct approach:
+    // infobox REMOVED from the html : simplest correct approach:
     // re-serialize is heavy; instead extract the article body
     // directly from #mw-content-text via inline rendering of
     // block children.
@@ -79,7 +88,7 @@ pub fn extract(html: &str, url: &str, opts: &ExtractOptions) -> Option<Extracted
     let body = doc.select(&body_sel).next()?;
     let mut body_opts = opts.clone();
     body_opts.max_chars = None; // paginate once, below, after prepending
-    let body_md = render_blocks(body, url, &body_opts);
+    let body_md = render_markdown_blocks(body, url, &body_opts);
 
     let mut full = md;
     full.push_str(&body_md);
@@ -87,6 +96,7 @@ pub fn extract(html: &str, url: &str, opts: &ExtractOptions) -> Option<Extracted
     let max = opts.max_chars.unwrap_or(16_000).max(200);
     let (slice, next) = crate::extract::paginate_public(&full, opts.offset, max);
     Some(Extracted {
+        tokens_est: slice.len() / 4,
         markdown: slice,
         title: doc
             .select(&Selector::parse("h1.firstHeading").unwrap())
@@ -99,16 +109,56 @@ pub fn extract(html: &str, url: &str, opts: &ExtractOptions) -> Option<Extracted
         next_offset: next,
         blocks_total: fields.len(),
         blocks_shown: fields.len(),
-        tokens_est: total / 4,
+        focus_omitted: false,
         thin: false,
         content_kind: ContentKind::Article,
         lang: "en".to_string(),
         quality: 0.9,
         pdf_pages: None,
         images: Vec::new(),
-        fingerprint: None,
+        // Change tracking (since_last verdicts) needs the fingerprint
+        // the generic path records: sha256 of the full pre-pagination
+        // markdown.
+        fingerprint: Some(crate::pages::history::PageHistory::fingerprint(&full)),
         via: Some("adapter:wikipedia-infobox"),
+        partial: None,
     })
+}
+
+/// The MediaWiki namespace prefixes that are never articles
+/// (case-insensitive: `file:` and `File:` name the same namespace).
+fn is_namespace(prefix: &str) -> bool {
+    const NS: [&str; 28] = [
+        "media",
+        "special",
+        "talk",
+        "user",
+        "user talk",
+        "wikipedia",
+        "wikipedia talk",
+        "file",
+        "file talk",
+        "mediawiki",
+        "mediawiki talk",
+        "template",
+        "template talk",
+        "help",
+        "help talk",
+        "category",
+        "category talk",
+        "portal",
+        "portal talk",
+        "draft",
+        "draft talk",
+        "timedtext",
+        "module",
+        "module talk",
+        "gadget",
+        "gadget definition",
+        "book",
+        "education program",
+    ];
+    NS.contains(&prefix.to_lowercase().as_str())
 }
 
 /// Field value: text + links made readable ("Berlin, Germany"),
@@ -117,7 +167,10 @@ fn field_value(td: ElementRef) -> String {
     let mut out = String::new();
     for child in td.children() {
         match child.value() {
-            scraper::Node::Text(t) => out.push_str(&t.text),
+            scraper::Node::Text(t) => {
+                out.push(' ');
+                out.push_str(&t.text);
+            }
             scraper::Node::Element(el) => {
                 let c = match ElementRef::wrap(child) {
                     Some(c) => c,
@@ -135,7 +188,10 @@ fn field_value(td: ElementRef) -> String {
                             .collect();
                         out.push_str(&items.join("; "));
                     }
-                    _ => out.push_str(&plain_text(c)),
+                    _ => {
+                        out.push(' ');
+                        out.push_str(&plain_text(c));
+                    }
                 }
             }
             _ => {}
@@ -154,7 +210,9 @@ fn field_value(td: ElementRef) -> String {
 }
 
 fn plain_text(el: ElementRef) -> String {
-    el.text().collect::<String>().trim().to_string()
+    // Visible text only: a script/style subtree inside the element is
+    // source, not content (#288).
+    inline::visible_text(el)
 }
 
 /// Page furniture, checked on the element itself (selecting
@@ -175,9 +233,11 @@ fn is_furniture(el: ElementRef) -> bool {
     }
 }
 
-/// Minimal block walk over the article body: headings, paragraphs,
-/// lists, tables, code — furniture skipped at the element level.
-fn render_blocks(root: ElementRef, url: &str, opts: &ExtractOptions) -> String {
+/// Minimal block walk over an article body: headings, paragraphs,
+/// lists, tables, code : furniture skipped at the element level.
+/// Shared with the reddit wiki renderer (a wiki page is a whole
+/// document, not one paragraph).
+pub(crate) fn render_markdown_blocks(root: ElementRef, url: &str, opts: &ExtractOptions) -> String {
     let mut out = String::new();
     let mut opts = opts.clone();
     opts.include_links = true; // interwiki links are the point of wiki
@@ -189,7 +249,7 @@ fn render_blocks(root: ElementRef, url: &str, opts: &ExtractOptions) -> String {
             continue;
         }
         match el.value().name() {
-            "h2" | "h3" | "h4" => {
+            "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
                 let t = plain_text(el);
                 if !t.is_empty() {
                     let level = el.value().name().as_bytes()[1] - b'0';
@@ -204,24 +264,16 @@ fn render_blocks(root: ElementRef, url: &str, opts: &ExtractOptions) -> String {
                 }
             }
             "ul" | "ol" => {
-                let li_sel = Selector::parse("li").unwrap();
-                for (i, li) in el.select(&li_sel).enumerate() {
-                    let (m, _) = crate::extract::inline::markdown(li, url, &opts);
-                    if !m.trim().is_empty() {
-                        let bullet = if el.value().name() == "ol" {
-                            format!("{}. ", i + 1)
-                        } else {
-                            "- ".to_string()
-                        };
-                        out.push_str(&format!("{bullet}{}\n", m.trim()));
-                    }
+                let (items, _) = crate::extract::blocks::list_items(el, url, &opts, 0);
+                if !items.is_empty() {
+                    crate::extract::render::push_list(&mut out, &items, el.value().name() == "ol");
                 }
-                out.push('\n');
             }
             "pre" => {
-                let code = plain_text(el);
+                let code = inline::visible_text_raw(el).trim().to_string();
                 if !code.is_empty() {
-                    out.push_str(&format!("```\n{code}\n```\n\n"));
+                    let fence = crate::extract::render::code_fence(&code);
+                    out.push_str(&format!("{fence}\n{code}\n{fence}\n\n"));
                 }
             }
             "table" => {
@@ -230,7 +282,7 @@ fn render_blocks(root: ElementRef, url: &str, opts: &ExtractOptions) -> String {
             }
             "div" | "section" => {
                 // Recurse one level (gallery, columns…).
-                let inner = render_blocks(el, url, &opts);
+                let inner = render_markdown_blocks(el, url, &opts);
                 if !inner.is_empty() {
                     out.push_str(&inner);
                 }
@@ -273,6 +325,17 @@ fn render_wiki_table(table: ElementRef, url: &str, opts: &ExtractOptions, out: &
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn report_audit_infobox_keeps_name_and_date_boundaries() {
+        let html = Html::parse_fragment(
+            "<table><tr><td><span>January</span><span>26</span>, <span>2021</span><br><a>Ada Amodei</a><a>Bob Amodei</a><sup>[2]</sup></td></tr></table>",
+        );
+        let cell = html.select(&Selector::parse("td").unwrap()).next().unwrap();
+        let value = field_value(cell);
+        assert!(value.contains("January 26") && value.contains("Ada Amodei Bob Amodei"));
+        assert!(!value.contains("[2]"));
+    }
+
     use super::*;
 
     fn opts() -> ExtractOptions {
@@ -317,6 +380,23 @@ mod tests {
         assert!(ex.markdown.contains("personal project in 2006"));
     }
 
+    // V08: an adapter read must carry a change fingerprint so a
+    // since_last re-fetch can answer with a verdict; None silently
+    // disabled change tracking for every adapter page.
+    #[test]
+    fn an_infobox_read_carries_a_change_fingerprint() {
+        let url = "https://en.wikipedia.org/wiki/Rust_(programming_language)";
+        let ex = extract(WIKI, url, &opts()).unwrap();
+        let fp = ex.fingerprint.expect("since_last needs a fingerprint");
+        // Stable across identical input.
+        let again = extract(WIKI, url, &opts()).unwrap();
+        assert_eq!(again.fingerprint.as_deref(), Some(fp.as_str()));
+        // Sensitive to content.
+        let edited = WIKI.replace("personal project in 2006", "personal project in 2007");
+        let other = extract(&edited, url, &opts()).unwrap();
+        assert_ne!(other.fingerprint.as_deref(), Some(fp.as_str()));
+    }
+
     #[test]
     fn non_article_pages_rejected() {
         assert!(
@@ -331,5 +411,64 @@ mod tests {
         // No infobox → no adapter.
         let plain = "<html><body><div class='mw-parser-output'><p>text</p></div></body></html>";
         assert!(extract(plain, "https://en.wikipedia.org/wiki/Plain", &opts()).is_none());
+    }
+
+    // A colon in an article title is not a namespace: the blanket
+    // check skipped every such article's infobox.
+    #[test]
+    fn colon_articles_keep_the_infobox_namespaces_do_not() {
+        let ex = extract(
+            WIKI,
+            "https://en.wikipedia.org/wiki/Star_Trek:_The_Original_Series",
+            &opts(),
+        )
+        .expect("colon titles are articles");
+        assert!(ex.markdown.contains("## Infobox"));
+        for ns in [
+            "Talk:Rust",
+            "File:Example.jpg",
+            "Category:Programming_languages",
+            "Wikipedia:About",
+            "Special:Search",
+        ] {
+            let url = format!("https://en.wikipedia.org/wiki/{ns}");
+            assert!(extract(WIKI, &url, &opts()).is_none(), "{ns}");
+        }
+    }
+
+    #[test]
+    fn pre_containing_a_fence_gets_a_longer_fence() {
+        // e.g. the Markdown article's own syntax example.
+        let html = WIKI.replace(
+            "<h2>History</h2>",
+            "<pre>```python\nprint(1)\n```</pre><h2>History</h2>",
+        );
+        let ex = extract(&html, "https://en.wikipedia.org/wiki/Markdown", &opts()).unwrap();
+        assert!(
+            ex.markdown
+                .contains("````\n```python\nprint(1)\n```\n````\n"),
+            "{}",
+            ex.markdown
+        );
+    }
+
+    // `el.select("li")` matched nested items too, so each one
+    // appeared fused into its parent's line and again as its own
+    // top-level bullet (and nested numbering restarted the count).
+    #[test]
+    fn nested_list_items_are_indented_not_duplicated() {
+        let html = WIKI.replace(
+            "<h2>History</h2>",
+            "<ul><li>Outer one<ul><li>Inner a</li><li>Inner b</li></ul></li><li>Outer two</li></ul>\
+             <ol><li>First<ol><li>Sub</li></ol></li><li>Second</li></ol><h2>History</h2>",
+        );
+        let ex = extract(&html, "https://en.wikipedia.org/wiki/Lists", &opts()).unwrap();
+        let md = &ex.markdown;
+        assert_eq!(md.matches("Inner a").count(), 1, "{md}");
+        assert!(
+            md.contains("- Outer one\n  - Inner a\n  - Inner b\n- Outer two\n"),
+            "{md}"
+        );
+        assert!(md.contains("1. First\n  - Sub\n2. Second\n"), "{md}");
     }
 }

@@ -14,14 +14,14 @@
 /// Content-Type to pass for browser-provided (ghost) DOM text.
 ///
 /// The ghost tier reads text out of a live Chromium DOM via CDP,
-/// which returns UTF-8 strings — the browser already ran charset
+/// which returns UTF-8 strings : the browser already ran charset
 /// decoding. But the rendered DOM still carries the page's original
 /// `<meta charset=...>` declaration (e.g. gb18030 on 69shuba), so a
 /// bare `text/html` makes `decode` sniff that stale meta and decode
 /// the already-UTF-8 bytes a second time as gb18030 → mojibake (#35).
 /// Declaring `charset=utf-8` here wins at step 1 (header beats meta)
 /// and copies the text through verbatim. Raw HTTP bytes keep full
-/// detection — only browser text is pinned.
+/// detection : only browser text is pinned.
 pub const GHOST_TEXT_CT: &str = "text/html; charset=utf-8";
 
 /// Decode body bytes to a String using the detection order above.
@@ -687,7 +687,7 @@ mod tests {
         let decoded = decode(&dom, "text/html");
         assert!(
             !decoded.contains("末日乐园"),
-            "bare text/html must not pass browser DOM through cleanly — \
+            "bare text/html must not pass browser DOM through cleanly : \
              that is exactly the bug GHOST_TEXT_CT exists to prevent; got: {decoded}"
         );
     }

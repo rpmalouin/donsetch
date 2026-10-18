@@ -4,13 +4,13 @@
 //! to re-score search results by semantic relevance. The cross-encoder
 //! reads the query and each document **together** through full attention,
 //! capturing relationships that RRF (rank-based) and BM25 (keyword-based)
-//! fundamentally cannot — "fast web scraper" matches "high-speed crawler"
+//! fundamentally cannot : "fast web scraper" matches "high-speed crawler"
 //! even with zero word overlap.
 //!
 //! Same lazy-cache pattern as OCR: model files are downloaded + sha256-
 //! verified on first use, then loaded from disk on subsequent calls. If
 //! the model is unavailable (download failed, feature disabled, offline),
-//! reranking is skipped gracefully — results fall back to RRF+BM25 ranking.
+//! reranking is skipped gracefully : results fall back to RRF+BM25 ranking.
 //!
 //! The 23MB model runs in ~5ms/pair on CPU. For 50 results: ~250ms,
 //! negligible on top of 1-3s multi-engine search time.
@@ -34,9 +34,6 @@ mod inner {
     /// Max sequence length for the MiniLM cross-encoder.
     const MAX_SEQ_LEN: usize = 512;
 
-    /// ONNX Runtime accepts the thread count as a C `int`.
-    const MAX_INTRA_THREADS: usize = i32::MAX as usize;
-
     const MODEL_URL: &str = "https://huggingface.co/Xenova/ms-marco-MiniLM-L-6-v2/resolve/main/onnx/model_quantized.onnx";
     const MODEL_SHA256: &str = "e9d8ebf845c413e981c175bfe49a3bfa9b3dcce2a3ba54875ee5df5a58639fbe";
     const TOKENIZER_URL: &str =
@@ -53,7 +50,7 @@ mod inner {
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum ThreadSelection {
-        Environment {
+        Configured {
             threads: usize,
         },
         Automatic {
@@ -70,29 +67,10 @@ mod inner {
     impl ThreadSelection {
         fn threads(self) -> Option<usize> {
             match self {
-                Self::Environment { threads } | Self::Automatic { threads, .. } => Some(threads),
+                Self::Configured { threads } | Self::Automatic { threads, .. } => Some(threads),
                 Self::OnnxDefault { .. } => None,
             }
         }
-    }
-
-    enum ThreadOverride<'a> {
-        Unset,
-        Value(&'a str),
-        InvalidUnicode,
-    }
-
-    fn parse_intra_threads(raw: &str) -> Result<usize, String> {
-        let raw = raw.trim();
-        let threads = raw.parse::<usize>().map_err(|_| {
-            format!("DONSEEK_RERANK_THREADS must be an integer between 1 and {MAX_INTRA_THREADS}")
-        })?;
-        if !(1..=MAX_INTRA_THREADS).contains(&threads) {
-            return Err(format!(
-                "DONSEEK_RERANK_THREADS must be an integer between 1 and {MAX_INTRA_THREADS}"
-            ));
-        }
-        Ok(threads)
     }
 
     fn automatic_intra_threads(effective: Option<usize>, physical: usize) -> ThreadSelection {
@@ -110,56 +88,39 @@ mod inner {
     }
 
     fn select_intra_threads(
-        override_value: ThreadOverride<'_>,
+        configured: u32,
         effective: Option<usize>,
         physical: usize,
-    ) -> (ThreadSelection, Option<String>) {
-        match override_value {
-            ThreadOverride::Value(raw) => match parse_intra_threads(raw) {
-                Ok(threads) => (ThreadSelection::Environment { threads }, None),
-                Err(e) => (
-                    automatic_intra_threads(effective, physical),
-                    Some(format!("{e}; using automatic selection")),
-                ),
-            },
-            ThreadOverride::InvalidUnicode => (
-                automatic_intra_threads(effective, physical),
-                Some(
-                    "DONSEEK_RERANK_THREADS must contain valid UTF-8; using automatic selection"
-                        .to_string(),
-                ),
-            ),
-            ThreadOverride::Unset => (automatic_intra_threads(effective, physical), None),
+    ) -> ThreadSelection {
+        if configured == 0 {
+            automatic_intra_threads(effective, physical)
+        } else {
+            ThreadSelection::Configured {
+                threads: configured as usize,
+            }
         }
     }
 
     fn configured_intra_threads() -> ThreadSelection {
         let effective = std::thread::available_parallelism().ok().map(|n| n.get());
         let physical = num_cpus::get_physical();
-        let raw = std::env::var("DONSEEK_RERANK_THREADS");
-        let override_value = match raw.as_deref() {
-            Ok(raw) => ThreadOverride::Value(raw),
-            Err(std::env::VarError::NotPresent) => ThreadOverride::Unset,
-            Err(std::env::VarError::NotUnicode(_)) => ThreadOverride::InvalidUnicode,
-        };
-        let (selection, warning) = select_intra_threads(override_value, effective, physical);
-        if let Some(warning) = warning {
-            eprintln!("[rerank] invalid configuration: {warning}");
-        }
-        selection
+        // Values have already been parsed and validated by the process-wide
+        // layered config. 0 = auto; every nonzero value is explicit.
+        let configured = crate::config::cfg().search.rerank_threads;
+        select_intra_threads(configured, effective, physical)
     }
 
-    fn log_thread_selection(selection: ThreadSelection) {
+    fn thread_selection_log(selection: ThreadSelection) -> String {
         match selection {
-            ThreadSelection::Environment { threads } => eprintln!(
-                "[rerank] ONNX intra-op threads: {} (source: DONSEEK_RERANK_THREADS)",
+            ThreadSelection::Configured { threads } => format!(
+                "[rerank] ONNX intra-op threads: {} (source: layered config)",
                 threads
             ),
             ThreadSelection::Automatic {
                 threads,
                 effective,
                 physical,
-            } => eprintln!(
+            } => format!(
                 "[rerank] ONNX intra-op threads: {} (source: automatic, effective: {}, physical: {})",
                 threads, effective, physical
             ),
@@ -167,11 +128,11 @@ mod inner {
                 effective,
                 physical,
             } => match effective {
-                Some(effective) => eprintln!(
+                Some(effective) => format!(
                     "[rerank] ONNX intra-op threads: default (effective: {effective}, physical: {})",
                     physical
                 ),
-                None => eprintln!(
+                None => format!(
                     "[rerank] ONNX intra-op threads: default (effective parallelism unavailable, physical: {})",
                     physical
                 ),
@@ -179,39 +140,103 @@ mod inner {
         }
     }
 
+    fn log_thread_selection(selection: ThreadSelection) {
+        crate::diag!("{}", thread_selection_log(selection));
+    }
+
     /// Returns the cache directory for reranker model files.
+    ///
+    /// Off the same root as every other cache: DONSETCH_CACHE_DIR and
+    /// [paths] cache_dir move this one too. It used dirs::cache_dir()
+    /// directly, so an override moved every cache except the model: a
+    /// container or a side-by-side install read and wrote the real user
+    /// cache while doctor, which checks paths::cache_dir(), reported the
+    /// model as missing.
     fn cache_dir() -> PathBuf {
-        let mut p = dirs::cache_dir().unwrap_or_else(|| PathBuf::from("."));
-        p.push("donsetch");
-        p.push("rerank");
+        let p = crate::paths::cache_dir().join("rerank");
         let _ = std::fs::create_dir_all(&p);
         p
     }
 
     /// Downloads a file via reqwest blocking, verifying sha256.
     fn download(url: &str, dest: &Path, expected: &str) -> Result<(), String> {
-        let client = reqwest::blocking::Client::builder()
-            .timeout(std::time::Duration::from_secs(120))
-            .build()
-            .map_err(|e| format!("client build: {e}"))?;
-        let resp = client
-            .get(url)
-            .send()
-            .map_err(|e| format!("download {url}: {e}"))?
-            .error_for_status()
-            .map_err(|e| format!("download {url}: {e}"))?;
-        let body = resp.bytes().map_err(|e| format!("read {url}: {e}"))?;
+        fn inner(url: &str, dest: &Path, expected: &str) -> Result<(), String> {
+            let client = reqwest::blocking::Client::builder()
+                .timeout(std::time::Duration::from_secs(120))
+                .build()
+                .map_err(|e| format!("client build: {e}"))?;
+            let resp = client
+                .get(url)
+                .send()
+                .map_err(|e| format!("download {url}: {e}"))?
+                .error_for_status()
+                .map_err(|e| format!("download {url}: {e}"))?;
+            let body = resp.bytes().map_err(|e| format!("read {url}: {e}"))?;
+            let got = Sha256::digest(&body)
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>();
+            if got != expected {
+                return Err(format!(
+                    "sha256 mismatch for {url}: expected {expected}, got {got}"
+                ));
+            }
+            // Publish atomically: write a sibling temp file, then rename
+            // it over the target. Writing straight to `dest` let a
+            // concurrent first-use download (parallel test processes, two
+            // daemons on one cache) expose a half-written model: the load
+            // fails, reranking is silently skipped, and the ranking
+            // changes. The temp name carries the pid so two writers never
+            // share one.
+            let mut tmp_name = dest
+                .file_name()
+                .map(|n| n.to_os_string())
+                .unwrap_or_default();
+            tmp_name.push(format!(".{}.part", std::process::id()));
+            let tmp = dest.with_file_name(tmp_name);
+            std::fs::write(&tmp, &body).map_err(|e| format!("write {tmp:?}: {e}"))?;
+            std::fs::rename(&tmp, dest).map_err(|e| {
+                let _ = std::fs::remove_file(&tmp);
+                format!("publish {dest:?}: {e}")
+            })?;
+            Ok(())
+        }
+
+        // Dedicated plain thread: `reqwest::blocking` panics when used on
+        // a tokio runtime thread : and `panic = "abort"` turns that into a
+        // process abort : and first-use downloads are triggered from the
+        // async search path.
+        let url = url.to_string();
+        let dest = dest.to_path_buf();
+        let expected = expected.to_string();
+        std::thread::Builder::new()
+            .name("rerank-download".into())
+            .spawn(move || inner(&url, &dest, &expected))
+            .map_err(|e| format!("download thread spawn: {e}"))?
+            .join()
+            .map_err(|_| "download thread panicked".to_string())?
+    }
+
+    /// Test-only: the user's real cache may already hold the pinned
+    /// model. Copy it into this process's sandbox instead of
+    /// re-downloading 23MB: nextest gives every test process a fresh
+    /// cache root, so without this each rank test re-fetched the model
+    /// and a loaded box pushed them past the local 60s slow-timeout.
+    /// The copy is sha-verified; a mismatch falls back to the download
+    /// (which verifies again). CI has no user cache and downloads.
+    #[cfg(test)]
+    fn seed_from_user_cache(dest: &Path, file: &str, expected: &str) {
+        let src = crate::paths::user_cache_dir().join("rerank").join(file);
+        let Ok(body) = std::fs::read(&src) else {
+            return;
+        };
         let got = Sha256::digest(&body)
             .iter()
             .map(|b| format!("{b:02x}"))
             .collect::<String>();
-        if got != expected {
-            return Err(format!(
-                "sha256 mismatch for {url}: expected {expected}, got {got}"
-            ));
+        if got == expected {
+            let _ = std::fs::write(dest, &body);
         }
-        std::fs::write(dest, &body).map_err(|e| format!("write {dest:?}: {e}"))?;
-        Ok(())
     }
 
     /// Ensures model + tokenizer files are on disk, returns their paths.
@@ -221,20 +246,28 @@ mod inner {
         let tok_path = dir.join("tokenizer.json");
 
         if !model_path.exists() {
-            eprintln!("[rerank] downloading model (23MB, first use only)...");
-            download(MODEL_URL, &model_path, MODEL_SHA256)?;
-            eprintln!("[rerank] model cached.");
+            #[cfg(test)]
+            seed_from_user_cache(&model_path, "model_quantized.onnx", MODEL_SHA256);
+            if !model_path.exists() {
+                crate::diag!("[rerank] downloading model (23MB, first use only)...");
+                download(MODEL_URL, &model_path, MODEL_SHA256)?;
+                crate::diag!("[rerank] model cached.");
+            }
         }
         if !tok_path.exists() {
-            eprintln!("[rerank] downloading tokenizer (695KB)...");
-            download(TOKENIZER_URL, &tok_path, TOKENIZER_SHA256)?;
-            eprintln!("[rerank] tokenizer cached.");
+            #[cfg(test)]
+            seed_from_user_cache(&tok_path, "tokenizer.json", TOKENIZER_SHA256);
+            if !tok_path.exists() {
+                crate::diag!("[rerank] downloading tokenizer (695KB)...");
+                download(TOKENIZER_URL, &tok_path, TOKENIZER_SHA256)?;
+                crate::diag!("[rerank] tokenizer cached.");
+            }
         }
         Ok((model_path, tok_path))
     }
 
     /// Initializes the reranker on first call. Returns `None` on any
-    /// failure — caller skips reranking gracefully.
+    /// failure : caller skips reranking gracefully.
     ///
     /// ONNX Runtime init runs in a separate thread with a 30s timeout.
     /// ONNX's C++ global constructors can deadlock on some platforms
@@ -243,17 +276,17 @@ mod inner {
     /// RRF+BM25.
     fn init() -> Option<Reranker> {
         // Gate: ensure ONNX Runtime is loaded (AVX check + dlopen).
-        // If the CPU lacks AVX or the .so is missing, return None;
+        // If the runtime library is missing or fails to init, return None;
         // reranking falls back to RRF+BM25.
         if let Err(e) = crate::onnx::ensure_loaded() {
-            eprintln!("[rerank] {e}");
+            crate::diag!("[rerank] {e}");
             return None;
         }
 
         let (model_path, tok_path) = match ensure_files() {
             Ok(p) => p,
             Err(e) => {
-                eprintln!("[rerank] init failed: {e}");
+                crate::diag!("[rerank] init failed: {e}");
                 return None;
             }
         };
@@ -266,8 +299,8 @@ mod inner {
         match rx.recv_timeout(std::time::Duration::from_secs(30)) {
             Ok(result) => result,
             Err(_) => {
-                eprintln!(
-                    "[rerank] ONNX Runtime init timed out (30s) — \
+                crate::diag!(
+                    "[rerank] ONNX Runtime init timed out (30s) : \
                      reranking disabled, falling back to RRF+BM25"
                 );
                 None
@@ -283,7 +316,7 @@ mod inner {
         let mut tokenizer = match Tokenizer::from_file(&tok_path) {
             Ok(t) => t,
             Err(e) => {
-                eprintln!("[rerank] tokenizer load failed: {e}");
+                crate::diag!("[rerank] tokenizer load failed: {e}");
                 return None;
             }
         };
@@ -312,7 +345,7 @@ mod inner {
                             b
                         }
                         Err(e) => {
-                            eprintln!(
+                            crate::diag!(
                                 "[rerank] failed to set ONNX thread limit: {e}; using ONNX default"
                             );
                             e.recover()
@@ -324,13 +357,13 @@ mod inner {
                 match b.commit_from_file(&model_path) {
                     Ok(s) => s,
                     Err(e) => {
-                        eprintln!("[rerank] session load failed: {e}");
+                        crate::diag!("[rerank] session load failed: {e}");
                         return None;
                     }
                 }
             }
             Err(e) => {
-                eprintln!("[rerank] session builder failed: {e}");
+                crate::diag!("[rerank] session builder failed: {e}");
                 return None;
             }
         };
@@ -353,7 +386,7 @@ mod inner {
     }
 
     /// Returns true if the reranker model + tokenizer are already
-    /// on disk. Does NOT trigger a download — used by focus
+    /// on disk. Does NOT trigger a download : used by focus
     /// extraction to decide whether semantic scoring is available
     /// without surprising the user with a model download during
     /// a plain fetch.
@@ -361,6 +394,18 @@ mod inner {
     /// last ranking pass in this process (feature on + model ok).
     pub fn active() -> bool {
         get().is_some()
+    }
+
+    /// True only when the cross-encoder is ALREADY loaded in this
+    /// process. Unlike active(), this NEVER initializes: no
+    /// download, no ONNX session load. The search hot paths (cache
+    /// hits, single-flight followers, report stamps) call this,
+    /// because the first active() caller used to block its tokio
+    /// worker on the whole init chain (a 120s model download + a
+    /// bounded 30s session load). Ranking itself initializes inside
+    /// its own spawn_blocking, off the reactor.
+    pub fn loaded() -> bool {
+        RERANKER.get().is_some_and(|slot| slot.is_some())
     }
 
     pub fn is_model_cached() -> bool {
@@ -380,7 +425,7 @@ mod inner {
 
         // Build (query, "title snippet") pairs for batch encoding.
         // The tokenizer's Dual mode produces [CLS] query [SEP] doc [SEP]
-        // automatically — we just pass (query, doc) tuples.
+        // automatically : we just pass (query, doc) tuples.
         let pairs: Vec<(&str, String)> = docs
             .iter()
             .map(|(title, snippet)| {
@@ -397,7 +442,7 @@ mod inner {
         let encodings = match tokenizer.encode_batch(pairs_ref, true) {
             Ok(e) => e,
             Err(e) => {
-                eprintln!("[rerank] tokenization failed: {e}");
+                crate::diag!("[rerank] tokenization failed: {e}");
                 return None;
             }
         };
@@ -458,7 +503,7 @@ mod inner {
     }
 
     /// Min-max normalize a slice to [0, 1]. If all values are equal,
-    /// returns 0.5 for each (neutral — doesn't perturb the blend).
+    /// returns 0.5 for each (neutral : doesn't perturb the blend).
     fn min_max_normalize(values: &[f64]) -> Vec<f64> {
         let min = values.iter().cloned().fold(f64::INFINITY, f64::min);
         let max = values.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
@@ -507,10 +552,86 @@ mod inner {
         }
     }
 
+    /// Additive cross-encoder top-up, run on post-enrichment text.
+    ///
+    /// The main blend ranks on SERP fragments (title + snippet from
+    /// the result page). Enrichment then swaps in the real page
+    /// title / meta description for the top slice, which is strictly
+    /// better evidence for semantic relevance. A full re-blend here
+    /// would let the enrichment rewrite the whole ordering on fresh
+    /// text; an additive nudge on the already-final scores breaks
+    /// close ties with page truth without re-litigating the merge.
+    pub fn topup(query: &str, results: &mut [crate::search::rank::Merged], depth: usize) {
+        const NUDGE: f64 = 0.1;
+        if results.is_empty() || depth < 2 || query.trim().is_empty() {
+            return;
+        }
+        let n = depth.min(results.len());
+        let docs: Vec<(String, String)> = results[..n]
+            .iter()
+            .map(|r| (r.title.clone(), r.snippet.clone()))
+            .collect();
+        let Some(scores) = cross_encoder_scores(query, &docs) else {
+            return;
+        };
+        if scores.len() != n {
+            return;
+        }
+        apply_topup_scores(results, n, &scores, NUDGE);
+    }
+
+    /// The score-nudge-and-resort half of `topup`, split out so it's
+    /// testable without a real cross-encoder model.
+    fn apply_topup_scores(
+        results: &mut [crate::search::rank::Merged],
+        n: usize,
+        scores: &[f64],
+        nudge: f64,
+    ) {
+        for (r, s) in results[..n].iter_mut().zip(scores) {
+            // scores are probabilities (0=irrelevant, 1=exact); the
+            // 0.5-centered product keeps the nudge zero-sum around
+            // the midpoint.
+            r.score += nudge * (s - 0.5);
+        }
+        // Sort the whole slice, not just the nudged prefix: the
+        // nudge can push results[n-1] below results[n]'s untouched
+        // score (a near-tied pair straddling the depth boundary),
+        // and callers taking more than `depth` results (merge()
+        // always keeps 12; topup runs at depth=8) would otherwise
+        // get a slice that isn't sorted by score at that boundary.
+        results.sort_by(|a, b| b.score.total_cmp(&a.score));
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
         use crate::search::rank::Merged;
+
+        /// The rerank model cache must hang off the same root as
+        /// everything else, or DONSETCH_CACHE_DIR (and [paths]
+        /// cache_dir) moves every other cache except this one: a
+        /// container or a side-by-side install then reads and writes the
+        /// real user cache while doctor, which checks
+        /// paths::cache_dir(), reports the model as missing.
+        #[test]
+        fn cache_dir_follows_the_override() {
+            let dir =
+                std::env::temp_dir().join(format!("donsetch-rerank-cache-{}", std::process::id()));
+            let prev = std::env::var_os("DONSETCH_CACHE_DIR");
+            // SAFETY: process-scoped, and nextest runs one test per process.
+            unsafe { std::env::set_var("DONSETCH_CACHE_DIR", &dir) };
+            let got = cache_dir();
+            match prev {
+                Some(v) => unsafe { std::env::set_var("DONSETCH_CACHE_DIR", v) },
+                None => unsafe { std::env::remove_var("DONSETCH_CACHE_DIR") },
+            }
+            assert_eq!(
+                got,
+                dir.join("rerank"),
+                "the rerank cache must hang off paths::cache_dir()"
+            );
+        }
 
         #[test]
         fn sigmoid_basic() {
@@ -603,7 +724,7 @@ mod inner {
         fn blend_preserves_rrf_order_when_xenc_uniform() {
             // When cross-encoder gives all results the same score,
             // min_max returns 0.5 for all, so the blend reduces to
-            // a constant offset on the RRF ordering — A still > B.
+            // a constant offset on the RRF ordering : A still > B.
             let rrf = vec![0.8, 0.4];
             let xenc = vec![0.5, 0.5];
             let rrf_n = min_max_normalize(&rrf);
@@ -636,7 +757,7 @@ mod inner {
                 .collect();
             // blend[0] = 0.6*1.0 + 0.4*0.0 = 0.6
             // blend[1] = 0.6*0.0 + 0.4*1.0 = 0.4
-            // A still wins (0.6 > 0.4) — 40% weight isn't enough to flip
+            // A still wins (0.6 > 0.4) : 40% weight isn't enough to flip
             assert!(
                 blend[0] > blend[1],
                 "60/40 blend should NOT flip on moderate disagreement"
@@ -648,28 +769,56 @@ mod inner {
             );
         }
 
-        #[test]
-        fn rerank_threads_accepts_positive_integers() {
-            assert_eq!(parse_intra_threads("1").unwrap(), 1);
-            assert_eq!(parse_intra_threads("2").unwrap(), 2);
-            assert_eq!(parse_intra_threads(" 64 ").unwrap(), 64);
-            assert_eq!(
-                parse_intra_threads(&MAX_INTRA_THREADS.to_string()).unwrap(),
-                MAX_INTRA_THREADS
-            );
+        fn merged(url: &str, score: f64) -> Merged {
+            Merged {
+                title: url.into(),
+                url: url.into(),
+                snippet: String::new(),
+                sources: vec![],
+                score,
+                published: None,
+            }
         }
 
+        // apply_topup_scores used to only re-sort results[..n], leaving
+        // results[n..] untouched: a nudge that pushes results[n-1]
+        // below results[n]'s original score left the overall vector
+        // non-monotonic at that boundary. depth=n=2 here; result[1]
+        // ("boundary") starts just above result[2] ("untouched") and
+        // gets nudged down past it.
         #[test]
-        fn rerank_threads_rejects_invalid_values() {
-            for raw in ["", "0", "-1", "1.5", "two", "2147483648"] {
-                assert!(parse_intra_threads(raw).is_err(), "accepted {raw:?}");
+        fn apply_topup_scores_keeps_the_whole_vector_sorted() {
+            let mut results = vec![
+                merged("top", 1.0),
+                merged("boundary", 0.60),
+                merged("untouched", 0.55),
+                merged("tail", 0.1),
+            ];
+            apply_topup_scores(&mut results, 2, &[1.0, 0.0], 0.2);
+            // "top" nudged up (+0.1 -> 1.1), "boundary" nudged down
+            // (0.60 - 0.1 = 0.50), which is now below "untouched"
+            // (0.55). The whole vector must reflect that, not just
+            // the first two entries.
+            for pair in results.windows(2) {
+                assert!(
+                    pair[0].score >= pair[1].score,
+                    "not sorted: {} ({}) before {} ({})",
+                    pair[0].url,
+                    pair[0].score,
+                    pair[1].url,
+                    pair[1].score
+                );
             }
+            assert_eq!(results[0].url, "top");
+            assert_eq!(results[1].url, "untouched");
+            assert_eq!(results[2].url, "boundary");
+            assert_eq!(results[3].url, "tail");
         }
 
         #[test]
         fn rerank_threads_auto_clamps_constrained_processes() {
             assert_eq!(
-                automatic_intra_threads(Some(2), 8),
+                select_intra_threads(0, Some(2), 8),
                 ThreadSelection::Automatic {
                     threads: 2,
                     effective: 2,
@@ -682,10 +831,10 @@ mod inner {
         #[test]
         fn rerank_threads_auto_preserves_unconstrained_onnx_default() {
             for selection in [
-                automatic_intra_threads(Some(8), 4),
-                automatic_intra_threads(Some(4), 4),
-                automatic_intra_threads(None, 8),
-                automatic_intra_threads(Some(0), 8),
+                select_intra_threads(0, Some(8), 4),
+                select_intra_threads(0, Some(4), 4),
+                select_intra_threads(0, None, 8),
+                select_intra_threads(0, Some(0), 8),
             ] {
                 assert_eq!(selection.threads(), None);
                 assert!(matches!(selection, ThreadSelection::OnnxDefault { .. }));
@@ -693,33 +842,18 @@ mod inner {
         }
 
         #[test]
-        fn rerank_threads_environment_override_wins() {
-            let (selection, warning) = select_intra_threads(ThreadOverride::Value("1"), Some(2), 8);
-            assert_eq!(selection.threads(), Some(1));
-            assert!(matches!(
-                selection,
-                ThreadSelection::Environment { threads: 1 }
-            ));
-            assert_eq!(warning, None);
-        }
-
-        #[test]
-        fn rerank_threads_invalid_override_falls_back_to_auto() {
-            for override_value in [
-                ThreadOverride::Value("invalid"),
-                ThreadOverride::InvalidUnicode,
-            ] {
-                let (selection, warning) = select_intra_threads(override_value, Some(2), 8);
-                assert_eq!(selection.threads(), Some(2));
-                assert!(matches!(selection, ThreadSelection::Automatic { .. }));
-                assert!(warning.is_some());
+        fn rerank_threads_configured_value_wins() {
+            for configured in [1, 2, 64] {
+                let selection = select_intra_threads(configured, Some(1), 8);
+                assert_eq!(selection.threads(), Some(configured as usize));
+                assert!(matches!(selection, ThreadSelection::Configured { .. }));
+                assert_eq!(
+                    thread_selection_log(selection),
+                    format!(
+                        "[rerank] ONNX intra-op threads: {configured} (source: layered config)"
+                    )
+                );
             }
-
-            let (selection, warning) =
-                select_intra_threads(ThreadOverride::Value("invalid"), Some(8), 4);
-            assert_eq!(selection.threads(), None);
-            assert!(matches!(selection, ThreadSelection::OnnxDefault { .. }));
-            assert!(warning.is_some());
         }
     }
 }
@@ -731,12 +865,16 @@ mod inner {
     pub fn active() -> bool {
         false
     }
+    pub fn loaded() -> bool {
+        false
+    }
     pub fn cross_encoder_scores(_query: &str, _docs: &[(String, String)]) -> Option<Vec<f64>> {
         None
     }
     pub fn is_model_cached() -> bool {
         false
     }
+    pub fn topup(_query: &str, _results: &mut [crate::search::rank::Merged], _depth: usize) {}
 }
 
-pub use inner::{active, cross_encoder_scores, is_model_cached, rerank};
+pub use inner::{active, cross_encoder_scores, is_model_cached, loaded, rerank, topup};

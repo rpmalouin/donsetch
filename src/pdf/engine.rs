@@ -7,7 +7,7 @@
 //! `load_document`, which hands plain Rust data to the caller.
 //!
 //! Coordinates are normalized to screen space (origin top-left, y grows
-//! downward, points) using the page height at load time — the rest of
+//! downward, points) using the page height at load time : the rest of
 //! the pipeline never has to think about PDF's bottom-left origin.
 
 #![allow(dead_code)]
@@ -39,7 +39,7 @@ pub struct PdfChar {
     pub angle: f32,
     /// Character index order in the content stream.
     pub order: u32,
-    /// Dingbat-font glyph (checkbox/seal art — picture, not text).
+    /// Dingbat-font glyph (checkbox/seal art : picture, not text).
     pub dingbat: bool,
     /// Canonicalized from a rotated/vertical run (rotate.rs set it).
     pub rt: bool,
@@ -82,7 +82,16 @@ pub struct RawDoc {
     pub meta: RawMeta,
     pub outline: Vec<OutlineItem>,
     pub page_count: usize,
+    /// Pages actually read: `page_count` capped at `MAX_PAGES`.
+    pub pages_read: usize,
 }
+
+/// Pages parsed per document. Each page is a rasterization (up to
+/// 80 M px) plus the text, layout and table passes; the size gate
+/// (`pdf_max_mb`, 100 MB) admits a document of a few hundred
+/// thousand near-empty pages, which is hours of work for a note that
+/// says "scanned". The remainder is reported, not read.
+pub const MAX_PAGES: usize = 500;
 
 /// What the wrapper itself can fail with.
 #[derive(Debug)]
@@ -186,7 +195,7 @@ fn quick_validate(bytes: &[u8]) -> Result<(), LoadError> {
     // Scan for "/Length" with direct numeric value. If claimed length
     // mismatches the actual stream bytes by more than a generous slack,
     // the document is corrupt. Indirect lengths (e.g. "/Length 5 0 R")
-    // are ignored – they are validated by PDFium itself.
+    // are ignored - they are validated by PDFium itself.
     //
     // Note: naive `endstream` search can be fooled if stream content
     // itself contains the literal `endstream`; for our minimal PDFs
@@ -213,20 +222,20 @@ fn quick_validate(bytes: &[u8]) -> Result<(), LoadError> {
             p += 1;
         }
         if start == p {
-            // no direct digits – likely indirect object; skip
+            // no direct digits - likely indirect object; skip
             pos = abs + 7;
             continue;
         }
         // If next non-space after digits is not whitespace / >> / stream,
         // it's indirect like "5 0 R". Check a few bytes ahead: if we see
-        // " 0 R" pattern, skip validation – indirect Lengths are resolved
+        // " 0 R" pattern, skip validation - indirect Lengths are resolved
         // by PDFium and must not be flagged here.
         let mut peek = p;
         while peek < bytes.len() && matches!(bytes[peek], b' ' | b'\t') {
             peek += 1;
         }
         if peek < bytes.len() && bytes[peek] == b'0' {
-            // could be indirect – be conservative and skip
+            // could be indirect - be conservative and skip
             // look for 'R' within next 5 bytes
             let end = (peek + 6).min(bytes.len());
             if bytes[peek..end].contains(&b'R') {
@@ -314,7 +323,7 @@ fn quick_validate(bytes: &[u8]) -> Result<(), LoadError> {
             // or obj? Allow up to 1000 bytes slack for
             // whitespace/comments between the offset and the keyword.
             // Incremental PDFs may have the last xref far from the
-            // first, so distance to first xref is irrelevant – check
+            // first, so distance to first xref is irrelevant - check
             // against the last xref instead.
             if let Some(xref_pos) = bytes.windows(4).rposition(|w| w == b"xref") {
                 let dist = val.abs_diff(xref_pos);
@@ -338,7 +347,7 @@ fn quick_validate(bytes: &[u8]) -> Result<(), LoadError> {
                 }
                 // Xref entry sanity: only fail if an entry offset is
                 // beyond EOF (points outside file). Missing "obj"
-                // markers are ignored – PDFium repairs them and we
+                // markers are ignored - PDFium repairs them and we
                 // must not false-positive on real-world files.
                 let mut off = xref_pos + 4;
                 // skip whitespace and possible "0 N" header line
@@ -399,6 +408,19 @@ fn decode_utf16(buf: &[u16], len_units: usize) -> String {
     String::from_utf16_lossy(&buf[..end])
 }
 
+/// Decode a UTF-16LE buffer using a PDFium-reported BYTE count, as
+/// returned by `FPDF_GetMetaText`/`FPDFBookmark_GetTitle` (both
+/// count bytes, including the NUL terminator (see their headers in
+/// fpdf_doc.h). `decode_utf16` above takes a UNIT count instead;
+/// passing a byte count straight through reads past the real string
+/// into the buffer's zero-initialized tail, appending trailing NULs
+/// (the buffers here are always over-allocated by a few units past
+/// what the byte count implies, matching the sibling `field_string`
+/// helper in forms.rs, which does this division correctly).
+fn decode_utf16_from_byte_count(buf: &[u16], byte_count: usize) -> String {
+    decode_utf16(buf, (byte_count / 2).min(buf.len()))
+}
+
 /// Fonts whose glyphs are pictures, not text (checkboxes, seals,
 /// logo art). Detected once at intern time.
 pub fn is_dingbat_family(name: &str) -> bool {
@@ -413,9 +435,9 @@ pub fn is_dingbat_family(name: &str) -> bool {
 }
 
 /// Mark a font as monospace when its NAME says so (the descriptor's
-/// FixedPitch bit is dropped by many subset pipelines — books &
+/// FixedPitch bit is dropped by many subset pipelines : books &
 /// guides embed mono fonts without it).
-pub const DONSHEET_MONO_HINT: u32 = 0x8000_0000;
+pub const DONSETCH_MONO_HINT: u32 = 0x8000_0000;
 
 fn mono_font_name(name: &str) -> bool {
     let n = name.to_lowercase();
@@ -432,6 +454,21 @@ fn mono_font_name(name: &str) -> bool {
         || n.contains("inconsolata")
         || n.contains("jetbrains")
         || n.contains("fira code")
+}
+
+/// Is the glyph's font family a monospace font? `family` is an index
+/// into the interned `fonts` list, but it falls back to 0 whenever a
+/// glyph's font has no PDFium-reportable name (Type3, no BaseFont, an
+/// over-long name), and `fonts` is empty until the first NAMED font
+/// is interned. So a crafted PDF whose first walked glyph uses an
+/// unnamed font reaches here with family==0 and an empty `fonts` — a
+/// direct `fonts[family]` index panicked (release panic=abort → a
+/// remote DoS on a fetched PDF). Bounds-check like the sibling
+/// `font_dingbat.get(family)` a few lines down already does.
+fn font_is_mono(fonts: &[String], family: u16) -> bool {
+    fonts
+        .get(family as usize)
+        .is_some_and(|name| mono_font_name(name))
 }
 
 /// Fill `buf` with a meta tag value; returns None when empty.
@@ -457,7 +494,7 @@ fn get_meta(doc: FpdfDocument, tag: &str, buf: &mut Vec<u16>) -> Option<String> 
                 return None;
             }
         }
-        let s = decode_utf16(buf, n.min(buf.len()));
+        let s = decode_utf16_from_byte_count(buf, n);
         let cleaned: String = s.chars().filter(|&c| c != '\0').collect();
         let s = cleaned.trim();
         if s.is_empty() {
@@ -480,7 +517,7 @@ fn bookmark_title(bm: FpdfBookmark) -> String {
             buf.as_mut_ptr() as *mut c_void,
             (buf.len() * 2) as c_ulong,
         ) as usize;
-        decode_utf16(&buf, n2.min(buf.len()))
+        decode_utf16_from_byte_count(&buf, n2)
     }
 }
 
@@ -525,13 +562,15 @@ pub struct LoadOpts {
     pub want_forms: bool,
     /// DPi override (0.0 = 96). Higher for OCR; forms do not need this.
     pub dpi: f32,
+    /// Pages read per document; `MAX_PAGES` unless a test says less.
+    pub max_pages: usize,
 }
 
 /// The per-page bundle the sink receives. Pixel/form extras empty unless
 /// requested via LoadOpts.
 pub struct PageInput {
     pub chars: PageChars,
-    /// Rasterized page (transient — treat as scratch, extract what you
+    /// Rasterized page (transient : treat as scratch, extract what you
     /// need during the sink call).
     pub bitmap: Option<super::pixels::PageBitmap>,
     pub widgets: Vec<super::forms::FormWidget>,
@@ -656,7 +695,7 @@ pub fn rasterize_pages(
 /// to the normalized pure-Rust model. `page_sink` receives each page's
 /// bundle (and may transform it into the caller's per-page type `P`).
 ///
-/// The PDFium lock is held for the entire walk — handles never escape.
+/// The PDFium lock is held for the entire walk : handles never escape.
 #[allow(clippy::too_many_arguments)]
 pub fn load_document<P, F>(
     bytes: &[u8],
@@ -716,13 +755,15 @@ where
         };
 
         let page_count = FPDF_GetPageCount(doc).max(0) as usize;
+        let pages_read = page_count.min(opts.max_pages);
         let mut raw = RawDoc {
             fonts: Vec::new(),
             meta: RawMeta::default(),
             outline: walk_outlines(doc),
             page_count,
+            pages_read,
         };
-        let mut pages_out: Vec<P> = Vec::with_capacity(page_count);
+        let mut pages_out: Vec<P> = Vec::with_capacity(pages_read);
         let mut font_index: std::collections::HashMap<String, u16> =
             std::collections::HashMap::new();
         let mut font_dingbat: Vec<bool> = Vec::new();
@@ -736,7 +777,7 @@ where
         raw.meta.created = get_meta(doc, "CreationDate", &mut mbuf);
         raw.meta.modified = get_meta(doc, "ModDate", &mut mbuf);
 
-        for pi in 0..page_count {
+        for pi in 0..pages_read {
             let page = FPDF_LoadPage(doc, pi as i32);
             if page.is_null() {
                 continue;
@@ -797,10 +838,13 @@ where
                     } else {
                         m.b.atan2(m.a).to_degrees()
                     };
-                    if std::env::var("DONSHEET_DEBUG_MATRIX").is_ok() && i < 8 {
-                        eprintln!(
+                    if crate::config::cfg().debug.pdf_matrix && i < 8 {
+                        crate::diag!(
                             "[matrix] i={i} a={:.3} b={:.3} c={:.3} d={:.3} angle={angle:.1}",
-                            m.a, m.b, m.c, m.d
+                            m.a,
+                            m.b,
+                            m.c,
+                            m.d
                         );
                     }
                     let size = if size.is_finite() && size > 1.5 {
@@ -860,8 +904,8 @@ where
                         size,
                         weight,
                         flags: flags as u32
-                            | if mono_font_name(&raw.fonts[family as usize]) {
-                                DONSHEET_MONO_HINT
+                            | if font_is_mono(&raw.fonts, family) {
+                                DONSETCH_MONO_HINT
                             } else {
                                 0
                             },
@@ -875,7 +919,7 @@ where
                 }
             }
             // Lazy pixel rendering: text-rich pages (200+ chars,
-            // no images) don't need pixel fusion — the text layer
+            // no images) don't need pixel fusion : the text layer
             // is sufficient for reading order and garbage detection.
             // This makes 50-page arXiv papers fast (no bitmap per page).
             let char_count = chars.len();
@@ -898,12 +942,77 @@ where
                     None => Vec::new(),
                 },
             }));
-            if std::env::var("DONSHEET_DEBUG").is_ok() && pi % 50 == 0 {
-                eprintln!("[engine] page {pi}/{page_count} done");
+            if crate::config::cfg().debug.pdf && pi % 50 == 0 {
+                crate::diag!("[engine] page {pi}/{page_count} done");
             }
         }
 
         drop(guard);
         Ok((raw, pages_out))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A glyph whose font has no PDFium-reportable name reaches the
+    // mono check with family==0 while the interned `fonts` list is
+    // still empty (nothing named has been interned yet). The old
+    // direct index `fonts[family as usize]` panicked here — release
+    // panic=abort turns that into a remote DoS on a fetched PDF.
+    // font_is_mono must bounds-check and simply return false.
+    #[test]
+    fn font_is_mono_does_not_panic_on_empty_or_out_of_range_family() {
+        assert!(!font_is_mono(&[], 0)); // the crash input: empty list, family 0
+        assert!(!font_is_mono(&["Arial".to_string()], 7)); // out of range
+        assert!(font_is_mono(&["Courier New".to_string()], 0)); // named mono resolves
+        assert!(!font_is_mono(&["Arial".to_string()], 0)); // named non-mono
+    }
+
+    #[test]
+    fn decode_utf16_from_byte_count_strips_terminator_and_padding() {
+        // Mimics the real buffer shape at both call sites: "Hi" (2
+        // UTF-16 units) + a NUL terminator (1 unit) written by
+        // PDFium, followed by the caller's over-allocated slack
+        // (the `n/2 + 2` sizing convention), left zero-initialized.
+        let buf: Vec<u16> = vec![
+            'H' as u16, 'i' as u16, 0x0000, // title + NUL terminator
+            0x0000, 0x0000, // caller's slack padding
+        ];
+        // PDFium reports byte counts, not unit counts: a 2-char
+        // title + its NUL terminator is (2 + 1) * 2 = 6 bytes.
+        assert_eq!(decode_utf16_from_byte_count(&buf, 6), "Hi");
+    }
+
+    #[test]
+    fn decode_utf16_from_byte_count_handles_empty_title() {
+        let buf: Vec<u16> = vec![0x0000, 0x0000];
+        // byte_count for just the NUL terminator: 1 unit * 2 = 2.
+        assert_eq!(decode_utf16_from_byte_count(&buf, 2), "");
+    }
+
+    #[test]
+    fn decode_utf16_from_byte_count_never_reads_past_the_buffer() {
+        // A byte_count larger than the actual buffer must never
+        // panic: defensive against a hostile/corrupt PDF causing
+        // PDFium to report an implausible size.
+        let buf: Vec<u16> = vec!['x' as u16, 0x0000];
+        assert_eq!(decode_utf16_from_byte_count(&buf, 1_000_000), "x");
+    }
+
+    #[test]
+    fn decode_utf16_from_byte_count_matches_unit_count_form() {
+        // Regression for the actual bug: the byte-count form must
+        // agree with calling decode_utf16 directly with the correct
+        // UNIT count, not the byte count itself passed straight
+        // through (which is what both call sites used to do).
+        let buf: Vec<u16> = vec!['h' as u16, 'i' as u16, 0x0000, 0x0000];
+        let byte_count = 6; // (2 chars + NUL) * 2
+        let unit_count = 3; // 2 chars + NUL
+        assert_eq!(
+            decode_utf16_from_byte_count(&buf, byte_count),
+            decode_utf16(&buf, unit_count)
+        );
     }
 }

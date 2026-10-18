@@ -1,6 +1,6 @@
 //! Hacker News dedicated extractor.
 //!
-//! HN's comment tree is a nested <table> layout — the generic
+//! HN's comment tree is a nested <table> layout : the generic
 //! pipeline renders it as pipe-table rows (truncating every comment
 //! to 120 chars) or loses it to main-content scoring. HN's markup
 //! has been frozen for 15+ years, so a dedicated extractor is the
@@ -18,7 +18,8 @@ use super::{ContentKind, ExtractOptions, Extracted, inline};
 const MAX_COMMENTS: usize = 150;
 
 pub fn extract(html: &str, url: &str, opts: &ExtractOptions) -> Option<Extracted> {
-    if opts.selector.is_some() || opts.toc {
+    if opts.selector.is_some() || opts.toc || opts.section.is_some() || opts.must_contain.is_some()
+    {
         return None;
     }
     let parsed = url::Url::parse(url).ok()?;
@@ -127,6 +128,7 @@ fn extract_permalink(doc: &Html, url: &str, opts: &ExtractOptions) -> Option<Ext
         next_offset: next,
         blocks_total: 1,
         blocks_shown: 1,
+        focus_omitted: false,
         tokens_est,
         thin: total < 800,
         content_kind: ContentKind::Forum,
@@ -136,6 +138,7 @@ fn extract_permalink(doc: &Html, url: &str, opts: &ExtractOptions) -> Option<Ext
         images: Vec::new(),
         fingerprint: None,
         via: None,
+        partial: None,
     })
 }
 
@@ -347,7 +350,7 @@ fn extract_thread(
     }
 
     if focus_missed && let Some(q) = &opts.focus {
-        md = format!("*(focus \"{q}\": no matches — showing full thread)*\n\n{md}");
+        md = format!("*(focus \"{q}\": no matches : showing full thread)*\n\n{md}");
     }
 
     let total = md.len();
@@ -363,6 +366,7 @@ fn extract_thread(
         next_offset: next,
         blocks_total: parsed_comments.len(),
         blocks_shown: parsed_comments.len(),
+        focus_omitted: false,
         tokens_est,
         thin: parsed_comments.is_empty() && total < 800,
         content_kind: ContentKind::Forum,
@@ -372,6 +376,7 @@ fn extract_thread(
         images: Vec::new(),
         fingerprint: None,
         via: None,
+        partial: None,
     })
 }
 

@@ -1,9 +1,13 @@
 # DonSeTch private working docs + build artifacts
 status.md
 project.md
+design.md
 
 # Private design blueprints — never public
 design/
+
+# V5 working docs — private (plan + discussion, decision log)
+v5/
 
 # Rust
 /target
@@ -23,6 +27,7 @@ Thumbs.db
 bench/results.json
 bench/results/
 bench/battle-corpus/
+bench/improve/out/
 
 # Vendored PDFium static libraries (build.rs auto-downloads)
 vendor/
@@ -37,13 +42,15 @@ tests/pdf-corpus/*.pdf
 # Cache directories (local state)
 .cache/
 npm/binaries/
+npm/LICENSE
+*.tgz
 bench/regression-results.json
-# Added by code-review-graph
-.code-review-graph/
+/libonnxruntime.so
 
-# Agent tooling — machine-specific, installed by code-review-graph
-# (AGENTS.md is committed as the canonical copy; the rest are
-# byte-identical per-machine boilerplate and MCP launcher configs)
+# Fork: code graph + machine-specific agent tooling (installed by
+# code-review-graph). AGENTS.md and CLAUDE.md are upstream-tracked; the rest
+# are byte-identical per-machine boilerplate and MCP launcher configs.
+.code-review-graph/
 .claude/
 .codebuddy/
 .cursorrules
@@ -54,7 +61,6 @@ opencode.jsonc
 .qoder/
 .windsurfrules
 .github/code-review-graph.instruction.md
-CLAUDE.md
 CODEBUDDY.md
 GEMINI.md
 QODER.md

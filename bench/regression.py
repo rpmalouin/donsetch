@@ -131,7 +131,7 @@ for q, canon in QUERIES:
 
 n = len(QUERIES)
 print(f"\n═══ hit@1 {h1}/{n} ({100*h1//n}%)  hit@3 {h3}/{n} ({100*h3//n}%)  hit@5 {h5}/{n} ({100*h5//n}%)")
-print(f"═══ report bar: top-3 ≥ 80% — {'PASS' if h3*10 >= n*8 else 'FAIL'}")
+print(f"═══ report bar: top-3 ≥ 80% : {'PASS' if h3*10 >= n*8 else 'FAIL'}")
 
 json.dump({"rows": rows, "hit1": h1, "hit3": h3, "hit5": h5},
           open("/home/dondai/Projects/donsetch/bench/regression-results.json", "w"), indent=1)

@@ -1,6 +1,6 @@
 //! Token-efficiency invariants as a CI gate (v3 foundation #3).
 //! Offline: real saved pages (tests/fixtures/corpus/), full DonSift
-//! pipeline — the same claims bench/tokens.py makes live, asserted
+//! pipeline : the same claims bench/tokens.py makes live, asserted
 //! deterministically on every build.
 
 use donsetch::extract::{self, ExtractOptions};
@@ -21,6 +21,7 @@ fn opts_with(f: impl FnOnce(&mut ExtractOptions)) -> ExtractOptions {
 
 #[test]
 fn focus_cuts_at_least_40_percent_on_a_long_page() {
+    crate::sandbox();
     let body = corpus("wiki-rust.html");
     let full = extract::extract(
         &body,
@@ -50,6 +51,7 @@ fn focus_cuts_at_least_40_percent_on_a_long_page() {
 
 #[test]
 fn toc_costs_under_5_percent_of_the_full_page() {
+    crate::sandbox();
     let body = corpus("wiki-rust.html");
     let full = extract::extract(
         &body,
@@ -72,7 +74,7 @@ fn toc_costs_under_5_percent_of_the_full_page() {
     // The toc-only view (section=TOC) must be a small fraction.
     assert!(
         toc.markdown.len() as f64 / full.markdown.len() as f64 <= 0.05,
-        "toc output {} chars vs full {} — >5%",
+        "toc output {} chars vs full {} : >5%",
         toc.markdown.len(),
         full.markdown.len()
     );
@@ -80,6 +82,7 @@ fn toc_costs_under_5_percent_of_the_full_page() {
 
 #[test]
 fn probe_output_stays_tiny() {
+    crate::sandbox();
     let body = corpus("wiki-rust.html");
     let probe = extract::extract(
         &body,
@@ -108,7 +111,44 @@ fn probe_output_stays_tiny() {
 }
 
 #[test]
+fn mcp_instructions_stay_cheap() {
+    crate::sandbox();
+    // The handshake blurb is the one string an agent pays for in
+    // every session, whether or not it ever calls us : so it is a
+    // token invariant like any response size. Generated live, not
+    // read from the fixture: a fixture is only as fresh as its
+    // last blessing, so measuring it would pass on stale text and
+    // report the bloat one run too late.
+    let text = donsetch::mcp::tools::instructions();
+
+    // chars/4 : the estimator the rest of the codebase uses.
+    let tokens = text.len() / 4;
+    assert!(
+        tokens <= 165,
+        "instructions cost ~{tokens} tokens (>165) : resident in every session"
+    );
+    // The 150 cap covered the 5-tool contract; web_screenshot (issue
+    // #171) added the sixth tool line and the ceiling follows it.
+}
+
+#[test]
+fn split_mcp_contract_stays_under_3000_estimated_tokens() {
+    crate::sandbox();
+    // chars/4 is the repository-wide offline estimator. Exact tokenizer
+    // measurements belong in the external evaluation report. The
+    // ceiling tracks the 4-tool contract (web_answer + web_memory
+    // were cut 2026-09-11, which bought the headroom back).
+    let bytes = donsetch::mcp::tools::list().to_string().len();
+    let estimated_tokens = bytes.div_ceil(4);
+    assert!(
+        estimated_tokens <= 3_000,
+        "split MCP schema costs ~{estimated_tokens} tokens (>3000)"
+    );
+}
+
+#[test]
 fn links_on_renders_real_links() {
+    crate::sandbox();
     // Wikipedia article body: hundreds of interwiki links. With
     // links=true the pipeline must render them as markdown links
     // (handle rewriting is the MCP layer's job on top).

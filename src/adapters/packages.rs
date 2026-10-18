@@ -40,6 +40,7 @@ pub fn extract(body: &[u8], url: &str, opts: &ExtractOptions) -> Option<Extracte
     let (slice, next) = crate::extract::paginate_public(&md, opts.offset, max);
     let deps_n = card.deps.len();
     Some(Extracted {
+        tokens_est: slice.len() / 4,
         markdown: slice,
         title: Some(format!("{} {}", card.name, card.version)),
         byline: None,
@@ -49,7 +50,7 @@ pub fn extract(body: &[u8], url: &str, opts: &ExtractOptions) -> Option<Extracte
         next_offset: next,
         blocks_total: deps_n,
         blocks_shown: deps_n,
-        tokens_est: total / 4,
+        focus_omitted: false,
         thin: false,
         content_kind: ContentKind::Listing,
         lang: "en".to_string(),
@@ -58,6 +59,7 @@ pub fn extract(body: &[u8], url: &str, opts: &ExtractOptions) -> Option<Extracte
         images: Vec::new(),
         fingerprint: None,
         via: Some(via),
+        partial: None,
     })
 }
 
@@ -119,7 +121,7 @@ fn render(registry: &str, c: &PkgCard) -> String {
         facts.push(format!("license {l}"));
     }
     if let Some(d) = c.downloads {
-        facts.push(format!("{} downloads", human_count(d)));
+        facts.push(format!("{} downloads", super::human_count(d)));
     }
     md.push_str(&format!("{}\n", facts.join(" · ")));
     for e in &c.extra {
@@ -152,7 +154,7 @@ fn render(registry: &str, c: &PkgCard) -> String {
         md.push_str("## Recent versions\n");
         for (num, date, yanked) in c.versions.iter().take(MAX_VERSIONS) {
             let flag = if *yanked { " *(yanked)*" } else { "" };
-            md.push_str(&format!("- {num} — {date}{flag}\n"));
+            md.push_str(&format!("- {num} : {date}{flag}\n"));
         }
         md.push('\n');
     }
@@ -421,7 +423,7 @@ fn crates_card(v: &Value) -> Option<PkgCard> {
             .unwrap_or_default()
             .to_string();
         let deps_hint = format!(
-            "deps live per version — fetch crates.io/crates/{}/{version} for the tree",
+            "deps live per version : fetch crates.io/crates/{}/{version} for the tree",
             c.get("name").and_then(Value::as_str).unwrap_or("?")
         );
         Some(PkgCard {
@@ -457,7 +459,7 @@ fn crates_card(v: &Value) -> Option<PkgCard> {
             versions: sorted,
         })
     } else if v.get("version").is_some() {
-        // Version endpoint (/api/v1/crates/<n>/<v>) — carries deps.
+        // Version endpoint (/api/v1/crates/<n>/<v>) : carries deps.
         let ver = v.get("version")?;
         let deps: Vec<String> = ver
             .get("dependencies")
@@ -517,6 +519,57 @@ fn crates_card(v: &Value) -> Option<PkgCard> {
             deps_hint: None,
             versions: Vec::new(),
         })
+    } else if let Some(arr) = v.get("versions").and_then(Value::as_array) {
+        // /crates/<name>/versions : {"versions":[...]} as served
+        // (newest first), one object per release. This shape used
+        // to fall through to the raw-JSON passthrough; render the
+        // same card shape as the summary endpoint.
+        let first = arr.first()?;
+        let name = first.get("crate").and_then(Value::as_str)?.to_string();
+        let mut all: Vec<(String, String, bool)> = arr
+            .iter()
+            .filter_map(|ver| {
+                Some((
+                    ver.get("num").and_then(Value::as_str)?.to_string(),
+                    ver.get("created_at")
+                        .and_then(Value::as_str)
+                        .map(date_of)
+                        .unwrap_or_default(),
+                    ver.get("yanked").and_then(Value::as_bool).unwrap_or(false),
+                ))
+            })
+            .collect();
+        all.sort_by(|a, b| b.1.cmp(&a.1));
+        let headline = all.first().map(|(n, _, _)| n.clone()).unwrap_or_default();
+        let published = all
+            .first()
+            .map(|(_, d, _)| d.clone())
+            .filter(|d| !d.is_empty());
+        let versions = prefer_stable(all);
+        let mut extra = Vec::new();
+        if arr.len() > MAX_VERSIONS {
+            extra.push(format!("{} versions total", arr.len()));
+        }
+        Some(PkgCard {
+            description: String::new(),
+            published,
+            modified: None,
+            license: first
+                .get("license")
+                .and_then(Value::as_str)
+                .map(|l| l.replace('/', " OR ")),
+            repo: None,
+            homepage: None,
+            downloads: first.get("downloads").and_then(Value::as_u64),
+            extra,
+            deps: Vec::new(),
+            deps_hint: Some(format!(
+                "deps live per version : fetch crates.io/crates/{name}/{headline} for the tree"
+            )),
+            versions,
+            version: headline,
+            name,
+        })
     } else {
         None
     }
@@ -526,14 +579,18 @@ fn crates_card(v: &Value) -> Option<PkgCard> {
 
 fn go_card(v: &Value, url: &str) -> Option<PkgCard> {
     let version = v.get("Version").and_then(Value::as_str)?.to_string();
-    // The proxy payload carries no name — the module path IS the
-    // name; recover it from the URL (.../<module>/@latest).
+    // The proxy payload carries no name : the module path IS the
+    // name; recover it from the URL (`/<module>/@latest` or the
+    // version-pinned `/<module>/@v/<version>.info`).
     let name = url::Url::parse(url)
         .ok()
         .and_then(|u| {
             let p = u.path().to_string();
-            p.strip_suffix("/@latest")
-                .map(|m| m.trim_start_matches('/').to_string())
+            if let Some(m) = p.strip_suffix("/@latest") {
+                return Some(m.trim_start_matches('/').to_string());
+            }
+            p.split_once("/@v/")
+                .map(|(m, _)| m.trim_start_matches('/').to_string())
         })
         .unwrap_or_default();
     let date = v.get("Time").and_then(Value::as_str).map(date_of);
@@ -626,16 +683,6 @@ fn clean_license(l: &str) -> String {
         l.chars().take(40).collect()
     } else {
         l.to_string()
-    }
-}
-
-fn human_count(n: u64) -> String {
-    if n >= 1_000_000 {
-        format!("{:.1}M", n as f64 / 1_000_000.0)
-    } else if n >= 1_000 {
-        format!("{:.1}k", n as f64 / 1_000.0)
-    } else {
-        n.to_string()
     }
 }
 
@@ -758,6 +805,40 @@ mod tests {
         assert!(ex.markdown.contains("rack >= 2.2"));
         assert!(ex.markdown.contains("+1 dev-dependencies"));
         assert!(ex.markdown.contains("license MIT"));
+    }
+
+    #[test]
+    fn go_version_pinned_card_recovers_the_module_name() {
+        let g = r#"{"Version":"v1.10.0","Time":"2024-05-07T03:23:42Z",
+          "Origin":{"URL":"https://github.com/gin-gonic/gin"}}"#;
+        let ex = extract(
+            g.as_bytes(),
+            "https://proxy.golang.org/github.com/gin-gonic/gin/@v/v1.10.0.info",
+            &opts(),
+        )
+        .unwrap();
+        assert!(ex.markdown.contains("# github.com/gin-gonic/gin v1.10.0"));
+        assert!(ex.markdown.contains("2024-05-07"));
+    }
+
+    #[test]
+    fn crates_versions_list_card() {
+        let c = r#"{"versions":[
+          {"crate":"serde","num":"1.0.229","created_at":"2026-07-18T23:05:13Z","yanked":false,"downloads":95220782,"license":"MIT OR Apache-2.0"},
+          {"crate":"serde","num":"1.0.228","created_at":"2025-09-27T00:00:00Z","yanked":false,"downloads":1,"license":"MIT OR Apache-2.0"},
+          {"crate":"serde","num":"1.0.95","created_at":"2019-07-16T00:00:00Z","yanked":true,"downloads":2,"license":"MIT OR Apache-2.0"}],
+          "meta":{"total":316}}"#;
+        let ex = extract(
+            c.as_bytes(),
+            "https://crates.io/api/v1/crates/serde/versions",
+            &opts(),
+        )
+        .unwrap();
+        assert_eq!(ex.via, Some("adapter:crates-api"));
+        assert!(ex.markdown.contains("# serde 1.0.229"));
+        assert!(ex.markdown.contains("95.2M downloads"));
+        assert!(ex.markdown.contains("*(yanked)*"));
+        assert!(ex.markdown.contains("fetch crates.io/crates/serde/1.0.229"));
     }
 
     #[test]

@@ -1,14 +1,14 @@
-//! Fusion — where the two modalities meet.
+//! Fusion : where the two modalities meet.
 //!
 //! Glyphs tell us WHAT the text is. Pixels tell us WHERE structure lives.
 //! Both come from one content stream, so their geometry is aligned to the
 //! sub-point. This module consumes both per page and produces:
 //!
-//! - **Trust audit** — how much of the glyph stream is garbage (private-
+//! - **Trust audit** : how much of the glyph stream is garbage (private-
 //!   use-area codepoints with no meaning), driving the OCR arbitration.
-//! - **Visual regions** — ink-grown connected blocks in point space.
-//! - **Rule lines** — pixel-verified separators for tables and structure.
-//! - **Reading order 2.0** — region-based ordering that handles real
+//! - **Visual regions** : ink-grown connected blocks in point space.
+//! - **Rule lines** : pixel-verified separators for tables and structure.
+//! - **Reading order 2.0** : region-based ordering that handles real
 //!   magazine-style layouts where XY-cut guesses wrong.
 
 #![allow(dead_code)]
@@ -24,10 +24,10 @@ pub struct RegionPt {
     pub x1: f32,
     pub y1: f32,
     pub area_px: u32,
-    /// Vertical whitespace channels inside the region (pt x-ranges) —
+    /// Vertical whitespace channels inside the region (pt x-ranges) :
     /// borderless-table column separators' ground truth.
     pub chan_v: Vec<(f32, f32)>,
-    /// Horizontal whitespace channels (pt y-ranges) — row separators.
+    /// Horizontal whitespace channels (pt y-ranges) : row separators.
     pub chan_h: Vec<(f32, f32)>,
 }
 
@@ -177,7 +177,7 @@ pub fn analyze(chars: &PageChars, lines: &PageLines, bmp: &PageBitmap) -> Fusion
 ///
 /// - Group regions into horizontal bands (y-overlap); bands sort top-down,
 ///   regions inside a band sort left-right. This is the same order a
-///   human follows on magazine layouts — and it degrades to single-column
+///   human follows on magazine layouts : and it degrades to single-column
 ///   top-down when there's only one region per band.
 /// - Lines are emitted within their region, sorted (y, x).
 /// - Unassigned lines (ornaments, tiny text missed by morphology growth)
@@ -275,7 +275,7 @@ pub fn reading_order(page: &PageLines, fusion: &FusionData) -> Vec<Line> {
     }
 
     // Interleave unassigned lines by y position (they had no region: tiny
-    // or off-morphology text — keep them at reading position).
+    // or off-morphology text : keep them at reading position).
     if !unassigned.is_empty() {
         for &i in &unassigned {
             let l = &page.lines[i];

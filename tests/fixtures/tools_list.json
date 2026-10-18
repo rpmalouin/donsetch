@@ -1,83 +1,132 @@
 {
   "tools": [
     {
-      "description": "Fetch one URL (or a batch) as clean markdown — use when you have a specific URL to read. To find URLs use web_search; for whole sites use web_crawl.\n\nURL forms: a URL · an L-handle from earlier fetch output ([text](LxK7mP2q) → fetch LxK7mP2q) · an S-handle from search (fetch the S-handle shown next to a result) · an array of up to 12 for ONE parallel batch call (share a budget with budget_tokens).\n\nPick the CHEAPEST reading mode for the job:\n- Verification question (\"does it mention X?\") → must_contain=\"X\" (or /regex/) — returns MATCH/NO-MATCH + ≤3 excerpts, ~60 tokens.\n- Don't know where it is in a long page → toc=true (outline with section ids+sizes) → section=\"s3\" or section=\"heading text\" for just that part.\n- Know the topic → focus=\"query\" — only relevant blocks, 50-80% cheaper.\n- Just reading → default full page.\n\nRe-checking a page you fetched before: since_last=true → one-line unchanged verdict, or the section-level diff if it changed (~30 tokens). structuredContent.changed carries the verdict on every fetch.\n\nMulti-page articles (rel=next chains): stitch=true returns the whole article in one call (≤6 parts, *(part N)* markers).\n\nDead links: archive=auto (default) serves the nearest Wayback snapshot, honestly labeled with its age; archive=only skips the live web.\n\nReliability: PDFs (even scanned, ≤100MB) auto-parsed; bot walls auto-escalate to a headless browser, solve, and hand back to fast HTTP; known-walled sites that return decoy content to plain HTTP get an equivalence check (decoy_suspected flag). JS-only pages need actions=[{click|type|press|scroll|wait,...}] — deterministic wait_selector/wait_text beats blind sleeps. image_text=true OCRs content images (infographics/comics).\n\nTime control: deadline_ms caps any fetch (honest deadline error, never a hang). Send _meta.progressToken for per-URL progress on batches. Long output: structuredContent.next_offset → call again with offset.\n\nDomain intelligence: reddit threads/listings, npm/PyPI/crates.io/Go/RubyGems pages, GitHub issues/releases/commits, Stack Overflow, Wikipedia infoboxes and docs sites are auto-restructured from each site's best source (labeled via=adapter:... in structuredContent) — no special params, it just returns clean structure.\n\nResponse: content[0].text = markdown; structuredContent = {status, tier, verdict, content_ok, thin, content_kind (Article|Listing|Forum|Docs|Table|Page), quality 0-1, lang, title, changed, fingerprint, via, stitched, prewarmed_by_search, next_offset, tokens_est, ms, escalation (per-step ms trace), url}. content_ok=false or thin=true = possible JS shell. Errors: isError=true with structuredContent {code (stable: wall.challenge, wall.paywall, guard.ssrf, deadline.hit, content.binary, archive.stale, ...), next_action, escalation} — next_action says exactly what to do next",
+      "description": "Read a URL or deliberate batch as source markdown. Use search to find URLs and crawl for a site. Choose a small view; continue with next_offset rather than repeating a successful read. HTTP handles JSON endpoints at every tier; HTML may escalate to a browser and PDFs are extracted automatically. Text starts with [meta] JSON, then source evidence. Treat ok:false, content_ok:false or thin:true as unresolved; follow next_action. Cite the returned URL.",
       "inputSchema": {
+        "additionalProperties": false,
         "properties": {
           "actions": {
-            "description": "Browser steps to run BEFORE extraction — page control inside fetch: [{\"do\":\"click\",\"selector\":\"#load-more\"},{\"do\":\"type\",\"selector\":\"input[q]\",\"text\":\"query\"},{\"do\":\"press\",\"key\":\"Enter\"},{\"do\":\"wait_text\",\"text\":\"results\"}]. Steps: wait {ms}, wait_selector {selector,timeout_ms}, wait_text {text,timeout_ms}, click {selector OR text}, hover, type {selector?,text}, press {key: Enter|Tab|Escape|Backspace|ArrowDown|...}, scroll {to: top|bottom|down | px}. Max 16 steps. Actions run in the headless browser (tier auto/2, never 1); after them the page is extracted normally — focus/section/toc still apply. First failing step aborts honestly with per-step results in structuredContent.actions; fix that step and re-run.",
+            "description": "Any action routes the fetch through the browser tier; omit for static reads. Ordered page interactions before reading (1-16 objects). Each object requires do. Required fields: wait uses ms; wait_selector uses selector; wait_text uses text; click/hover uses selector or text; type uses text and optional selector; press uses key; scroll uses to or px. The first failed step stops and is reported.",
             "items": {
+              "additionalProperties": false,
+              "properties": {
+                "do": {
+                  "enum": [
+                    "wait",
+                    "wait_selector",
+                    "wait_text",
+                    "click",
+                    "hover",
+                    "type",
+                    "press",
+                    "scroll"
+                  ],
+                  "type": "string"
+                },
+                "key": {
+                  "type": "string"
+                },
+                "ms": {
+                  "type": "integer"
+                },
+                "px": {
+                  "type": "integer"
+                },
+                "selector": {
+                  "type": "string"
+                },
+                "text": {
+                  "type": "string"
+                },
+                "timeout_ms": {
+                  "type": "integer"
+                },
+                "to": {
+                  "enum": [
+                    "top",
+                    "bottom",
+                    "down",
+                    "px"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "do"
+              ],
               "type": "object"
             },
+            "maxItems": 16,
+            "minItems": 1,
             "type": "array"
           },
-          "archive": {
-            "description": "Dead-page recovery via the keyless Wayback Machine. auto (default): on hard failure (404/paywall/unsolvable wall) serve the nearest archived snapshot, clearly labeled with its date. only: skip the live fetch, go straight to the archive. off: never.",
-            "enum": [
-              "auto",
-              "only",
-              "off"
-            ],
-            "type": "string"
-          },
           "budget_tokens": {
-            "description": "Batch mode (array url): total output token budget shared across all results (200-500k). DonSeTch allocates it across pages by size — small pages stay whole, big ones get sliced with a resume note. Without it each page uses max_chars independently.",
+            "description": "Shared output-token limit for a URL batch (200-500000). Omit for one URL. Truncated members return continuation information.",
             "type": "integer"
           },
           "deadline_ms": {
-            "description": "Hard time budget for this call in ms (500-600000). On expiry: honest deadline error + next_action — never a silent hang. Batch mode: per-URL budget.",
+            "description": "Hard time budget in ms (500-600000). On expiry: honest error with next_action, never a silent hang. Batch mode: per-URL budget.",
             "type": "integer"
           },
           "focus": {
-            "description": "Relevance query — returns ONLY blocks relevant to your question, cutting tokens 50-80% on long pages. Hybrid keyword + semantic matching catches blocks with different vocabulary than your query. If nothing matches, returns full page with a notice. ALWAYS set when you know what you're looking for — #1 token saver.",
+            "description": "Topic or question for returning only relevant passages. Set when the requested evidence is known; omit only when the whole page is needed. A no-match response, or one saving less than 20%, is labeled and falls back to the full page; for a guaranteed reduction use toc first, then section.",
             "type": "string"
           },
           "image_text": {
-            "description": "OCR the page's content images (up to 4) and append an 'image text' section. For infographics/comics/screenshots whose meaning IS the image. Costs extra fetch+compute — only when image content matters.",
+            "description": "Extract words from up to 4 content images. Enable only when requested evidence is inside an infographic, screenshot, comic or other image.",
             "type": "boolean"
           },
           "links": {
-            "description": "Include [text](url) link URLs. Default false — saves ~30% tokens. Enable only when you need the URLs.",
+            "description": "Include destination URLs found inside page content. The fetched page's own citation URL is always returned separately; enable only when outbound targets are requested evidence.",
             "type": "boolean"
           },
           "max_chars": {
-            "description": "Max markdown chars (default 16000). Truncated pages include next_offset for resumption.",
+            "description": "Max extracted-markdown bytes to return (default 16000; ~4 bytes per token). Truncated pages include next_offset for resumption.",
             "type": "integer"
           },
           "media": {
-            "description": "Include image alt text and sources. Default false.",
+            "description": "Include image alt text and source URLs. Use image_text instead when words inside an image must be read.",
             "type": "boolean"
           },
+          "mode": {
+            "description": "Byte budget for the extracted source markdown (~4 bytes per token): scan=800, read=4000, deep=16000. Explicit max_chars wins; omission keeps the 16000 default. All presets return next_offset when truncated; budget_tokens is the token-denominated budget.",
+            "enum": [
+              "scan",
+              "read",
+              "deep"
+            ],
+            "type": "string"
+          },
           "must_contain": {
-            "description": "Probe mode: verify the page mentions a string/pattern WITHOUT loading it into context. Output = MATCH/NO-MATCH verdict + up to 3 short context excerpts. Case-insensitive substring, or /regex/ (e.g. \"/CVE-2026-\\d+/\"). Full fetch still happens (tiers, walls, PDFs) — only the output collapses. For verification questions, not reading.",
+            "description": "Case-insensitive string or /regex/ presence check. Returns MATCH/NO-MATCH and up to 3 excerpts instead of the full page; use for verification, not general reading.",
             "type": "string"
           },
           "offset": {
-            "description": "Resume from a previous response's next_offset to continue a truncated page.",
+            "description": "Continue from a previous next_offset. Reuse the same URL and any focus, section, selector or rendering fields from that fetch.",
             "type": "integer"
           },
           "section": {
-            "description": "Heading name (substring, case-insensitive) — return only that section. Use after toc to target a specific part.",
+            "description": "Heading name (substring, case-insensitive) or an sN id from a toc outline: return only that section. Use after toc.",
             "type": "string"
           },
           "selector": {
-            "description": "CSS selector — extract only from matching elements. Narrows scope precisely.",
+            "description": "CSS selector for extracting only matching elements. Set only when the selector is known; focus may filter passages inside that region.",
             "type": "string"
           },
           "shot": {
-            "description": "File path — saves a PNG screenshot when blocked by interactive captcha. Only fires on captcha walls; not a general screenshot tool.",
+            "description": "File path: save a PNG screenshot when blocked by an interactive captcha. Fires on captcha walls only, not a general screenshot tool. Relative names resolve under the screenshots root; absolute paths must already be below it. An invalid path is refused before any fetch work.",
             "type": "string"
           },
           "since_last": {
-            "description": "Change check instead of full read: if the page is unchanged since your last fetch, output collapses to a one-line verdict; if changed, you get the section-level delta (added/removed/changed). Refetch without it for full content. Monitoring/re-verification at ~zero tokens.",
+            "description": "Standalone change check for a previously fetched URL. Returns an unchanged verdict or changed sections instead of the full page; a URL with no prior baseline says so (changed:\"no_baseline\" when the read has no change tracking, else a no-prior-snapshot notice). History is tracked per URL (crawl's since_last is per site). Do not combine with reading filters or rendering fields.",
             "type": "boolean"
           },
           "stitch": {
-            "description": "Multi-page articles: follow rel=next pagination and return the WHOLE article in one call (up to 6 parts / 48k chars) with *(part N)* markers, instead of re-fetching page by page. Same-host only.",
+            "description": "Read up to 6 parts of a paginated article. Output obeys max_chars; next_offset resumes collected text and next_part identifies uncollected content. Enable only when the requested source spans article pages.",
             "type": "boolean"
           },
           "tier": {
-            "description": "auto (default, always use for real work): HTTP first, auto-escalates to headless browser on bot-walls/JS-shells, auto-detects and parses PDFs. \"1\" (testing): HTTP only, no browser — fails on JS sites. \"2\" (testing): browser directly — slower, skips HTTP entirely.",
+            "description": "auto (default): HTTP first, escalating to a browser on bot-walls/JS-shells; parses PDFs. \"1\": HTTP only, no browser (fails on JS sites). \"2\": browser directly, skips HTTP (slower).",
             "enum": [
               "auto",
               "1",
@@ -86,7 +135,7 @@
             "type": "string"
           },
           "toc": {
-            "description": "true = heading outline only, no body text. Read structure first, then target with section or focus.",
+            "description": "Return only the heading outline. Use as a standalone first read, then make a new fetch with section or focus.",
             "type": "boolean"
           },
           "url": {
@@ -101,7 +150,7 @@
                 "type": "array"
               }
             ],
-            "description": "URL to fetch: http(s) URL, a handle (L/S from earlier results), or an array of up to 12 for one parallel batch call."
+            "description": "One http(s) URL, an S/L handle returned earlier, or an array of up to 12 URLs or handles for one batch read."
           }
         },
         "required": [
@@ -112,15 +161,16 @@
       "name": "web_fetch"
     },
     {
-      "description": "Web search — returns ranked URLs + titles + snippets. Use to decide WHAT to fetch (web_fetch reads content; this never does).\n\nResults list random handles: each result shows an S-handle (fetch the S-handle shown next to a result; raw URLs in structuredContent for citation). Domains known to need the browser carry a ⚠ needs-browser hint — pick a faster source or budget time before fetching. A *degraded:* footer names any engines that failed — silent quality loss is visible.\n\nEngines: 10+ keyless backends fused by cross-engine consensus + local semantic reranking (automatic). Verticals via intent: GitHub, Wikipedia, HN, Scholar, news, StackExchange, MDN. BYOK: providers configured via `donsetch keys` (Tavily/Exa/Serper/TinyFish/Parallel/BrightData) take over; structuredContent.provider names what served (null = local keyless).\n\ndeadline_ms caps the fan-out (honest deadline error, never a hang).\n\nResponse: numbered markdown list (N. **Title** — domain / snippet / S-handle / engines+score). structuredContent = {intent, weak, cached, elapsed_ms, provider, results:[{title,url,snippet,score,consensus,engines}], engines:[{engine,status,hits,ms}]}. Key signals: weak=true = low consensus, treat with care; consensus = independent engines agreeing (authority); engines[].status = per-engine health.\n\nAfter search: fetch the best result via its S-handle — enrichment pre-fetches top results, so the next fetch is near-instant (prewarmed_by_search=true)",
+      "description": "Discover ranked URLs, titles and snippets; fetch a candidate for its full text. A snippet supports only what it states. Weak or degraded results are incomplete. Fetch handles resolve directly in web_fetch; citation URLs accompany the evidence in the leading [meta] JSON.",
       "inputSchema": {
+        "additionalProperties": false,
         "properties": {
           "deadline_ms": {
-            "description": "Hard time budget in ms (500-600000). Engines have their own timeouts; this caps the whole call. On expiry: honest deadline error.",
+            "description": "Hard time budget in ms (500-600000) for the whole call; per-backend timeouts stay below it. On expiry: an honest deadline error.",
             "type": "integer"
           },
           "intent": {
-            "description": "auto (default) detects from query. code: adds GitHub, HN, StackExchange, MDN verticals. paper: adds Scholar, arXiv. news: adds Google News, HN. entity: adds Wikipedia. web: general only.",
+            "description": "auto (default) detects from the query. Keyless mode adds keyless verticals: code: + GitHub, HN, StackExchange, MDN; paper: + Scholar, arXiv; news: + Google News, HN; entity: + Wikipedia; web: general only. With a configured provider, intent selects that provider's filters instead (one provider; the keyless verticals do not join).",
             "enum": [
               "auto",
               "web",
@@ -132,12 +182,20 @@
             "type": "string"
           },
           "max_results": {
-            "description": "Max results (default 7, max 12). The most relevant results almost always live in the top 7. Increase only when results are weak.",
+            "description": "Maximum ranked candidates to return (default 7, max 12). Increase only when the returned candidate set is insufficient.",
             "type": "integer"
           },
           "query": {
-            "description": "Search query.",
+            "description": "Primary search formulation. Include required entities, dates, versions and exclusions; do not include a guessed answer.",
             "type": "string"
+          },
+          "query_variants": {
+            "description": "Optional array; maximum 2 alternate formulations for the same unmet requirement. Preserve entities and hard constraints; vary vocabulary, terminology, language or answer-bearing phrasing. Omit when no distinct retrieval angle exists.",
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 2,
+            "type": "array"
           }
         },
         "required": [
@@ -148,11 +206,16 @@
       "name": "web_search"
     },
     {
-      "description": "Crawl a site from a seed — for multi-page extraction (docs, API refs, wikis). Single page → web_fetch; finding sites → web_search.\n\nTwo-phase: sitemap discovery (cheap URL inventory) first, then focus-ranked page fetching with adaptive per-host pacing. Docs sites (mkdocs/docusaurus/sphinx/antora) get their nav as the site map automatically.\n\nModes: full (default) = map + content · map = URL inventory only, very cheap — see what a site has before committing · content = BFS from seed, no sitemap (use when sitemap is missing). PDF pages auto-parsed, not skipped.\n\nBudgets: focus (topic) ranks pages by keyword+semantic relevance and crawls only matches — set it whenever you have a topic. max_pages / max_total_chars / deadline_s cap the run; resume tokens continue across calls. since_last=true skips pages unchanged since your last crawl of the site (fingerprint memory — returns only what moved). Send _meta.progressToken for live per-page progress (\"12 pages, 34 queued\"); cancellation stops gracefully and keeps the resume token.\n\nResponse: map (if any) + pages as markdown. structuredContent = {seed, pages:[{url,title,kind,chars,quality}], map, queued, filtered_out, skipped:[{url,reason}], stop, elapsed_s, resume}. stop = FrontierEmpty (done) | MaxPages|CharBudget|DepthLimit|Deadline (budget — resume to continue) | ThrottledOut (site pushed back — wait, then resume) | Cancelled (resume token kept)",
+      "description": "Read multiple pages of a known site within explicit budgets. Text starts with [meta] JSON containing completion, page URLs and resume state. FrontierEmpty is complete only if evidence was obtained without failed or excluded pages; budget, deadline, throttle, cancellation and depth stops are incomplete. Cite page URLs. dataset=true returns JSONL after the metadata line.",
       "inputSchema": {
+        "additionalProperties": false,
         "properties": {
+          "dataset": {
+            "description": "Dataset mode: return JSON Lines (one JSON object per page) instead of markdown.",
+            "type": "boolean"
+          },
           "deadline_s": {
-            "description": "Hard crawl deadline in seconds (default 120, range 5-600). Partial results return after.",
+            "description": "Hard crawl deadline in seconds (default 120, range 1-600). Partial results return after.",
             "type": "integer"
           },
           "exclude_paths": {
@@ -163,7 +226,7 @@
             "type": "array"
           },
           "focus": {
-            "description": "Relevance query — rank pages by relevance and crawl only matching ones. Uses hybrid keyword + semantic matching. Essential for large sites; without it the crawl wastes budget on noise. Set this whenever you have a specific topic in mind.",
+            "description": "Topic or question for selecting relevant pages and passages. Set when the request targets one subject; omit only when the whole site scope is relevant.",
             "type": "string"
           },
           "include_paths": {
@@ -172,6 +235,10 @@
               "type": "string"
             },
             "type": "array"
+          },
+          "map_limit": {
+            "description": "Max URLs returned in the inventory (default 120, range 1-50000). A capped inventory is incomplete; narrow focus/include_paths for large sites.",
+            "type": "integer"
           },
           "max_depth": {
             "description": "Max link depth from seed (default 2). 0 = seed only.",
@@ -182,11 +249,11 @@
             "type": "integer"
           },
           "max_total_chars": {
-            "description": "Total extracted-char budget across all pages (default 60000, range 4000-500000).",
+            "description": "Total extracted-char budget across all pages (default 60000, range 1-500000).",
             "type": "integer"
           },
           "mode": {
-            "description": "full (default): sitemap map + content. map: URL inventory only (very cheap). content: skip sitemap, BFS from seed.",
+            "description": "full (default) discovers pages and reads content; map returns only the URL inventory (a site map when one exists, otherwise the seed page's links, with no page fetches); content follows links from the seed when no usable site map exists.",
             "enum": [
               "full",
               "map",
@@ -195,7 +262,7 @@
             "type": "string"
           },
           "per_page_max": {
-            "description": "Max markdown chars per page (default 8000, range 400-40000).",
+            "description": "Max markdown chars per page (default 8000, range 1-40000).",
             "type": "integer"
           },
           "respect_robots": {
@@ -203,7 +270,7 @@
             "type": "boolean"
           },
           "resume": {
-            "description": "Resume token from a previous response to continue a stopped crawl. Valid for 30 min.",
+            "description": "Opaque token returned by a stopped crawl. Send it instead of url to continue saved progress; do not invent or alter it. A new crawl requires url and omits resume.",
             "type": "string"
           },
           "same_host": {
@@ -211,12 +278,39 @@
             "type": "boolean"
           },
           "since_last": {
-            "description": "Delta crawl: skip pages you already fetched in the last 24h (fingerprint on file) — only new/changed pages are fetched and counted. Monitoring and re-crawls at a fraction of the cost.",
+            "description": "Re-fetch pages and return only new or changed source fingerprints. Prior crawls or fetches supply per-URL baselines. Saves output, not verification requests; use for repeated reads.",
             "type": "boolean"
           },
           "url": {
-            "description": "Seed http(s) URL to crawl from.",
+            "description": "Seed http(s) URL to crawl from; omit when continuing with resume.",
             "type": "string"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "name": "web_crawl"
+    },
+    {
+      "description": "Capture a URL as a rendered PNG in the browser. Returns an image content block and [meta] JSON with path and bytes. The path is server-local; use the inline image on remote clients. Full-page captures can be several MB. Private/loopback URLs are blocked like fetch. Failures return ok:false, code and next_action.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "deadline_ms": {
+            "description": "Hard time budget in ms (500-600000, default 60000). On expiry: an honest deadline error with next_action, never a silent hang.",
+            "type": "integer"
+          },
+          "full_page": {
+            "description": "Capture the full page height, not just the viewport.",
+            "type": "boolean"
+          },
+          "url": {
+            "description": "The URL to capture.",
+            "type": "string"
+          },
+          "wait_ms": {
+            "description": "Extra milliseconds to wait after load, max 5000.",
+            "type": "integer"
           }
         },
         "required": [
@@ -224,7 +318,7 @@
         ],
         "type": "object"
       },
-      "name": "web_crawl"
+      "name": "web_screenshot"
     }
   ]
 }

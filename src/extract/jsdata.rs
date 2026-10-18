@@ -4,7 +4,7 @@
 //! render client-side, but they embed their full content as a JSON
 //! blob assigned to a JS global or inside a
 //! `<script type="application/json">`/ld+json tag. Tier 1 can't run
-//! the JS, but it CAN parse that blob — turning an empty SPA shell
+//! the JS, but it CAN parse that blob : turning an empty SPA shell
 //! into real content without a browser. This is the single biggest
 //! tier-1 unlock: YouTube, GitHub, and every Next.js site drops
 //! its data in the HTML.
@@ -234,7 +234,7 @@ pub fn extract(html: &str, url: &str, opts: &ExtractOptions) -> Option<Extracted
         return None;
     }
 
-    // Score each candidate; generous lower bound — prose with any
+    // Score each candidate; generous lower bound : prose with any
     // content key already earned points. Config noise is penalized
     // below the threshold.
     let mut kept: Vec<Item> = items
@@ -256,11 +256,59 @@ pub fn extract(html: &str, url: &str, opts: &ExtractOptions) -> Option<Extracted
     }
 
     // Render markdown.
-    let (md, title) = render(&kept, url);
+    let preferred_title = super::metadata::metadata(&Html::parse_document(html)).title;
+    let (md, title) = render(&kept, url, preferred_title);
 
+    if opts.focus.is_some() || opts.section.is_some() || opts.must_contain.is_some() {
+        // Rescued data earns the same read controls as ordinary DOM content.
+        let mut blocks = Vec::new();
+        for item in &kept {
+            let text = strip_html(&item.text);
+            if title.as_deref() == Some(text.trim()) {
+                continue;
+            }
+            if item.title_like && text.chars().count() <= 200 {
+                blocks.push(super::blocks::Block::Heading {
+                    level: 2,
+                    text,
+                    path: Vec::new(),
+                });
+            } else {
+                blocks.push(super::blocks::Block::Para {
+                    md: text,
+                    link_density: 0.0,
+                    path: Vec::new(),
+                });
+            }
+        }
+        let meta = super::metadata::Meta {
+            title,
+            byline: None,
+            published: None,
+            site: extract_site(url),
+            description: None,
+            canonical: None,
+        };
+        return super::downstream(
+            &meta,
+            blocks,
+            html.len(),
+            false,
+            false,
+            Vec::new(),
+            super::language::detect_from_text(&md),
+            None,
+            url,
+            opts,
+            opts.max_chars.unwrap_or(16_000).max(200),
+            None,
+        )
+        .ok();
+    }
     let total = md.len();
     let (slice, next) = paginate(&md, opts);
     Some(Extracted {
+        tokens_est: slice.len() / 4,
         markdown: slice,
         title,
         byline: None,
@@ -270,7 +318,7 @@ pub fn extract(html: &str, url: &str, opts: &ExtractOptions) -> Option<Extracted
         next_offset: next,
         blocks_total: kept.len(),
         blocks_shown: kept.len(),
-        tokens_est: total / 4,
+        focus_omitted: false,
         thin: total < 800,
         content_kind: ContentKind::Page,
         lang: guess_lang(&md),
@@ -279,6 +327,7 @@ pub fn extract(html: &str, url: &str, opts: &ExtractOptions) -> Option<Extracted
         images: Vec::new(),
         fingerprint: None,
         via: None,
+        partial: None,
     })
 }
 
@@ -289,16 +338,29 @@ fn find_blobs(html: &str) -> Vec<Blob> {
     let mut out: Vec<Blob> = Vec::new();
 
     // 1. Known JS globals: `var NAME = <json>` or `window.NAME = <json>`.
-    for key in KNOWN_GLOBALS {
+    //
+    // A failed value scan runs to the end of the document (no brace
+    // after the marker, or one that never closes), and the marker is
+    // page text: a page repeating `window.__NEXT_DATA__ = ` with no
+    // value made every occurrence rescan the rest, N × the document.
+    // A real page has a handful of markers, each scanned once, so a
+    // budget of a few document lengths covers it; past it the
+    // remaining markers are left alone.
+    let mut budget = html.len().saturating_mul(SCAN_BUDGET_MULTIPLIER);
+    'keys: for key in KNOWN_GLOBALS {
         let search = format!("{key} = ");
         let mut from = 0;
         while let Some(idx) = html[from..].find(&search) {
             let start = from + idx + search.len();
-            if let Some((raw, consumed)) = extract_js_value(&html[start..]) {
+            let (found, scanned) = extract_js_value_counted(&html[start..]);
+            budget = budget.saturating_sub(scanned);
+            if let Some((raw, consumed)) = found {
                 if !out.iter().any(|b: &Blob| b.raw == raw) {
                     out.push(Blob { raw });
                 }
                 from = start + consumed;
+            } else if budget == 0 {
+                break 'keys;
             } else {
                 // Advance to the next CHAR boundary (a replacement
                 // char is 3 bytes; a naive +1 slices mid-char), and
@@ -333,10 +395,10 @@ fn find_blobs(html: &str) -> Vec<Blob> {
 
     // 4. Modern Next.js (>=13): `self.__next_f.push([k,"..."])`
     // streaming-RSC flight frames. These carry the FULL rendered
-    // page (paragraphs under `children`) — the single biggest
+    // page (paragraphs under `children`) : the single biggest
     // modern-SPA unlock.
     for frame in find_next_f(html) {
-        // Frame is `[k]:"value"` — strip the key prefix so the
+        // Frame is `[k]:"value"` : strip the key prefix so the
         // remainder is a standalone JSON array/object.
         let json = strip_frame_key(&frame);
         if !json.is_empty()
@@ -361,7 +423,7 @@ fn find_next_f(html: &str) -> Vec<String> {
         };
         let body_start = from + rel + needle.len();
         let rest = &html[body_start..];
-        // `[k,"` — skip to the opening quote.
+        // `[k,"` : skip to the opening quote.
         let Some(q) = rest.find('"') else { break };
         // Scan the JS string literal (\" and \\ are escapes).
         let bytes = rest.as_bytes();
@@ -465,7 +527,7 @@ fn js_unescape(s: &str) -> String {
                 // a multi-byte UTF-8 lead, advancing to j+1 would land
                 // mid-character and the next `&s[i..end]` slice would
                 // panic on a hostile page (`\é` inside a flight
-                // frame) — copy the full char instead.
+                // frame) : copy the full char instead.
                 let ch_len = utf8_len(b[j]);
                 let end = (j + ch_len).min(b.len());
                 if ch_len == 1 {
@@ -543,7 +605,7 @@ fn find_data_target<'a>(html: &'a str, suffix: &str) -> Vec<&'a str> {
 /// raw JSON body (trimmed).
 fn find_typed_bodies<'a>(html: &'a str, ty: &str) -> Vec<&'a str> {
     let mut out = Vec::new();
-    let needle = format!(r#"type="{ty}""#);
+    let quoted = [format!(r#"type="{ty}""#), format!("type='{ty}'")];
     let mut from = 0usize;
     while from < html.len() {
         let Some(lt) = html[from..].find("<script") else {
@@ -554,7 +616,10 @@ fn find_typed_bodies<'a>(html: &'a str, ty: &str) -> Vec<&'a str> {
             break;
         };
         let tag_end = tag_start + tag_end_rel;
-        if html[tag_start..tag_end].contains(&needle) {
+        if quoted
+            .iter()
+            .any(|needle| html[tag_start..tag_end].contains(needle))
+        {
             let body_start = tag_end + 1;
             let rest = &html[body_start..];
             if let Some(cs) = rest.find("</script>") {
@@ -576,7 +641,14 @@ fn find_typed_bodies<'a>(html: &'a str, ty: &str) -> Vec<&'a str> {
 /// this to advance past the value, not into it: using the raw
 /// string's length alone misses bytes between the search match
 /// and the opening bracket, which can land mid-character.
-fn extract_js_value(s: &str) -> Option<(String, usize)> {
+/// Bytes the global-assignment scan may examine per document, as a
+/// multiple of the document length.
+const SCAN_BUDGET_MULTIPLIER: usize = 4;
+
+/// The first balanced `{…}`/`[…]` after the marker, with the number
+/// of bytes examined so the caller can bound the total work over
+/// many markers.
+fn extract_js_value_counted(s: &str) -> (Option<(String, usize)>, usize) {
     let bytes = s.as_bytes();
     let mut start = None;
     for (i, &b) in bytes.iter().enumerate() {
@@ -585,7 +657,9 @@ fn extract_js_value(s: &str) -> Option<(String, usize)> {
             break;
         }
     }
-    let start = start?;
+    let Some(start) = start else {
+        return (None, bytes.len());
+    };
     let open = bytes[start];
     let mut depth = 0usize;
     let mut in_str = false;
@@ -609,13 +683,13 @@ fn extract_js_value(s: &str) -> Option<(String, usize)> {
                 depth = depth.saturating_sub(1);
                 if depth == 0 && b == close {
                     let raw = &s[start..=i];
-                    return Some((raw.to_string(), i + 1));
+                    return (Some((raw.to_string(), i + 1)), i + 1);
                 }
             }
             _ => {}
         }
     }
-    None
+    (None, bytes.len())
 }
 
 // ── JSON walk ─────────────────────────────────────────────────
@@ -634,6 +708,18 @@ fn walk(value: &Value, path: &str, out: &mut Vec<Item>, order: &mut usize, depth
     match value {
         Value::Object(map) => {
             for (k, v) in map {
+                if matches!(
+                    k.as_str(),
+                    "notFound"
+                        | "errorBoundary"
+                        | "templateStyles"
+                        | "templateScripts"
+                        | "user_agent"
+                        | "supported_locales"
+                        | "compMap"
+                ) {
+                    continue;
+                }
                 let np = if path.is_empty() {
                     k.clone()
                 } else {
@@ -643,6 +729,17 @@ fn walk(value: &Value, path: &str, out: &mut Vec<Item>, order: &mut usize, depth
             }
         }
         Value::Array(arr) => {
+            if arr.first().and_then(Value::as_str).is_some_and(|module| {
+                matches!(
+                    module,
+                    "Bootloader"
+                        | "RequireDeferredReference"
+                        | "InstagramUserAgent"
+                        | "PolarisLocales"
+                )
+            }) {
+                return;
+            }
             for v in arr.iter().take(400) {
                 walk(v, path, out, order, depth + 1);
             }
@@ -687,6 +784,12 @@ fn score_string(s: &str, path: &str) -> (f32, bool) {
         return (0.0, false);
     }
     let low = t.to_lowercase();
+    if [".jpg", ".jpeg", ".png", ".webp", ".gif", ".svg", ".avif"]
+        .iter()
+        .any(|ext| low.ends_with(ext))
+    {
+        return (0.0, false);
+    }
     if (low.contains("noopener") || low.contains("noreferrer") || low.contains("nofollow"))
         && !t.contains(' ')
     {
@@ -702,7 +805,7 @@ fn score_string(s: &str, path: &str) -> (f32, bool) {
         return (0.0, false);
     }
     let len = t.chars().count();
-    // Long single-token blobs (base64, opaque IDs, tracking tokens) —
+    // Long single-token blobs (base64, opaque IDs, tracking tokens) :
     // reject unless the path is a real content key AND it reads
     // as prose (has spaces).
     if !t.contains(' ') && len >= 40 {
@@ -723,20 +826,30 @@ fn score_string(s: &str, path: &str) -> (f32, bool) {
         if lower.contains(key) {
             score += 2.0;
             key_hit = true;
-            if TITLE_KEYS.contains(key) {
+            if lower
+                .rsplit('.')
+                .next()
+                .is_some_and(|key| TITLE_KEYS.contains(&key))
+            {
                 title_like = true;
             }
             break;
         }
     }
     for key in BAD_KEYS {
-        if lower.contains(key) {
+        // Identity fields are tokens: "id" inside "children" is not an ID.
+        let bad = if matches!(*key, "id" | "guid") {
+            lower.split('.').any(|part| part == *key)
+        } else {
+            lower.contains(key)
+        };
+        if bad {
             score -= 3.0;
             break;
         }
     }
 
-    // Shape signals (secondary — only matter with a key hit).
+    // Shape signals (secondary : only matter with a key hit).
     if t.contains(' ') {
         score += 1.0;
     }
@@ -756,7 +869,7 @@ fn score_string(s: &str, path: &str) -> (f32, bool) {
     }
 
     // Without a real content-key hit, only very long prose-shaped
-    // strings survive — short buttons/aria labels stay out.
+    // strings survive : short buttons/aria labels stay out.
     if !key_hit {
         // Requires an actual sentence-shaped string: >= 60 chars,
         // words separated by spaces, with sentence punctuation.
@@ -771,7 +884,7 @@ fn score_string(s: &str, path: &str) -> (f32, bool) {
 }
 
 /// `key=value[_]key=value` attribute fragments (viewports, meta
-/// charset) — no prose. Only fires when before the first space the
+/// charset) : no prose. Only fires when before the first space the
 /// token is a bare `key=value` pair.
 fn looks_like_attr(t: &str) -> bool {
     let first = t
@@ -819,13 +932,16 @@ fn dedupe(items: &mut Vec<Item>) {
 
 // ── Render ─────────────────────────────────────────────────────
 
-fn render(items: &[Item], url: &str) -> (String, Option<String>) {
+fn render(items: &[Item], url: &str, preferred_title: Option<String>) -> (String, Option<String>) {
     let mut md = String::new();
-    let mut title: Option<String> = None;
+    let mut title = preferred_title.filter(|t| !t.trim().is_empty());
+    if let Some(t) = &title {
+        md.push_str(&format!("# {t}\n\n"));
+    }
 
     // Prefer a short, title-like fragment for the heading.
     for it in items {
-        if it.title_like && it.text.chars().count() <= 200 {
+        if title.is_none() && it.title_like && it.text.chars().count() <= 200 {
             let clean = strip_html(&it.text);
             if !clean.is_empty() {
                 title = Some(clean.clone());
@@ -851,7 +967,7 @@ fn render(items: &[Item], url: &str) -> (String, Option<String>) {
 
     let mut emitted = 0usize;
     for it in items {
-        if it.title_like && title.is_some() {
+        if it.title_like && title.as_deref() == Some(strip_html(&it.text).trim()) {
             continue; // heading already shown
         }
         let clean = strip_html(&it.text);
@@ -875,19 +991,19 @@ fn strip_html(s: &str) -> String {
     if !s.contains('<') || !s.contains('>') {
         return s.to_string();
     }
+    // A FRAGMENT has no <body>: the old `select("body")` matched
+    // nothing and `unwrap_or_default()` emptied every string that
+    // carried markup, so mined items vanished instead of rendering.
+    // Walk the fragment root instead; script/style subtrees never
+    // contribute (#288).
     let doc = Html::parse_fragment(s);
-    let text: String = doc
-        .select(&scraper::Selector::parse("body").unwrap())
-        .next()
-        .map(|b| b.text().collect())
-        .unwrap_or_default();
-    let collapsed: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    collapsed
+    let text = super::inline::visible_text_raw(doc.root_element());
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// HTML-entity-unescape the raw JSON (DOM encodes it).
 fn unescape(raw: &str) -> String {
-    // The blob may contain &quot; &amp; &lt; &gt; &#39; — decode the
+    // The blob may contain &quot; &amp; &lt; &gt; &#39; : decode the
     // common ones (serde_json decodes the rest).
     let mut s = raw.to_string();
     for (from, to) in [
@@ -927,22 +1043,121 @@ fn guess_lang(md: &str) -> String {
 /// Apply caller's max_chars/offset (shared shape with DonSift).
 fn paginate(full: &str, opts: &ExtractOptions) -> (String, Option<usize>) {
     let max = opts.max_chars.unwrap_or(16_000).max(200);
-    let offset = opts.offset;
-    let chars: Vec<char> = full.chars().collect();
-    if offset >= chars.len() {
-        return (String::new(), None);
-    }
-    let end = offset.saturating_add(max).min(chars.len());
-    let slice: String = chars[offset..end].iter().collect();
-    let next = if end < chars.len() { Some(end) } else { None };
-    (slice, next)
+    super::paginate_public(full, opts.offset, max)
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn report_audit_js_rescue_excludes_bootstrap_configuration_without_losing_prose() {
+        let payload = serde_json::json!({"require": [
+            ["Bootloader", [], {"description":"Unused module prose. ".repeat(50)}],
+            ["PolarisLocales", [], {"text":"Simplified Chinese (China)".repeat(30)}],
+            ["RelayPrefetchedStreamCache", [], {"content": "Public profile has actual biography and useful information. ".repeat(15)}]
+        ], "user_agent": "Mozilla/5.0 Chrome/151.0.0.0 Safari/537.36", "compMap": {"description":"Fake configuration prose. ".repeat(50)}});
+        let html =
+            format!("<title>Profile</title><script type='application/json'>{payload}</script>");
+        let ex = super::extract(&html, "https://example.com/profile", &Default::default()).unwrap();
+        assert!(ex.markdown.contains("actual biography"));
+        for noise in [
+            "Unused module",
+            "Simplified Chinese",
+            "Mozilla/5.0",
+            "Fake configuration",
+        ] {
+            assert!(!ex.markdown.contains(noise));
+        }
+    }
+
+    #[test]
+    fn report_audit_js_rescue_read_controls_use_the_recovered_evidence() {
+        let payload = serde_json::json!({"children": [
+            {"title": "Funding history and valuation"},
+            {"text": "Funding round raised a billion dollars for research and development. ".repeat(12)},
+            {"title": "Unrelated manufacturing details"},
+            {"text": "Manufacturing involves assembly equipment and complicated machinery. ".repeat(15)}
+        ]});
+        let html = format!(
+            "<title>Company information</title><script type='application/json'>{payload}</script>"
+        );
+        let options = crate::extract::ExtractOptions {
+            section: Some("Funding history".into()),
+            ..Default::default()
+        };
+        let selected = super::extract(&html, "https://example.com/company", &options).unwrap();
+        assert!(selected.markdown.contains("a billion dollars"));
+        assert!(!selected.markdown.contains("assembly equipment"));
+        let probed = super::extract(
+            &html,
+            "https://example.com/company",
+            &crate::extract::ExtractOptions {
+                must_contain: Some("a billion dollars".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(probed.markdown.contains("MATCH"));
+        assert!(probed.markdown.len() < 1000);
+        let focused = super::extract(
+            &html,
+            "https://example.com/company",
+            &crate::extract::ExtractOptions {
+                focus: Some("funding billion research".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(focused.markdown.contains("a billion dollars"));
+        assert!(!focused.markdown.contains("assembly equipment"));
+    }
+
+    #[test]
+    fn report_audit_js_rescue_rejects_inactive_routes_and_asset_titles() {
+        // Shape captured from Figma's RSC route: notFound and live children
+        // coexist, with Sanity asset metadata in the same page data.
+        let payload = serde_json::json!({
+            "notFound": [["$", "title", null, {"children": "404: This page could not be found."}]],
+            "originalFilename": "Homepage Hero Thumbnail (1).jpg",
+            "children": [
+                {"title": "The real page heading appears here"},
+                {"text": "First real paragraph explains the collaborative canvas and its design tools. ".repeat(5)},
+                {"title": "Another meaningful section heading"},
+                {"text": "Second real paragraph gives practical design instructions and product details. ".repeat(5)}
+            ]
+        });
+        let html = format!(
+            "<html><title>Figma: The collaborative canvas</title><script type='application/json'>{payload}</script><body></body></html>"
+        );
+        let ex = super::extract(
+            &html,
+            "https://www.figma.com/",
+            &crate::extract::ExtractOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(ex.title.as_deref(), Some("Figma: The collaborative canvas"));
+        assert!(!ex.markdown.contains("404:") && !ex.markdown.contains("Thumbnail"));
+        for text in [
+            "The real page heading",
+            "Another meaningful section",
+            "First real paragraph",
+            "Second real paragraph",
+        ] {
+            assert!(ex.markdown.contains(text));
+        }
+        assert!(
+            ex.markdown.find("First real paragraph") < ex.markdown.find("Second real paragraph")
+        );
+        let opts = crate::extract::ExtractOptions {
+            max_chars: Some(200),
+            ..Default::default()
+        };
+        let cut = super::extract(&html, "https://www.figma.com/", &opts).unwrap();
+        assert!(cut.markdown.len() <= 200 && cut.next_offset.is_some());
+    }
+
     /// Fuzzer find (CI, 2026-08-22): a global-assignment match at
     /// the END of input advanced `from` past the string and/or
-    /// mid-replacement-char — `html[from..]` panicked. The advance
+    /// mid-replacement-char : `html[from..]` panicked. The advance
     /// now floors to the next char boundary, clamped to len.
     #[test]
     fn global_match_at_end_of_input_no_panic() {
@@ -953,6 +1168,27 @@ mod tests {
         ])
         .into_owned();
         let _ = find_blobs(&html);
+    }
+
+    // Every marker with no value behind it rescanned the rest of the
+    // document: 512 KiB of them was minutes.
+    #[test]
+    fn repeated_valueless_markers_are_bounded_by_the_scan_budget() {
+        let html = "window.__NEXT_DATA__ = ".repeat(512 * 1024 / 23);
+        let started = std::time::Instant::now();
+        let blobs = find_blobs(&html);
+        assert!(blobs.is_empty());
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(20),
+            "took {:?}",
+            started.elapsed()
+        );
+        // The same markers with a value at the end: the value is
+        // still found, once, before the budget matters.
+        let html = format!("{}{{\"a\":1}}", "window.__NEXT_DATA__ = ".repeat(1000));
+        let blobs = find_blobs(&html);
+        assert_eq!(blobs.len(), 1);
+        assert_eq!(blobs[0].raw, "{\"a\":1}");
     }
 
     #[test]
@@ -1090,14 +1326,14 @@ mod tests {
 
     #[test]
     fn extract_none_on_pure_shell_without_json() {
-        // A plain static HTML body — jsdata must not claim it.
+        // A plain static HTML body : jsdata must not claim it.
         let html = "<html><body><p>Just a normal server-side page, no embedded JSON anywhere in this document.</p></body></html>";
         assert!(extract(html, "https://example.com/x", &opts()).is_none());
     }
 
     #[test]
     fn extract_none_when_only_config_noise() {
-        // Embedded JSON with only ids/urls — must not produce
+        // Embedded JSON with only ids/urls : must not produce
         // "content". Ensure we don't fabricate prose from config.
         let html = r#"<script type="application/json">{"sessionId":"abc123","tracking":{"url":"/api/t","nonce":"deadbeefdecafbad"}}</script>"#;
         assert!(extract(html, "https://example.com/a", &opts()).is_none());
@@ -1152,5 +1388,20 @@ mod tests {
     fn strip_frame_key_passes_through_plain_json() {
         assert_eq!(strip_frame_key("[\"$\",\"p\"]"), "[\"$\",\"p\"]");
         assert_eq!(strip_frame_key("12:{\"a\":1}"), "{\"a\":1}");
+    }
+}
+
+#[cfg(test)]
+mod strip_html_guard_tests {
+    use super::strip_html;
+
+    // A mined string carrying a script element must not leak its
+    // source into the rendered item (#288's class).
+    #[test]
+    fn strip_html_never_leaks_script_text() {
+        let out = strip_html("Hello <script>var leak = 1;</script>world");
+        assert!(!out.contains("leak"), "{out}");
+        assert!(out.contains("Hello"), "{out}");
+        assert!(out.contains("world"), "{out}");
     }
 }

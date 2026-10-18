@@ -1,12 +1,12 @@
 //! Page history (v3): fingerprints and diff for re-fetches.
 //!
-//! Every successful fetch records a knowledge fingerprint — the
+//! Every successful fetch records a knowledge fingerprint : the
 //! sha256 of the full pre-pagination markdown. Re-fetching a URL
 //! the agent has seen before answers "did this change?" honestly:
 //!
-//! - `unchanged` — same fingerprint; with `since_last=true` the
+//! - `unchanged` : same fingerprint; with `since_last=true` the
 //!   result collapses to a one-line verdict.
-//! - `changed`/`rewritten` — section-level delta report (added /
+//! - `changed`/`rewritten` : section-level delta report (added /
 //!   removed / changed sections) alongside (or, with since_last,
 //!   instead of) the fresh content.
 //!
@@ -72,7 +72,7 @@ impl PageHistory {
 
     /// Fingerprint of normalized full markdown: whitespace-tail
     /// trimmed (renderers differ on trailing newlines), sha256
-    /// first 12 hex chars — enough to be collision-honest for
+    /// first 12 hex chars : enough to be collision-honest for
     /// change detection, short enough to show agents.
     pub fn fingerprint(markdown: &str) -> String {
         use sha2::Digest;
@@ -92,6 +92,15 @@ impl PageHistory {
         markdown: &str,
     ) -> Option<PageRecord> {
         let prev = self.entries.get(url).cloned();
+        // An incomplete read supplies no baseline text. Preserve a complete
+        // snapshot only when its neutral page fingerprint still matches.
+        let text = if markdown.is_empty() {
+            prev.as_ref()
+                .filter(|p| p.fingerprint == fingerprint)
+                .and_then(|p| p.text.clone())
+        } else {
+            Some(markdown.chars().take(PER_TEXT_CAP).collect())
+        };
         self.entries.insert(
             url.to_string(),
             PageRecord {
@@ -99,7 +108,7 @@ impl PageHistory {
                 at: now(),
                 total_chars,
                 title: title.map(String::from),
-                text: Some(markdown.chars().take(PER_TEXT_CAP).collect()),
+                text,
             },
         );
         self.enforce_budget();
@@ -144,6 +153,16 @@ impl PageHistory {
         }
     }
 
+    /// True when the URL is on file with the same content
+    /// fingerprint. Powers delta crawl: only pages whose content
+    /// changed since the last crawl are returned. No TTL here: an
+    /// identical hash means identical content, however old it is.
+    pub fn matches_fingerprint(&self, url: &str, fingerprint: &str) -> bool {
+        self.entries
+            .get(url)
+            .is_some_and(|r| r.fingerprint == fingerprint)
+    }
+
     /// Was this URL fetched (and recorded) recently? Powers delta
     /// crawls: `since_last` skips pages whose fingerprint is on
     /// file from the last 24h.
@@ -161,8 +180,12 @@ impl PageHistory {
         let dir = crate::paths::cache_dir();
         let _ = std::fs::create_dir_all(&dir);
         let tmp = dir.join(".page-history.json.tmp");
+        // Owner-only from the first byte, like the handle table: the
+        // store keeps page markdown (up to 64 KB per URL), including
+        // pages fetched behind a session, so a umask-default 0644
+        // staging window is a leak. doctor tightens a legacy file.
         if let Ok(bytes) = serde_json::to_vec(&p)
-            && std::fs::write(&tmp, bytes).is_ok()
+            && crate::config::write_private(&tmp, &bytes).is_ok()
         {
             let _ = std::fs::rename(&tmp, path());
         }
@@ -258,7 +281,7 @@ pub fn classify_change(old: &str, new: &str) -> ChangeKind {
 }
 
 /// Human/agent-readable section-level delta: which sections were
-/// added, removed, or materially changed. Capped — the report must
+/// added, removed, or materially changed. Capped : the report must
 /// never outweigh the news it delivers.
 pub fn section_delta_report(old: &str, new: &str) -> String {
     let old_sec = split_sections(old);
@@ -406,5 +429,38 @@ mod tests {
             "text budget blown: {total}"
         );
         assert!(h.entries.len() <= MAX_URLS);
+    }
+
+    #[test]
+    fn matches_fingerprint_is_exact_per_url() {
+        // The delta-crawl contract: a changed page must NOT match its
+        // stored fingerprint, an unchanged one must, and an unseen URL
+        // must never match anything. This is the RUN2/RUN3 battery
+        // law: mutate leg reports the change, repeat leg reports none.
+        let mut h = PageHistory::default();
+        h.record("http://r/alpha/p1", "8826b1cd1035", 72, Some("p1"), "amber");
+        h.record("http://r/alpha/p2", "731605c1f239", 50, Some("p2"), "two");
+        assert!(h.matches_fingerprint("http://r/alpha/p1", "8826b1cd1035"));
+        assert!(!h.matches_fingerprint("http://r/alpha/p1", "2e73125a552c"));
+        assert!(h.matches_fingerprint("http://r/alpha/p2", "731605c1f239"));
+        assert!(!h.matches_fingerprint("http://r/alpha/p3", "2e73125a552c"));
+        assert!(!h.matches_fingerprint("http://r/alpha/p1", ""));
+    }
+
+    #[test]
+    fn wave450_partial_reads_preserve_only_matching_full_snapshots() {
+        let mut h = PageHistory::default();
+        let url = "https://example.com/guide";
+        h.record(url, "one", 20, None, "the full first page");
+        h.record(url, "one", 4, None, "");
+        let prior = h.record(url, "two", 4, None, "").unwrap();
+        assert_eq!(prior.text.as_deref(), Some("the full first page"));
+        let prior = h
+            .record(url, "two", 25, None, "the changed complete page")
+            .unwrap();
+        assert!(
+            prior.text.is_none(),
+            "a changed partial read must not retain stale full text"
+        );
     }
 }

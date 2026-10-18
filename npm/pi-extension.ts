@@ -1,5 +1,5 @@
 /**
- * DonSeTch pi extension — bridges the donsetch MCP binary into pi.
+ * DonSeTch pi extension : bridges the donsetch MCP binary into pi.
  *
  * `pi install npm:donsetch` installs this package. At session_start the
  * extension spawns `donsetch mcp`, performs the MCP handshake, discovers
@@ -8,37 +8,74 @@
  *
  * Zero maintenance: tool definitions are fetched dynamically from the
  * binary. When donsetch adds or changes tools, this extension picks
- * them up automatically — no code changes needed here.
+ * them up automatically : no code changes needed here.
  *
  * Auto-download: if the binary is missing (e.g. postinstall was
- * blocked by npm 10+), the extension runs install.js at session_start
- * to fetch it from GitHub Releases.
+ * blocked by npm 10+), the extension resolves through
+ * resolve-binary.js at session_start: the package binary gets
+ * installed when possible, otherwise an existing donsetch
+ * (DONSETCH_BINARY / PATH / cargo bin) is used (#361: system-wide
+ * installs under a root-owned prefix).
  *
  * Custom TUI: each tool has clean renderCall/renderResult showing
- * a compact summary card — not the full raw output. The LLM still
+ * a compact summary card : not the full raw output. The LLM still
  * receives complete content; the user sees a minimal status line +
  * one-line preview. Amber theme matching DonSeTch's identity.
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { spawn, execFileSync, type ChildProcess } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Text } from "@earendil-works/pi-tui";
 
 // ── Constants ──
-const INIT_TIMEOUT_MS = 10_000;
+const INIT_TIMEOUT_MS = 30_000;
 const CALL_TIMEOUT_MS = 120_000;
 const SHUTDOWN_GRACE_MS = 2_000;
 
+// The client timeout must outlive the server's OWN budget, or a call the
+// binary still considers legal gets killed here first. web_crawl accepts
+// deadline_s up to 600 and web_fetch deadline_ms up to 600000, so a fixed
+// 120s client cap cut legal crawls off at exactly the binary's default
+// deadline (deadline_s defaults to 120 : the two raced). Derive it from
+// the call's own budget plus slack instead, capped at the largest budget
+// the schemas allow so a hostile arg cannot hold a slot forever.
+const CALL_DEADLINE_SLACK_MS = 20_000;
+const MAX_CALL_TIMEOUT_MS = 620_000; // 600s budget + slack
+
+function num(v: unknown): number | null {
+  const n = typeof v === "string" ? Number(v) : typeof v === "number" ? v : NaN;
+  return Number.isFinite(n) && n > 0 ? n : null;
+}
+
+function callTimeoutFor(name: string, args: any): number {
+  let budgetMs: number | null = null;
+  if (name === "web_crawl") {
+    const secs = num(args?.deadline_s);
+    budgetMs = secs !== null ? secs * 1000 : 120_000; // the binary's default
+  } else if (name === "web_fetch") {
+    budgetMs = num(args?.deadline_ms);
+  }
+  if (budgetMs === null) return CALL_TIMEOUT_MS;
+  return Math.min(budgetMs + CALL_DEADLINE_SLACK_MS, MAX_CALL_TIMEOUT_MS);
+}
+
+// A raw process.stderr.write bypasses pi's TUI paint cycle and
+// corrupts the viewport (worse across parallel agents). Gate it here.
+const DEBUG_MODE =
+  (process.env.DONSETCH_DEBUG ?? "").length > 0 ||
+  (process.env.DEBUG ?? "").length > 0;
+
 // ── TUI rendering note ──
 // Pi's TUI wraps tool calls in its own green (success) / red (failure)
-// highlight. We output PLAIN TEXT only — no ANSI codes at all.
+// highlight. We output PLAIN TEXT only : no ANSI codes at all.
 // pi-tui's truncateToWidth injects \x1b[0m RESET around the ellipsis,
 // which breaks pi's overlay mid-line. We use our own truncate()
 // that adds zero ANSI codes.
 
-/** Plain text truncation — no ANSI codes. */
+/** Plain text truncation : no ANSI codes. */
 function truncate(text: string, maxLen: number): string {
   if (text.length <= maxLen) return text;
   if (maxLen <= 3) return text.slice(0, maxLen);
@@ -50,6 +87,7 @@ const ICONS: Record<string, string> = {
   web_fetch:  "\u{1F310}",  // 🌐
   web_search: "\u{1F50E}",  // 🔎
   web_crawl:  "\u{1F577}\u{FE0F}",  // 🕷️
+  web_screenshot: "\u{1F4F7}",  // 📷
 };
 
 // ── MCP client state ──
@@ -74,32 +112,35 @@ function ensureBinary(): string {
   const binaryPath = getBinaryPath();
   if (existsSync(binaryPath)) return binaryPath;
 
-  const installScript = join(__dirname, "install.js");
-  if (!existsSync(installScript)) {
+  const resolverScript = join(__dirname, "resolve-binary.js");
+  if (!existsSync(resolverScript)) {
     throw new Error(
-      `donsetch binary not found at ${binaryPath} and install.js is missing. ` +
+      `donsetch binary not found at ${binaryPath} and resolve-binary.js is missing. ` +
       `Run \`npm rebuild donsetch\` or \`npm install -g --allow-scripts=donsetch donsetch@latest\`.`
     );
   }
 
+  // The shared resolver installs the package binary when it can and
+  // falls back to an existing donsetch when it cannot. stdio is
+  // inherited so first-run download progress stays visible; the path
+  // arrives via a temp file because stdout belongs to the terminal.
+  const outFile = join(tmpdir(), `donsetch-resolve-${process.pid}.txt`);
   try {
-    execFileSync("node", [installScript], {
-      stdio: "inherit",
-      cwd: __dirname,
-      timeout: 60_000,
-    });
-  } catch (err: any) {
-    throw new Error(`Failed to download donsetch binary: ${err.message}`);
-  }
-
-  if (!existsSync(binaryPath)) {
-    throw new Error(
-      `donsetch binary still missing after install.js ran. ` +
-      `Run \`npm install -g --allow-scripts=donsetch donsetch@latest\` manually.`
+    execFileSync(
+      process.execPath,
+      [resolverScript, "--print-file", outFile, "--pkg-dir", __dirname],
+      { stdio: "inherit", cwd: __dirname, timeout: 300_000 }
     );
+    const resolved = readFileSync(outFile, "utf8").trim();
+    if (!resolved) throw new Error("resolver returned no binary path");
+    return resolved;
+  } catch (err: any) {
+    throw new Error(
+      `Failed to resolve the donsetch binary. The resolver output above names the cause and the ways out (${err.message}).`
+    );
+  } finally {
+    try { rmSync(outFile, { force: true }); } catch { /* best effort */ }
   }
-
-  return binaryPath;
 }
 
 // ── MCP JSON-RPC 2.0 over stdio ──
@@ -120,7 +161,7 @@ function startServer(): Promise<void> {
     try {
       // --supervised: crash-only daemon. If the MCP server is SIGKILLed
       // (OOM, crash), the supervisor respawns it and replays in-flight
-      // requests — pi users never see a dead tool until the process
+      // requests : pi users never see a dead tool until the process
       // itself dies.
       proc = spawn(binaryPath, ["mcp", "--supervised"], {
         stdio: ["pipe", "pipe", "pipe"],
@@ -158,8 +199,29 @@ function startServer(): Promise<void> {
       }
     });
 
+    // The daemon writes diagnostics to stderr (Xvfb warnings,
+    // fallback notices, ghost telemetry). Pi's TUI surfaces stderr
+    // as user-facing output: raw forwarding used to pop non-fatal
+    // warnings up (issue #95). Gate it:
+    // - DONSETCH_DEBUG / DEBUG set: forward everything (dev mode)
+    // - otherwise only crash/fatal lines survive; the rest is
+    //   tool-level information the caller already has
+    const FATAL_RE = /fatal|panic|crash|SIGSEGV|abort|OOM|out of memory/i;
+    let stderrTail = "";
     proc.stderr?.on("data", (chunk: Buffer) => {
-      process.stderr.write(chunk);
+      if (DEBUG_MODE) {
+        process.stderr.write(chunk);
+        return;
+      }
+      stderrTail = (stderrTail + chunk.toString()).slice(-2048);
+      const lines = stderrTail.split("\n");
+      stderrTail = lines.pop() || "";
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (trimmed && FATAL_RE.test(trimmed)) {
+          process.stderr.write(`[donsetch] ${trimmed}\n`);
+        }
+      }
     });
 
     proc.on("error", (err) => {
@@ -285,8 +347,13 @@ function sendNotification(method: string, params: any): void {
   }
 }
 
-async function callMcpTool(name: string, args: any, signal?: AbortSignal): Promise<any> {
-  return sendRequest("tools/call", { name, arguments: args ?? {} }, CALL_TIMEOUT_MS, signal);
+async function callMcpTool(
+  name: string,
+  args: any,
+  signal?: AbortSignal,
+  timeoutMs = CALL_TIMEOUT_MS
+): Promise<any> {
+  return sendRequest("tools/call", { name, arguments: args ?? {} }, timeoutMs, signal);
 }
 
 function killServer(): void {
@@ -328,6 +395,19 @@ function getPreview(text: string, maxLen = 72): string {
   return "";
 }
 
+/** Parse the server's folded state block: a leading "[meta] {json}". */
+function parseFoldedMeta(blocks: string[]): any {
+  for (const b of blocks) {
+    if (!b.startsWith("[meta] ")) continue;
+    try {
+      return JSON.parse(b.slice("[meta] ".length).trim());
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
 /** Count numbered search results in text. */
 function countSearchResults(text: string): number {
   const matches = text.match(/^\d+\.\s/gm);
@@ -362,22 +442,26 @@ function shortUrl(url: string): string {
  * engine), or the provider name ("exa", "tavily", "serper",
  * "tinyfish") for BYOK.
  */
-function getSearchProvider(sc: any): string {
-  if (!sc) return "local";
-  const provider = sc.provider;
+function getSearchProvider(sc: any, dbg: any): string {
+  const provider = (sc && sc.provider) || (dbg && dbg.provider) || null;
   if (!provider || provider === "null") return "local";
   return String(provider);
 }
 
 /**
- * Extract the fetch source label from structuredContent.
+ * Extract the fetch source label from model state with a
+ * client-only diagnostics fallback. Compact MCP contracts keep
+ * transport telemetry in _meta["com.donsetch/fetch-debug"], so the
+ * tier can live there; older servers still expose it on
+ * structuredContent.
  * Returns "cache" when tier is "1(warm)" (warm cookies, not a
  * fresh fetch), "ghost" when tier starts with "2" (browser
  * escalation), or "" for a normal tier-1 fetch.
  */
-function getFetchSource(sc: any): string {
-  if (!sc) return "";
-  const tier = String(sc.tier || "");
+function getFetchSource(sc: any, dbg: any): string {
+  const tier = String(
+    (sc && sc.tier) || (dbg && dbg.tier) || ""
+  );
   if (tier.includes("warm")) return "cache";
   if (tier.startsWith("2")) return "ghost";
   return "";
@@ -402,7 +486,11 @@ export default function (pi: ExtensionAPI) {
     try {
       await startServer();
     } catch (err: any) {
-      process.stderr.write(`[donsetch] failed to start MCP server: ${err.message}\n`);
+      const message = String(err.message || err);
+      const hint = message.includes("initialize") && message.includes("timeout")
+        ? " Run `donsetch doctor` to diagnose the installation and runtime."
+        : "";
+      process.stderr.write(`[donsetch] failed to start MCP server: ${message}.${hint}\n`);
       return;
     }
 
@@ -442,24 +530,42 @@ export default function (pi: ExtensionAPI) {
             } catch (err: any) {
               return {
                 content: [{ type: "text", text: `donsetch MCP server crashed and could not restart: ${err.message}` }],
+                // Every other result path carries `details`; pi's
+                // AgentToolResult requires it, and renderResult reads it.
+                details: { mcpTool: toolName, isError: true, error: err.message },
                 isError: true,
               };
             }
           }
 
           try {
-            const result = await callMcpTool(toolName, params, _signal);
-            // Join all content text blocks, skipping [meta] blocks.
-            // [meta] blocks contain compact metadata for clients
-            // (Claude Code, VSCode) that drop text when
-            // structuredContent is present. Pi reads structuredContent
-            // directly for details, so meta blocks are redundant here.
-            const text = (result?.content ?? [])
-              .map((b: any) => b?.text ?? "")
-              .filter((t: string) => !t.startsWith("[meta]"))
-              .join("") || "";
+            const result = await callMcpTool(
+              toolName,
+              params,
+              _signal,
+              callTimeoutFor(toolName, params)
+            );
+            // Every content block, joined verbatim: this is exactly
+            // what pi hands the model. The server folds state into a
+            // leading [meta] block for the clients whose model sees
+            // only `content` (pi among them), and that block carries
+            // the result URLs behind the S handles, next_offset and
+            // error codes, so it must not be dropped here. The detail
+            // helpers below skip meta-shaped lines where they look
+            // for prose.
+            const blocks = (result?.content ?? []).map((b: any) => b?.text ?? "");
+            const text = blocks.join("") || "";
             const isErr = result?.isError ?? false;
-            const sc = result?.structuredContent ?? null;
+            // Folded sessions omit structuredContent; when it is
+            // absent, recover the same state from the [meta] block so
+            // the TUI badge readers (blocked / thin / source) keep
+            // working.
+            const sc = result?.structuredContent ?? parseFoldedMeta(blocks);
+            const dbg = result?._meta?.["com.donsetch/fetch-debug"] ?? null;
+            // Issue #172: provider moved to _meta for compact search
+            // responses, so the BYOK label must read the telemetry
+            // object too instead of blaming "local" on every search.
+            const sdbg = result?._meta?.["com.donsetch/search-debug"] ?? null;
 
             // Build details for TUI rendering
             const details: any = {
@@ -471,9 +577,9 @@ export default function (pi: ExtensionAPI) {
             if (toolName === "web_search") {
               details.results = countSearchResults(text);
               details.topResult = getFirstResultTitle(text);
-              details.provider = getSearchProvider(sc);
+              details.provider = getSearchProvider(sc, sdbg);
             } else if (toolName === "web_fetch") {
-              details.source = getFetchSource(sc);
+              details.source = getFetchSource(sc, dbg);
               details.status = getFetchStatus(sc);
               if (sc?.stitched) details.stitched = sc.stitched;
             } else if (toolName === "web_crawl") {
@@ -518,7 +624,7 @@ export default function (pi: ExtensionAPI) {
           } else if (args?.query) {
             key = truncate(`"${args.query}"`, 50);
           }
-          // Plain text only — no ANSI codes. Pi wraps tool calls
+          // Plain text only : no ANSI codes. Pi wraps tool calls
           // in its own green (success) / red (failure) highlight.
           // Any ANSI we emit breaks pi's overlay mid-line.
           return new Text(
@@ -567,7 +673,7 @@ export default function (pi: ExtensionAPI) {
             line2 = d.preview;
           }
 
-          // Plain text only — no ANSI. Pi handles all coloring.
+          // Plain text only : no ANSI. Pi handles all coloring.
           const line1 = `${toolName} \u00B7 ${meta}`;
           const output = line2
             ? `${line1}\n  ${line2}`
@@ -578,7 +684,11 @@ export default function (pi: ExtensionAPI) {
       });
     }
 
-    process.stderr.write(`[donsetch] ${mcpTools.length} tools registered: ${toolNames.join(", ")}\n`);
+    // Fires every session_start (unlike the failure paths above), so
+    // this one corrupted the viewport on every normal run.
+    if (DEBUG_MODE) {
+      process.stderr.write(`[donsetch] ${mcpTools.length} tools registered: ${toolNames.join(", ")}\n`);
+    }
   });
 
   pi.on("session_shutdown", () => {

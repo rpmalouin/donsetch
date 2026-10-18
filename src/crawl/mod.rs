@@ -1,12 +1,13 @@
 //! The crawl orchestrator. Owns: frontier loop, worker pool,
 //! budgets, stop conditions, near-dup detection, resume tokens.
 //!
-//! Fetch I/O goes through the `PageFetcher` trait — the real
+//! Fetch I/O goes through the `PageFetcher` trait : the real
 //! crawl rides DonShadow; tests ride a mock. Never does the
 //! orchestrator touch sockets directly.
 
 pub mod frontier;
 pub mod governor;
+pub mod host_pace;
 pub mod real;
 pub mod score;
 pub mod sitemap;
@@ -29,62 +30,381 @@ use frontier::{FrontierQueue, scope_allowed};
 use governor::Governor;
 use sitemap::SitemapEntry;
 
+/// Frontier score bonus for links discovered on the seed page itself
+/// (depth 0) with no focus set: the seed page's own references are
+/// the crawl's topic neighborhood (V10, crawl topic drift).
+const SEED_NEIGHBOR_BOOST: f64 = 1.5;
+
 /// A fetched page as the orchestrator sees it.
+#[derive(Clone)]
 pub struct FetchedPage {
-    /// Final URL after redirects.
+    /// Governor assignment that produced this page, including buffered reads.
+    pub lane: String,
+    /// The actual HTTP policy; absent when no request produced a response.
+    pub route: Option<crate::transport::request_route::RequestRoute>,
+    /// Final URL after redirects; for a rule refusal, the refused URL
+    /// (a redirect hop's target when the refusal came mid-chain).
     pub url: String,
     pub status: u16,
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
     pub verdict: Verdict,
     pub latency: Duration,
-    /// True when served from the revalidation/pool cache — these
+    /// True when served from the revalidation/pool cache : these
     /// are FREE and must not count against pacing budgets.
     pub cached: bool,
     /// Human-readable failure note (network error, etc.).
     pub error_hint: Option<String>,
+    /// Set when a local DonSeTch rule refused the fetch (the URL, its
+    /// adapter rewrite or a redirect hop); `status` is then 0. Such a
+    /// page is final: the worker never retries it.
+    pub denied: Option<crate::rules::Denial>,
+}
+
+/// The skip reason a crawl records for a page a local rule refused:
+/// `<policy code>: excluded by the operator's local DonSeTch rules `<key>``.
+pub(crate) fn policy_skip_reason(d: &crate::rules::Denial) -> String {
+    format!(
+        "{}: excluded by the operator's local DonSeTch rules `{}`",
+        d.code(),
+        d.rule
+    )
+}
+
+/// The URLs one rule denied in a crawl.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct DeniedGroup {
+    /// The rule's pattern key.
+    pub rule: String,
+    /// `"walled"` or `"permanent"`.
+    pub kind: String,
+    /// The operator's message, verbatim.
+    pub message: String,
+    /// Every denial recorded under this rule.
+    pub count: usize,
+    /// The first `[rules] crawl_denied_urls_per_rule` URLs only.
+    pub urls: Vec<String>,
+}
+
+/// URLs a crawl refused to queue because a local rule denies them (or
+/// their adapter rewrite), grouped by rule. Bounded: per rule it keeps a
+/// count and a capped URL list.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct DeniedLog {
+    /// One group per rule, in first-seen order.
+    pub groups: Vec<DeniedGroup>,
+}
+
+impl DeniedLog {
+    /// Denials recorded across every rule.
+    pub fn total(&self) -> usize {
+        self.groups.iter().map(|g| g.count).sum()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.groups.is_empty()
+    }
+
+    /// Count one denial of `url` under `d`'s rule, keeping the URL only
+    /// while the group lists fewer than `cap`. Callers record each URL
+    /// once; this does not dedup.
+    pub fn record(&mut self, url: &str, d: &crate::rules::Denial, cap: usize) {
+        let index = match self.groups.iter().position(|g| g.rule == d.rule) {
+            Some(index) => index,
+            None => {
+                self.groups.push(DeniedGroup {
+                    rule: d.rule.clone(),
+                    kind: d.kind.clone(),
+                    message: d.message.clone(),
+                    count: 0,
+                    urls: Vec::new(),
+                });
+                self.groups.len() - 1
+            }
+        };
+        let group = &mut self.groups[index];
+        group.count += 1;
+        if group.urls.len() < cap {
+            group.urls.push(url.to_string());
+        }
+    }
+}
+
+/// Why the seed produced nothing in a crawl that had nothing else to
+/// fetch. `crawl()` still returns `Ok`; the tool turns this into its
+/// error. Never set for a resumed crawl.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SeedFailure {
+    /// The seed as the caller gave it.
+    pub requested: String,
+    /// Where the seed fetch ended, when that differs from `requested`.
+    pub landing: Option<String>,
+    /// HTTP status of the failing seed fetch; 0 = no response.
+    pub status: u16,
+    /// The fetch's verdict, `{:?}`-formatted; None when not fetched.
+    pub verdict: Option<String>,
+    /// The seed's skip reason, or the fetch's error note.
+    pub error: Option<String>,
+    /// Set when robots.txt refused the seed, which was then not fetched.
+    pub robots: Option<RobotsRefusal>,
+    /// Set when a local rule refused the seed fetch (a redirect into a
+    /// denied host).
+    pub denial: Option<crate::rules::Denial>,
+    /// False in content mode, which reads no sitemap.
+    pub has_sitemap_phase: bool,
+}
+
+/// How robots.txt refused a seed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RobotsRefusal {
+    /// The origin's published rules disallow it.
+    Disallow,
+    /// robots.txt could not be read (RFC 9309 "unreachable"), which
+    /// reads as disallow-all.
+    Unreachable,
+}
+
+impl RobotsRefusal {
+    fn of(robots: &sitemap::Robots) -> Self {
+        if robots.unreachable {
+            Self::Unreachable
+        } else {
+            Self::Disallow
+        }
+    }
+}
+
+impl SeedFailure {
+    /// A seed fetch that came back without content. `requested`,
+    /// `landing` and `has_sitemap_phase` are settled by the caller.
+    fn from_page(page: &FetchedPage, error: Option<String>) -> Self {
+        Self {
+            requested: String::new(),
+            landing: Some(page.url.clone()),
+            status: page.status,
+            verdict: Some(format!("{:?}", page.verdict)),
+            error: error.or_else(|| page.error_hint.clone()),
+            robots: None,
+            denial: page.denied.clone(),
+            has_sitemap_phase: false,
+        }
+    }
+
+    /// A seed robots.txt refused; it was not fetched.
+    fn from_robots(landing: &str, refusal: RobotsRefusal) -> Self {
+        Self {
+            requested: String::new(),
+            landing: Some(landing.to_string()),
+            status: 0,
+            verdict: None,
+            error: None,
+            robots: Some(refusal),
+            denial: None,
+            has_sitemap_phase: false,
+        }
+    }
+
+    /// Fill the fields only the crawl knows; `landing` survives only
+    /// when it names another URL than `requested`.
+    fn settle(mut self, requested: &str, has_sitemap_phase: bool) -> Self {
+        let same = |a: &str, b: &str| match (Url::parse(a), Url::parse(b)) {
+            (Ok(a), Ok(b)) => frontier::normalize(&a) == frontier::normalize(&b),
+            _ => a == b,
+        };
+        self.landing = self.landing.filter(|l| !same(l, requested));
+        self.requested = requested.to_string();
+        self.has_sitemap_phase = has_sitemap_phase;
+        self
+    }
+}
+
+/// The preflight's view of the seed, kept for map mode's exit, where
+/// the buffered seed page is gone by the time the empty-map branch runs.
+struct SeedPreflight {
+    /// The seed fetch, when robots let the preflight make it.
+    page: Option<SeedFailure>,
+    /// Content came back (2xx `ContentOk`).
+    page_ok: bool,
+    robots: Option<RobotsRefusal>,
+}
+
+impl SeedPreflight {
+    /// The failure the preflight saw, if the seed failed.
+    fn failure(&self, seed: &str) -> Option<SeedFailure> {
+        if let Some(refusal) = self.robots {
+            let mut failure = SeedFailure::from_robots(seed, refusal);
+            failure.error = self.page.as_ref().and_then(|p| p.error.clone());
+            return Some(failure);
+        }
+        match &self.page {
+            Some(page) if !self.page_ok => Some(page.clone()),
+            _ => None,
+        }
+    }
+}
+
+/// The local-rules check every frontier push goes through. It runs
+/// before robots wherever both apply, and it never touches the queue's
+/// order or scores: an allowed URL is pushed exactly as without rules.
+#[derive(Clone)]
+struct PushGate {
+    // Local rules: a change to where or how the crawl applies them needs
+    // the same change in docs/rules-architecture.md (and docs/rules.md
+    // when operators can see it).
+    rules: &'static crate::rules::RuleSet,
+    denied: Arc<Mutex<DeniedLog>>,
+    cap: usize,
+}
+
+impl PushGate {
+    /// True when a rule denies `url` or its adapter rewrite. The URL's
+    /// key then enters the queue's seen set (never the queue) and is
+    /// recorded in the denied log the first time it is seen.
+    fn refuse(&self, q: &mut FrontierQueue, url: &Url) -> bool {
+        let Some(denial) = rule_denial(self.rules, url) else {
+            return false;
+        };
+        let key = frontier::normalize(url);
+        // insert_seen, not mark_seen: an entry already queued (restored
+        // from a resume token) must stay queued, so the guard backstop
+        // can still report it as a policy skip row.
+        if q.insert_seen(key.clone()) {
+            self.denied
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .record(&key, &denial, self.cap);
+        }
+        true
+    }
+
+    /// `push_with_parent` for an allowed URL; a denied one is refused.
+    fn push(
+        &self,
+        q: &mut FrontierQueue,
+        url: Url,
+        score: f64,
+        depth: u32,
+        parent: Option<String>,
+    ) -> bool {
+        // Allowed URLs go to push_with_parent whether or not they were
+        // seen: its re-push raises an already-queued entry (the seed
+        // neighbor boost), which a dedup step here would swallow.
+        if self.refuse(q, &url) {
+            return false;
+        }
+        q.push_with_parent(url, score, depth, parent)
+    }
+}
+
+/// The denial for `url`, testing its adapter rewrite too: the crawl
+/// fetcher asks the wire for the rewritten endpoint, whose host can
+/// differ (`npmjs.com` -> `registry.npmjs.org`).
+fn rule_denial(rules: &crate::rules::RuleSet, url: &Url) -> Option<crate::rules::Denial> {
+    if rules.is_empty() {
+        return None;
+    }
+    rules.denial(url).or_else(|| {
+        crate::adapters::rewrite(url).and_then(|(rewritten, _via)| rules.denial_for_str(&rewritten))
+    })
 }
 
 /// Ghost-rendered page from tier-2 browser escalation.
-/// The orchestrator stays ghost-agnostic — this is the
+/// The orchestrator stays ghost-agnostic : this is the
 /// payload the injected `GhostHook` returns.
 pub struct GhostRender {
     pub html: String,
+    /// The native main-document receipt (original observation for cached renders).
+    pub document: crate::ghost::document::Document,
 }
 
-/// Injected ghost escalation hook. Takes a URL, returns
+/// One browser handoff with the caller's selected route and absolute deadline.
+#[derive(Clone, Debug)]
+pub struct GhostRequest {
+    pub url: String,
+    pub route: crate::transport::request_route::RequestRoute,
+    pub deadline: Instant,
+}
+
+impl FetchedPage {
+    fn apply_render(&mut self, rendered: GhostRender) {
+        self.url = rendered.document.url;
+        self.status = rendered.document.status.unwrap_or(0);
+        self.headers = vec![(
+            "content-type".into(),
+            crate::extract::charset::GHOST_TEXT_CT.into(),
+        )];
+        self.body = rendered.html.into_bytes();
+        self.verdict = Verdict::ContentOk;
+        self.error_hint = None;
+    }
+
+    fn browser_request(&self, url: String, deadline: Instant) -> Result<GhostRequest, String> {
+        Ok(GhostRequest {
+            url,
+            route: self
+                .route
+                .clone()
+                .ok_or("HTTP response has no route for browser handoff")?,
+            deadline,
+        })
+    }
+}
+
+/// Injected ghost escalation hook. Takes a selected request, returns
 /// rendered HTML + cookies on success, Err(reason) on failure
-/// (captcha, timeout, launch error) — the reason flows into the
+/// (captcha, timeout, launch error) : the reason flows into the
 /// crawl's skipped[] so the agent sees WHY the browser tier
 /// declined, not just that it did. The orchestrator calls it
 /// when a page is a JS shell (thin extraction) or a bot wall
 /// (Challenge verdict). Capped at 3 per crawl.
 pub type GhostHook =
-    Arc<dyn Fn(String) -> BoxFuture<'static, Result<GhostRender, String>> + Send + Sync>;
+    Arc<dyn Fn(GhostRequest) -> BoxFuture<'static, Result<GhostRender, String>> + Send + Sync>;
 
 /// Pluggable fetch: real = DonShadow, tests = in-memory map.
-pub type PageFetcher =
-    Arc<dyn Fn(String, String, Option<String>) -> BoxFuture<'static, FetchedPage> + Send + Sync>;
-//            (url, lane_id, referer) -> page
+pub type PageFetcher = Arc<
+    dyn Fn(
+            String,
+            String,
+            Option<String>,
+            Option<crate::fetch::client::RedirectGate>,
+        ) -> BoxFuture<'static, FetchedPage>
+        + Send
+        + Sync,
+>;
+//            (url, lane_id, referer, redirect_policy) -> page
 
 /// Crawl surface mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CrawlMode {
     /// Both phases (default): sitemap-map first, then content.
     Full,
-    /// URL map only — cheap, extractable for agent decisions.
+    /// URL map only : cheap, extractable for agent decisions.
     Map,
     /// Skip the sitemap phase, crawl links BFS-style only.
     Content,
 }
 
+// A popped page can enqueue descendants after a slow fetch. Idle workers
+// must wait for it; every error/continue/cancellation releases this guard.
+struct WorkInFlight<'a>(&'a AtomicUsize);
+impl Drop for WorkInFlight<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 /// One harvested crawl page.
 pub struct CrawlPage {
+    pub focus: Option<FocusStats>,
     pub url: String,
     pub title: String,
     pub kind: ContentKind,
     pub markdown: String,
     pub chars: usize,
+    /// Byte offset for a follow-up fetch when the returned page was capped.
+    pub next_offset: Option<usize>,
+    /// Source-side omission, independent of the returned byte budget.
+    pub partial: Option<crate::extract::PartialContent>,
     pub quality: f32,
     /// Same-content duplicate of an already-kept page.
     pub duplicate: bool,
@@ -95,26 +415,46 @@ pub struct CrawlPage {
     pub score: f64,
     /// Sitemap `<lastmod>` if available (ISO 8601 date string).
     pub lastmod: Option<String>,
+    /// Unix epoch seconds when this page was fetched (dataset
+    /// mode: per-row freshness that survives crawl resumes).
+    pub fetched_at: u64,
 }
 
 /// Why the crawl stopped. Agents MUST see this to decide
 /// whether to resume or re-scope.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StopReason {
-    /// Frontier exhausted — the whole reachable scope was read.
+    /// Frontier exhausted : the whole reachable scope was read.
     FrontierEmpty,
     MaxPages,
     CharBudget,
     DepthLimit,
     Deadline,
-    /// Client cancelled (MCP notifications/cancelled) — workers
+    /// Client cancelled (MCP notifications/cancelled) : workers
     /// stopped gracefully, resume token persisted.
     Cancelled,
-    /// Host boxed us out (all lanes walled) — resume later.
+    /// Host boxed us out (all lanes walled) : resume later.
     ThrottledOut,
+    /// Published inventory exceeded the output or discovery bound.
+    InventoryLimit,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct InventoryStatus {
+    pub complete: bool,
+    pub source: &'static str,
+    pub limit: usize,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct FocusStats {
+    pub omitted: bool,
+    pub blocks_total: usize,
+    pub blocks_shown: usize,
 }
 
 pub struct CrawlResult {
+    pub inventory: InventoryStatus,
     pub seed: String,
     pub pages: Vec<CrawlPage>,
     /// URLs discovered but not fetched (budget/depth/scope).
@@ -125,21 +465,40 @@ pub struct CrawlResult {
     pub skipped: Vec<(String, String)>,
     pub stop: StopReason,
     pub elapsed: Duration,
-    /// Sitemap map (Map phase) — capped URLs.
+    /// Sitemap map (Map phase) : capped URLs.
     pub map: Vec<String>,
     /// robots.txt Crawl-delay honored by pacing (seconds). Surfaces
     /// in the output so a slow crawl explains itself.
     pub crawl_delay: Option<f64>,
     /// Resume token when stopped early, for `resume=`.
     pub resume: Option<String>,
+    /// URLs refused at queue time by a local rule, never fetched;
+    /// includes the denials a resumed crawl's earlier runs recorded.
+    /// A page refused mid-fetch (a redirect into a denied host) is a
+    /// `skipped` row instead, never listed here.
+    pub denied: DeniedLog,
+    /// Set when the seed failed and the crawl had nothing else to fetch.
+    pub seed_failure: Option<SeedFailure>,
 }
 
-/// v3: (done, queued) — fired per completed page, throttled by the caller.
+/// v3: (done, queued) : fired per completed page, throttled by the caller.
 pub type ProgressFn = std::sync::Arc<dyn Fn(usize, usize) + Send + Sync>;
-/// v3: true = skip the URL entirely (recorded fingerprint still fresh).
-pub type SkipFn = std::sync::Arc<dyn Fn(&str) -> bool + Send + Sync>;
-/// v3: (url, fingerprint, markdown, title) — the delta-crawl memory feed.
+/// v4 phase 3 delta crawl: (url, new_fingerprint) -> true when the
+/// page is unchanged since the last crawl (fingerprint on file matches).
+pub type UnchangedFn = std::sync::Arc<dyn Fn(&str, &str) -> bool + Send + Sync>;
+/// v3: (url, fingerprint, markdown, title) : the delta-crawl memory feed.
 pub type OnPageFn = std::sync::Arc<dyn Fn(&str, Option<&str>, &str, Option<&str>) + Send + Sync>;
+/// Map mode: one rendered read of the seed for thin static inventories
+/// (JS-built navigation never appears in raw HTML). Returns (rendered
+/// html, final url); None = no rendered html, keep the static map.
+pub type RenderFn = std::sync::Arc<
+    dyn Fn(
+            String,
+        )
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<(String, String)>> + Send>>
+        + Send
+        + Sync,
+>;
 
 #[derive(Clone)]
 pub struct CrawlOptions {
@@ -164,20 +523,42 @@ pub struct CrawlOptions {
     pub concurrency: usize,
     /// Obey robots.txt Disallow rules.
     pub respect_robots: bool,
-    /// v3: cancellation — the client aborted the request. Workers
+    /// v3: cancellation : the client aborted the request. Workers
     /// observe this between pages and stop gracefully.
     pub cancel: Option<tokio::sync::watch::Receiver<bool>>,
-    /// v3: progress callback (done, queued) — fired per completed
+    /// v3: progress callback (done, queued) : fired per completed
     /// page, throttled by the caller.
     pub progress: Option<ProgressFn>,
-    /// v3: delta crawl — URLs for which this returns true are
-    /// skipped entirely (recorded fingerprint still fresh).
-    pub skip_unchanged: Option<SkipFn>,
+    /// v4 phase 3 delta crawl: called after extraction with the
+    /// page's fresh fingerprint; true = unchanged since the last
+    /// crawl. Unchanged pages are re-verified (history refreshed),
+    /// their outlinks still harvested, but they are excluded from
+    /// results and consume no page/char budgets. Replaces the old
+    /// presence-only pre-fetch skip, which could never see changes.
+    pub delta_unchanged: Option<UnchangedFn>,
     /// v3: record a fetched page's fingerprint (url, fingerprint,
-    /// markdown, title) — the delta-crawl memory feed.
+    /// markdown, title) : the delta-crawl memory feed.
     pub on_page: Option<OnPageFn>,
+    /// v4 phase 3 dataset mode: render one JSON object per page
+    /// (JSON Lines) instead of a markdown document. Output-format
+    /// only; traversal, budgets, and pacing are unchanged.
+    pub dataset: bool,
+    /// v4 phase 3 crawl-shape: reader-like pop jitter in the frontier
+    /// (default true). False restores exact score-order traversal.
+    /// Zero latency cost; DONSETCH_NO_CRAWL_SHAPE flips it at runtime
+    /// without any rebuild (belt for operators, env wins over the
+    /// option).
+    pub shape: bool,
+    /// Overrides the automatic shape seed (tests pin ordering; prod
+    /// derives it from the seed URL + clock). None = auto.
+    pub shape_seed: Option<u64>,
     /// Map hard cap.
     pub map_cap: usize,
+    /// Map mode: called with the seed URL when the static inventory is
+    /// thin (JS-built navigation never appears in raw HTML). Returns
+    /// (rendered html, final url) or None; failures keep the static
+    /// map. At most one call per map.
+    pub render_html: Option<RenderFn>,
     /// Minimum content quality (0.0-1.0). Pages below this
     /// are skipped (still counted against page budget).
     pub min_quality: f32,
@@ -198,11 +579,15 @@ impl Default for CrawlOptions {
             deadline: Duration::from_secs(120),
             concurrency: 1,
             respect_robots: true,
+            dataset: false,
+            shape: true,
+            shape_seed: None,
             cancel: None,
             progress: None,
-            skip_unchanged: None,
+            delta_unchanged: None,
             on_page: None,
             map_cap: 120,
+            render_html: None,
             min_quality: 0.05,
         }
     }
@@ -214,61 +599,228 @@ struct ResumeState {
     seed: String,
     /// (url, score, depth, retries, parent)
     queue: Vec<(String, f64, u32, u8, Option<String>)>,
-    /// Seen-set from run 1 — without it, run-2 pages re-link
+    /// Seen-set from run 1 : without it, run-2 pages re-link
     /// to already-fetched pages and they crawl AGAIN.
     seen: Vec<String>,
+    /// Denials the earlier runs recorded; absent in older tokens.
+    #[serde(default)]
+    denied: DeniedLog,
 }
 
-/// Disk-backed resume store: tokens survive process restarts,
-/// so both the MCP daemon AND one-shot CLI runs can continue a
-/// crawl. ~/.cache/donsetch/crawl-resumes.json, 30-min TTL.
-fn resumes_path() -> std::path::PathBuf {
-    dirs_cache().join("crawl-resumes.json")
+/// Disk-backed resume store: tokens survive process restarts, so
+/// both the MCP daemon AND one-shot CLI runs can continue a crawl.
+/// One immutable JSON file per token under
+/// <cache>/crawl-resumes/. Immutable sharding instead of one shared
+/// map: a shared map is save = load-modify-save, and two concurrent
+/// crawlers (the daemon plus a CLI run, or parallel test processes)
+/// save stale copies over each other, so a token issued
+/// milliseconds ago reads back as "resume token expired or
+/// unknown". Token files are written exactly once; consumption
+/// deletes the file. Sweep = mtime TTL (`fetch.resume_ttl_secs`,
+/// default 120 min) + a 50-token cap; the legacy single-file store
+/// migrates on first touch.
+const RESUME_CAP: usize = 50;
+
+fn resumes_dir() -> std::path::PathBuf {
+    crate::paths::cache_dir().join("crawl-resumes")
 }
 
-fn dirs_cache() -> std::path::PathBuf {
-    crate::paths::cache_dir()
+fn legacy_resumes_path() -> std::path::PathBuf {
+    crate::paths::cache_dir().join("crawl-resumes.json")
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Default)]
-struct ResumeFile {
-    /// token -> (state, issued_at_unix)
-    entries: std::collections::HashMap<String, (ResumeState, u64)>,
+fn token_path(dir: &std::path::Path, tok: &str) -> std::path::PathBuf {
+    // Token ids are c<hex-micros><hex-seq>: filename-safe on every
+    // platform, no traversal surface.
+    dir.join(format!("{tok}.json"))
 }
 
-impl ResumeFile {
-    fn load() -> Self {
-        std::fs::read_to_string(resumes_path())
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default()
+/// A resume token is only ever ISSUED as `c<hex><hex>`, but the value
+/// consumed on resume is agent-supplied, and it is joined into a
+/// filesystem path (`<cache>/crawl-resumes/<tok>.json`). Reject
+/// anything that is not plain ASCII alphanumeric so a crafted token
+/// (`../../etc/x`, an absolute path, a NUL) cannot escape the store
+/// directory to read-then-delete a `.json` file outside it. Matches
+/// the traversal rejection paths::resolve_screenshot_path already
+/// applies to the screenshot output path.
+fn is_valid_resume_token(tok: &str) -> bool {
+    !tok.is_empty() && tok.bytes().all(|b| b.is_ascii_alphanumeric())
+}
+
+/// One-time migration: the v3 store kept every token in one JSON
+/// map; split it into per-token files so tokens already issued
+/// survive the upgrade.
+fn migrate_legacy_store() {
+    let legacy = legacy_resumes_path();
+    if !legacy.exists() {
+        return;
     }
-
-    fn save(&self) {
-        let p = resumes_path();
-        if let Some(parent) = p.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        if let Ok(s) = serde_json::to_string(self) {
-            // Atomic write: write to temp file, then rename.
-            // Without this, a concurrent process reading the file
-            // mid-write gets partial JSON → empty store → "token
-            // expired or unknown" on a freshly-issued token.
-            let tmp = p.with_extension("tmp");
-            if std::fs::write(&tmp, s).is_ok() {
-                let _ = std::fs::rename(&tmp, &p);
+    #[derive(serde::Deserialize)]
+    struct LegacyFile {
+        entries: std::collections::HashMap<String, (ResumeState, u64)>,
+    }
+    if let Some(file) = std::fs::read_to_string(&legacy)
+        .ok()
+        .and_then(|text| serde_json::from_str::<LegacyFile>(&text).ok())
+    {
+        let total = file.entries.len();
+        let mut written = 0usize;
+        let dir = resumes_dir();
+        let _ = std::fs::create_dir_all(&dir);
+        for (tok, (state, _)) in file.entries {
+            if write_token_file(&dir, &tok, &state) {
+                written += 1;
             }
         }
+        // Only retire the legacy file after every entry it held
+        // made it to disk; a half-loss (disk full, read-only
+        // dir) is better retried on the next touch than deleted.
+        if total > 0 && written >= total {
+            let _ = std::fs::remove_file(&legacy);
+        }
     }
+}
 
-    fn sweep(&mut self) {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        self.entries
-            .retain(|_, (_, at)| now.saturating_sub(*at) < 120 * 60);
+/// Write one token file (atomic, issue-only: never rewritten after
+/// the token id carries timestamp + seq, so a collision would need
+/// the same microsecond twice in one process).
+fn write_token_file(dir: &std::path::Path, tok: &str, state: &ResumeState) -> bool {
+    let tmp = dir.join(format!("{tok}.tmp"));
+    let dst = token_path(dir, tok);
+    // Frontier URLs can name a private target: owner-only, same seal
+    // as the session-bearing stores.
+    let ok = serde_json::to_string(state)
+        .map(|s| {
+            crate::config::write_private(&tmp, s.as_bytes()).is_ok()
+                && std::fs::rename(&tmp, &dst).is_ok()
+        })
+        .unwrap_or(false);
+    if !ok {
+        let _ = std::fs::remove_file(&tmp);
     }
+    ok
+}
+
+/// Drop expired tokens and cap the store at 50, oldest first.
+/// Per-file mtime is the age signal: nothing else writes these.
+/// TTL is `fetch.resume_ttl_secs` (default 2h, clamped 5m..24h).
+fn resume_store_sweep(dir: &std::path::Path) {
+    let ttl = crate::config::cfg()
+        .fetch
+        .resume_ttl_secs
+        .clamp(300, 86_400);
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let mut alive: Vec<(u64, std::path::PathBuf)> = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|x| x.to_str()) != Some("json") {
+            continue;
+        }
+        let age_ok = std::fs::metadata(&path)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|t| now.saturating_sub(t.as_secs()) < ttl)
+            .unwrap_or(false);
+        if age_ok {
+            alive.push((
+                std::fs::metadata(&path)
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|t| t.as_secs())
+                    .unwrap_or(0),
+                path,
+            ));
+        } else {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+    if alive.len() > RESUME_CAP {
+        alive.sort();
+        let drop_n = alive.len() - RESUME_CAP;
+        for (_, path) in alive.into_iter().take(drop_n) {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
+/// Read one token without consuming it. Unknown, corrupt, or
+/// unreadable = the same honest error.
+fn resume_store_read(tok: &str) -> Result<ResumeState, String> {
+    // The token is agent-supplied and about to index the filesystem:
+    // refuse anything that is not a well-formed token before it can
+    // traverse out of the store directory (no FS touch on a bad one).
+    if !is_valid_resume_token(tok) {
+        return Err(format!("resume token expired or unknown: {tok}"));
+    }
+    migrate_legacy_store();
+    read_token_file(&resumes_dir(), tok)
+}
+
+/// Parse one token file. The token must already be validated.
+fn read_token_file(dir: &std::path::Path, tok: &str) -> Result<ResumeState, String> {
+    std::fs::read_to_string(token_path(dir, tok))
+        .ok()
+        .and_then(|text| serde_json::from_str::<ResumeState>(&text).ok())
+        .ok_or_else(|| format!("resume token expired or unknown: {tok}"))
+}
+
+/// The seed a resume token would continue, read without consuming the
+/// token: a call refused on this seed leaves the token usable.
+pub(crate) fn resume_store_peek(tok: &str) -> Result<String, String> {
+    resume_store_read(tok).map(|state| state.seed)
+}
+
+/// Read and consume one token (the v3 semantics: a token dies when
+/// its crawl actually resumes). Unknown, corrupt, or unreadable =
+/// the same honest error.
+fn resume_store_take(tok: &str) -> Result<ResumeState, String> {
+    if !is_valid_resume_token(tok) {
+        return Err(format!("resume token expired or unknown: {tok}"));
+    }
+    let dir = resumes_dir();
+    migrate_legacy_store();
+    resume_store_sweep(&dir);
+    let state = read_token_file(&dir, tok)?;
+    let _ = std::fs::remove_file(token_path(&dir, tok));
+    Ok(state)
+}
+
+/// Persist a freshly issued token. Failure is non-fatal: the crawl
+/// result still lands, the token just will not survive a restart.
+fn resume_store_issue(tok: &str, state: &ResumeState) {
+    let dir = resumes_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    migrate_legacy_store();
+    resume_store_sweep(&dir);
+    if !write_token_file(&dir, tok, state) {
+        crate::diag!("[crawl] resume token write failed; the token will not survive a restart");
+    }
+}
+
+/// Tier-2 (real browser) escalations allowed per crawl: each one is
+/// a 20-40s headless-browser cycle, so the cap is the crawl's cost
+/// ceiling, not a tuning knob.
+const GHOST_BUDGET: usize = 3;
+
+/// Claim one ghost escalation from the shared budget. Atomic
+/// check-and-decrement: workers used to `load() > 0` then
+/// `fetch_sub(1)` as two steps, so two workers seeing budget == 1
+/// both passed the check, the second `fetch_sub` wrapped the counter
+/// to `usize::MAX`, and every later check passed for the rest of the
+/// crawl -- the cost cap gone. Only reachable with `concurrency > 1`
+/// (the default is 1), but that is a public `CrawlOptions` field.
+fn claim_ghost_slot(budget: &AtomicUsize) -> bool {
+    budget
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+        .is_ok()
 }
 
 pub struct Crawler {
@@ -276,6 +828,9 @@ pub struct Crawler {
     governor: Arc<Governor>,
     ghost: Option<GhostHook>,
     token_seq: AtomicUsize,
+    /// The ruleset the frontier and robots cache enforce; None = the
+    /// process ruleset, resolved when a crawl starts.
+    rules: Option<&'static crate::rules::RuleSet>,
 }
 
 impl Crawler {
@@ -285,7 +840,17 @@ impl Crawler {
             governor,
             ghost: None,
             token_seq: AtomicUsize::new(0),
+            rules: None,
         }
+    }
+
+    /// Enforce `rules` at queue time instead of the process ruleset, so
+    /// tests need not install a config. The fetcher's own guard still
+    /// reads the process ruleset.
+    #[cfg(test)]
+    pub(crate) fn with_rules(mut self, rules: &'static crate::rules::RuleSet) -> Self {
+        self.rules = Some(rules);
+        self
     }
 
     /// Attach a ghost escalation hook for JS-only pages.
@@ -306,26 +871,174 @@ impl Crawler {
         resume_token: Option<&str>,
     ) -> Result<CrawlResult, String> {
         let started = Instant::now();
+        let deadline_at = started + opts.deadline;
+        // One clock covers discovery, robots, redirects and page I/O. Keep the
+        // resolved seed response so following its redirect costs no second GET.
+        let buffered = Arc::new(Mutex::new(
+            std::collections::HashMap::<String, FetchedPage>::new(),
+        ));
+        let fetch: PageFetcher = {
+            let inner = self.fetch.clone();
+            let buffered = buffered.clone();
+            Arc::new(move |url, lane, referer, redirect_gate| {
+                let inner = inner.clone();
+                let buffered = buffered.clone();
+                Box::pin(async move {
+                    let saved = buffered
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .remove(&url);
+                    if let Some(page) = saved {
+                        return page;
+                    }
+                    match tokio::time::timeout_at(
+                        deadline_at.into(),
+                        inner(url.clone(), lane.clone(), referer, redirect_gate),
+                    )
+                    .await
+                    {
+                        Ok(page) => page,
+                        Err(_) => FetchedPage {
+                            lane,
+                            route: None,
+                            url,
+                            status: 0,
+                            headers: Vec::new(),
+                            body: Vec::new(),
+                            verdict: Verdict::Blocked,
+                            latency: Duration::ZERO,
+                            cached: false,
+                            error_hint: Some("crawl deadline exceeded".into()),
+                            denied: None,
+                        },
+                    }
+                })
+            })
+        };
+
+        // Invalid caller input must not consume a valid resume token.
+        let explicit_seed = if seed.is_empty() {
+            None
+        } else {
+            crate::fetch::guards::validate_url_basic(seed)
+                .map_err(|e| format!("bad seed url: {e}"))?;
+            let u = Url::parse(seed).map_err(|_| format!("bad seed url: {seed}"))?;
+            let h = u.host_str().ok_or("seed must have a host")?.to_string();
+            Some((seed.to_string(), u, h))
+        };
+
+        // Resume state is taken from the store EXACTLY ONCE, up
+        // front: resume_store_take deletes the token file, and the
+        // old shape took it here for the empty-seed case and AGAIN
+        // below for the frontier restore, so every resume-only call
+        // aborted with "resume token expired or unknown" and the
+        // saved state was already destroyed. One take, two readers.
+        let resumed_state: Option<ResumeState> = match resume_token {
+            Some(tok) => Some(resume_store_take(tok)?),
+            None => None,
+        };
 
         // Resume without url: load the seed from the resume state.
-        let (seed, seed_url, seed_host) = if seed.is_empty() {
-            let mut store = ResumeFile::load();
-            store.sweep();
-            let tok = resume_token.ok_or("resume token required when url is empty")?;
-            let state = store
-                .entries
-                .get(tok)
-                .map(|(s, _)| s.clone())
-                .ok_or(format!("resume token expired or unknown: {tok}"))?;
+        let (mut seed, mut seed_url, mut seed_host) = if let Some(parsed) = explicit_seed {
+            parsed
+        } else {
+            let state = resumed_state
+                .as_ref()
+                .ok_or("resume token required when url is empty")?;
             let u = Url::parse(&state.seed)
                 .map_err(|_| format!("bad seed in resume state: {}", state.seed))?;
             let h = u.host_str().ok_or("seed must have a host")?.to_string();
             (state.seed.clone(), u, h)
-        } else {
-            let u = Url::parse(seed).map_err(|_| format!("bad seed url: {seed}"))?;
-            let h = u.host_str().ok_or("seed must have a host")?.to_string();
-            (seed.to_string(), u, h)
         };
+        // The seed as asked for, before the preflight may adopt a landing URL.
+        let requested_seed = seed.clone();
+        let requested_norm = frontier::normalize(&seed_url);
+
+        let rules = self.rules.unwrap_or_else(crate::rules::rules);
+        let gate = PushGate {
+            rules,
+            denied: Arc::new(Mutex::new(
+                resumed_state
+                    .as_ref()
+                    .map(|state| state.denied.clone())
+                    .unwrap_or_default(),
+            )),
+            cap: crate::config::cfg().rules.crawl_denied_urls_per_rule as usize,
+        };
+
+        let mut preflight: Option<SeedPreflight> = None;
+        if resumed_state.is_none() {
+            let origin = sitemap::origin_of(&seed_url);
+            let seed_lane = self
+                .governor
+                .best_lane(&seed_host)
+                .map(|lane| lane.id.clone());
+            let allowed = if opts.respect_robots {
+                let robots_url = format!("{origin}/robots.txt");
+                let page = fetch(
+                    robots_url.clone(),
+                    seed_lane.clone().unwrap_or_else(|| "direct".into()),
+                    None,
+                    None,
+                )
+                .await;
+                let robots = sitemap::robots_for_origin(page.status, &page.body, &origin);
+                self.governor
+                    .set_host_crawl_delay(&seed_host, robots.crawl_delay);
+                buffered
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(robots_url, page.clone());
+                let allowed = robots.allows_url(&seed_url);
+                if !allowed {
+                    preflight = Some(SeedPreflight {
+                        page: Some(SeedFailure::from_page(&page, None)),
+                        page_ok: false,
+                        robots: Some(RobotsRefusal::of(&robots)),
+                    });
+                }
+                allowed
+            } else {
+                true
+            };
+            if allowed
+                && Instant::now() < deadline_at
+                && let Some(lane) = seed_lane
+            {
+                let wait = self
+                    .governor
+                    .wait_for(&seed_host, &lane, 0)
+                    .min(deadline_at.saturating_duration_since(Instant::now()));
+                tokio::time::sleep(wait).await;
+                // The seed hop is identity resolution, not a scoped
+                // crawl step: its redirect may adopt a new host by
+                // design (short URLs, www moves), so it stays
+                // ungated; worker hops carry the policy.
+                let page = fetch(seed.clone(), lane, None, None).await;
+                preflight = Some(SeedPreflight {
+                    page: Some(SeedFailure::from_page(&page, None)),
+                    page_ok: matches!(page.verdict, Verdict::ContentOk)
+                        && (200..300).contains(&page.status),
+                    robots: None,
+                });
+                if matches!(page.verdict, Verdict::ContentOk)
+                    && (200..300).contains(&page.status)
+                    && let Ok(resolved) = Url::parse(&page.url)
+                    && crate::fetch::guards::validate_url_basic(&page.url).is_ok()
+                {
+                    seed_host = resolved
+                        .host_str()
+                        .ok_or("seed must have a host")?
+                        .to_string();
+                    seed = resolved.to_string();
+                    seed_url = resolved;
+                }
+                buffered
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(frontier::normalize(&seed_url), page);
+            }
+        }
 
         let host_ok = {
             let sh = seed_host.clone();
@@ -349,12 +1062,27 @@ impl Crawler {
         opts.exclude_paths = frontier::effective_excludes(&opts.exclude_paths);
 
         // ── Phase 1: the map ───────────────────────────────
+        // Robots and sitemap discovery run against the seed's own
+        // ORIGIN (scheme + host + port), not a bare hostname: an
+        // `http://` seed or one on a non-default port must read its
+        // own robots.txt and probe its own sitemap locations (#345).
+        let seed_origin = sitemap::origin_of(&seed_url);
         let mut map: Vec<String> = Vec::new();
         let mut sitemap_entries: Vec<SitemapEntry> = Vec::new();
+        let mut inventory = InventoryStatus {
+            limit: opts.map_cap,
+            ..Default::default()
+        };
         let mut robots = sitemap::Robots::default();
         if opts.mode != CrawlMode::Content {
-            let (mut r, mut entries) =
-                sitemap::discover(&self.fetch, &seed_host, opts.map_cap * 4).await;
+            let discovery = sitemap::discover_inventory(&fetch, &seed_origin, 100_000).await;
+            inventory.source = if discovery.entries.is_empty() {
+                "seed-links"
+            } else {
+                "sitemap"
+            };
+            inventory.complete = discovery.complete;
+            let (mut r, mut entries) = (discovery.robots, discovery.entries);
             robots = sitemap::Robots::default();
             std::mem::swap(&mut robots, &mut r);
             // Newest first: lastmod-sorted sitemaps put fresh
@@ -363,15 +1091,46 @@ impl Crawler {
             sitemap_entries = entries;
             let mut map_locales: std::collections::HashSet<String> =
                 std::collections::HashSet::new();
-            for e in &sitemap_entries {
-                if map.len() >= opts.map_cap {
-                    break;
-                }
+            // Relevance ranking against the seed (V06): the caller's
+            // focus when set, else the seed's own last path segment
+            // ("WebGPU_API" -> "webgpu api"). A section-root seed or
+            // a segment shared by everything ranks flat and keeps the
+            // sitemap's newest-first order; a topic seed pulls its
+            // own neighborhood to the front, before the map_cap cut.
+            let map_query: Option<String> = opts.focus.clone().or_else(|| {
+                seed_url
+                    .path()
+                    .rsplit('/')
+                    .find(|s| !s.is_empty())
+                    .map(|s| s.replace(['-', '_', '.'], " "))
+            });
+            let map_idf = map_query.as_ref().map(|_| {
+                score::FocusIdf::from_paths(sitemap_entries.iter().filter_map(|e| {
+                    Url::parse(&e.loc)
+                        .ok()
+                        .filter(|u| host_ok(u))
+                        .map(|u| u.path().to_string())
+                }))
+            });
+            let mut ranked: Vec<(f64, usize, String)> = Vec::new();
+            for (order, e) in sitemap_entries.iter().enumerate() {
                 if let Ok(u) = Url::parse(&e.loc) {
                     if !host_ok(&u) {
                         continue;
                     }
                     if !scope_allowed(u.path(), &opts.include_paths, &opts.exclude_paths) {
+                        continue;
+                    }
+                    // Full mode only: a denied entry is reported in the
+                    // denied section (the queue loop below records it),
+                    // not as merely "not fetched". Map mode fetches none
+                    // of its URLs, so it lists them all unmarked. Before
+                    // the locale dedup, which keys on the path alone: a
+                    // denied entry must not take an allowed twin's slot.
+                    if opts.mode == CrawlMode::Full && rule_denial(rules, &u).is_some() {
+                        continue;
+                    }
+                    if opts.respect_robots && !robots.allows_url(&u) {
                         continue;
                     }
                     if let Some(q) = &opts.focus
@@ -384,48 +1143,229 @@ impl Crawler {
                     if !map_locales.insert(lcanon) {
                         continue;
                     }
-                    map.push(e.loc.clone());
+                    let relevance = match &map_query {
+                        Some(q) => score::score_candidate_with_idf(
+                            "",
+                            u.path(),
+                            Some(q.as_str()),
+                            map_idf.as_ref(),
+                        ),
+                        None => 0.0,
+                    };
+                    ranked.push((relevance, order, e.loc.clone()));
                 }
             }
+            // Relevant first; ties keep the sitemap order (newest
+            // first, entry order preserved by the stable sort key).
+            ranked.sort_by(|a, b| {
+                b.0.partial_cmp(&a.0)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.1.cmp(&b.1))
+            });
+            inventory.complete &= ranked.len() <= opts.map_cap;
+            map = ranked
+                .into_iter()
+                .take(opts.map_cap)
+                .map(|(_, _, loc)| loc)
+                .collect();
         } else {
             // Content-only still reads robots for Disallow
             // rules when respect_robots is on.
             if opts.respect_robots {
-                let (r, _) = sitemap::discover(&self.fetch, &seed_host, 0).await;
+                let (r, _) = sitemap::discover(&fetch, &seed_origin, 0).await;
                 robots = r;
             }
         }
+        // Per-origin robots for the page loop: the seed's rules come
+        // from the phase-1 discovery; every other origin the frontier
+        // reaches gets its own fetch at first contact (#344).
+        let robots_cache = Arc::new(sitemap::RobotsCache::with_rules(rules));
         if opts.respect_robots {
-            self.governor.set_crawl_delay(robots.crawl_delay);
+            self.governor
+                .set_host_crawl_delay(&seed_host, robots.crawl_delay);
+            robots_cache.insert(seed_origin.clone(), Arc::new(robots.clone()));
         }
         if opts.mode == CrawlMode::Map {
-            // Map-only crawl: cheap exit. Guide the agent when no
-            // sitemap was found.
-            let skipped = if map.is_empty() {
+            // Map-only crawl: cheap exit. The seed page was already
+            // fetched in the identity hop and sits in the buffer, so
+            // when no sitemap exists map falls back to harvesting its
+            // links : a sitemap-less origin must not read as an empty
+            // site while full/content read real pages from the same
+            // seed (map and full have to agree on what exists).
+            //
+            // Raw HTML cannot see JS-built navigation (mdBook sidebars,
+            // SPA menus). A thin inventory gets one bounded rendered
+            // read of the seed through the caller's renderer, and its
+            // links merge through the same filter. Render failure or
+            // absence keeps the static map: the browser is an
+            // enhancement here, never a dependency.
+            let mut candidates: Vec<Url> = Vec::new();
+            if map.is_empty() {
+                let buffered_seed = buffered
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(&frontier::normalize(&seed_url));
+                if let Some(page) = buffered_seed
+                    && matches!(page.verdict, Verdict::ContentOk)
+                    && (200..300).contains(&page.status)
+                {
+                    let html = String::from_utf8_lossy(&page.body);
+                    let page_url_parsed =
+                        Url::parse(&page.url).unwrap_or_else(|_| seed_url.clone());
+                    // <base href> resolves against the document
+                    // URL first, the page loop's rule.
+                    let base = extract_base_href(&html)
+                        .and_then(|bh| page_url_parsed.join(&bh).ok())
+                        .filter(|b| matches!(b.scheme(), "http" | "https"))
+                        .unwrap_or(page_url_parsed);
+                    for (href, _anchor) in self_harvest_static(&html, &base) {
+                        if let Some(u) = frontier::resolve(&base, &href) {
+                            candidates.push(u);
+                        }
+                    }
+                }
+            }
+            const MAP_RENDER_FLOOR: usize = 32;
+            // Phase 1 reads robots.txt even with respect_robots off, so
+            // the seed's verdict counts only when robots are respected.
+            let seed_robots_ok = !opts.respect_robots || robots.allows_url(&seed_url);
+            if map.len() + candidates.len() < MAP_RENDER_FLOOR
+                && seed_robots_ok
+                && let Some(render) = opts.render_html.as_ref()
+                && deadline_at.saturating_duration_since(Instant::now()) > Duration::from_secs(15)
+            {
+                match tokio::time::timeout_at(deadline_at.into(), render(seed.clone()))
+                    .await
+                    .ok()
+                    .flatten()
+                {
+                    Some((html, final_url)) => {
+                        let parsed = Url::parse(&final_url).unwrap_or_else(|_| seed_url.clone());
+                        let base = extract_base_href(&html)
+                            .and_then(|bh| parsed.join(&bh).ok())
+                            .filter(|b| matches!(b.scheme(), "http" | "https"))
+                            .unwrap_or(parsed);
+                        let before = candidates.len();
+                        for (href, _anchor) in self_harvest_static(&html, &base) {
+                            if let Some(u) = frontier::resolve(&base, &href) {
+                                candidates.push(u);
+                            }
+                        }
+                        crate::diag!(
+                            "[crawl] thin static map; rendered harvest added {} candidate link(s)",
+                            candidates.len() - before
+                        );
+                    }
+                    None => {
+                        crate::diag!("[crawl] thin static map; rendered harvest unavailable");
+                    }
+                }
+            }
+            let mut seen_urls: std::collections::HashSet<String> = map.iter().cloned().collect();
+            let mut seen_locales: std::collections::HashSet<String> = map
+                .iter()
+                .filter_map(|url| Url::parse(url).ok())
+                .map(|u| frontier::locale_canonical(u.path()))
+                .collect();
+            for u in &candidates {
+                if !host_ok(u) {
+                    continue;
+                }
+                if !scope_allowed(u.path(), &opts.include_paths, &opts.exclude_paths) {
+                    continue;
+                }
+                if opts.respect_robots && !robots.allows_url(u) {
+                    continue;
+                }
+                if let Some(q) = &opts.focus
+                    && !score::focus_match("", u.path(), q)
+                {
+                    continue;
+                }
+                // Scheme coherence: a same-host plain-http link under
+                // an https seed names the canonical fetchable URL;
+                // mixed twins collapse in the seen-set below.
+                let u = frontier::canonical_scheme(u, &seed_url);
+                let lcanon = frontier::locale_canonical(u.path());
+                if !seen_locales.insert(lcanon) {
+                    continue;
+                }
+                // Canonical fetchable form (fragment, tracking params,
+                // default port away): the same shape the frontier queues.
+                let normalized = frontier::normalize(&u);
+                if !seen_urls.insert(normalized.clone()) {
+                    continue;
+                }
+                if map.len() >= opts.map_cap {
+                    inventory.complete = false;
+                    break;
+                }
+                map.push(normalized);
+            }
+            // Judged after the seed-link harvest and the render: a seed
+            // the browser rescued leaves a map, so it is not a failure.
+            // When the preflight fetched nothing (boxed host, deadline)
+            // there is no outcome to report and today's row stays.
+            let stop = if Instant::now() >= deadline_at {
+                StopReason::Deadline
+            } else if !inventory.complete && map.len() >= opts.map_cap {
+                StopReason::InventoryLimit
+            } else {
+                StopReason::FrontierEmpty
+            };
+            // Like the page loop's rule, a crawl the deadline cut short
+            // keeps its zero-page result.
+            let seed_failure = if map.is_empty() && stop == StopReason::FrontierEmpty {
+                preflight
+                    .as_ref()
+                    .and_then(|p| p.failure(&seed))
+                    .map(|f| f.settle(&requested_seed, true))
+            } else {
+                None
+            };
+            let skipped = if map.is_empty() && seed_failure.is_none() {
                 vec![(
                     seed.to_string(),
-                    "no sitemap found at common locations — use mode=content to BFS from the seed"
+                    "no sitemap found at common locations and the seed page exposed no usable links : try mode=full or mode=content"
                         .into(),
                 )]
             } else {
                 Vec::new()
             };
             return Ok(CrawlResult {
+                inventory,
                 crawl_delay: robots.crawl_delay,
                 seed: seed.to_string(),
                 pages: Vec::new(),
                 queued: Vec::new(),
                 filtered_out: 0,
                 skipped,
-                stop: StopReason::FrontierEmpty,
+                stop,
                 elapsed: started.elapsed(),
                 map,
                 resume: None,
+                // Map mode tests no URL against the rules (it fetches
+                // none of them), so it reports no denials.
+                denied: DeniedLog::default(),
+                seed_failure,
             });
         }
 
         // ── Frontier seeding ───────────────────────────────
-        let mut queue = FrontierQueue::new();
+        let mut queue = FrontierQueue::with_shaper(
+            opts.shape && crate::config::cfg().fetch.crawl_shape,
+            opts.shape_seed.unwrap_or_else(|| {
+                use std::hash::{Hash, Hasher};
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                seed.as_str().hash(&mut h);
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos() as u64)
+                    .unwrap_or(0)
+                    .hash(&mut h);
+                h.finish()
+            }),
+        );
         // Budgets are PER-CALL: a resume continues from the saved
         // position but the caller's page/char budgets apply to
         // the NEW work. (Run 2 must not instantly exhaust itself
@@ -433,52 +1373,79 @@ impl Crawler {
         let fetched_pages = 0usize;
         let total_chars = 0usize;
         let seed_norm = frontier::normalize(&seed_url);
-        if let Some(tok) = resume_token {
-            let mut store = ResumeFile::load();
-            store.sweep();
-            if let Some((state, _)) = store.entries.remove(tok) {
-                queue.restore_seen(state.seen);
-                for (u, s, d, r, p) in state.queue {
-                    queue.push_to_heap(u, s, d, r, p);
-                }
-                store.save();
-            } else {
-                return Err(format!("resume token expired or unknown: {tok}"));
+        if let Some(state) = resumed_state {
+            queue.restore_seen(state.seen);
+            for (u, s, d, r, p) in state.queue {
+                queue.push_to_heap(u, s, d, r, p);
             }
-        } else {
-            let _ = queue.push(seed_url.clone(), 10.0, 0);
+        }
+        // Site-wide IDF for BM25-lite frontier scoring: built from
+        // the sitemap inventory when one exists; None otherwise.
+        let mut focus_idf: Option<std::sync::Arc<score::FocusIdf>> = None;
+        if resume_token.is_none() {
+            let _ = gate.push(&mut queue, seed_url.clone(), 10.0, 0, None);
             // Sitemap entries seed frontier at depth 1.
             // Dedup by locale-canonical path: don't queue
             // multiple language variants of the same page
             // (de/, es/, fr/ copies waste crawl budget).
             let mut seeded_locales: std::collections::HashSet<String> =
                 std::collections::HashSet::new();
+            // Build the IDF table from the full inventory BEFORE
+            // scoring the seeds: document frequency is a corpus
+            // property, not a per-entry one.
+            if opts.focus.is_some() && !sitemap_entries.is_empty() {
+                focus_idf = Some(std::sync::Arc::new(score::FocusIdf::from_paths(
+                    sitemap_entries.iter().filter_map(|e| {
+                        Url::parse(&e.loc)
+                            .ok()
+                            .filter(|u| host_ok(u))
+                            .map(|u| u.path().to_string())
+                    }),
+                )));
+            }
             for e in &sitemap_entries {
-                if let Ok(u) = Url::parse(&e.loc)
-                    && host_ok(&u)
-                    && scope_allowed(u.path(), &opts.include_paths, &opts.exclude_paths)
-                    && (!opts.respect_robots || robots.allowed(u.path()))
+                let Ok(u) = Url::parse(&e.loc) else {
+                    continue;
+                };
+                if !host_ok(&u)
+                    || !scope_allowed(u.path(), &opts.include_paths, &opts.exclude_paths)
                 {
-                    // Focus gate: skip sitemap entries that don't
-                    // match the focus query (if set).
-                    if let Some(q) = &opts.focus
-                        && !score::focus_match("", u.path(), q)
-                    {
-                        continue;
-                    }
-                    let lcanon = frontier::locale_canonical(u.path());
-                    if !seeded_locales.insert(lcanon) {
-                        continue; // Another variant already queued
-                    }
-                    let s = score::score_candidate("", u.path(), opts.focus.as_deref())
-                        + e.priority.unwrap_or(0.0) as f64 * 2.0;
-                    queue.push(u, s, 1);
+                    continue;
                 }
+                // Rules before robots, and before the locale dedup (the
+                // map loop's reasons); the push below is then plain.
+                if gate.refuse(&mut queue, &u) {
+                    continue;
+                }
+                if opts.respect_robots
+                    && !robots_allows(&fetch, &self.governor, &robots_cache, &u).await
+                {
+                    continue;
+                }
+                // Focus gate: skip sitemap entries that don't
+                // match the focus query (if set).
+                if let Some(q) = &opts.focus
+                    && !score::focus_match("", u.path(), q)
+                {
+                    continue;
+                }
+                let lcanon = frontier::locale_canonical(u.path());
+                if !seeded_locales.insert(lcanon) {
+                    continue; // Another variant already queued
+                }
+                let s = score::score_candidate_with_idf(
+                    "",
+                    u.path(),
+                    opts.focus.as_deref(),
+                    focus_idf.as_deref(),
+                ) + e.priority.unwrap_or(0.0) as f64 * 2.0;
+                queue.push(u, s, 1);
             }
         }
 
         if queue.is_empty() {
             return Ok(CrawlResult {
+                inventory,
                 crawl_delay: robots.crawl_delay,
                 seed: seed.to_string(),
                 pages: Vec::new(),
@@ -489,6 +1456,13 @@ impl Crawler {
                 elapsed: started.elapsed(),
                 map,
                 resume: None,
+                denied: std::mem::take(
+                    &mut *gate
+                        .denied
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner),
+                ),
+                seed_failure: None,
             });
         }
 
@@ -498,7 +1472,7 @@ impl Crawler {
         let skipped: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
         let filtered_out = Arc::new(AtomicUsize::new(0));
         let dup_sigs: Arc<Mutex<HashSet<u64>>> = Arc::new(Mutex::new(HashSet::new()));
-        // Locale-canonical paths of fetched pages — prevents
+        // Locale-canonical paths of fetched pages : prevents
         // crawling translated variants (de/, es/, fr/ copies).
         let locale_seen: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
         let chars_total = Arc::new(AtomicUsize::new(total_chars));
@@ -508,12 +1482,19 @@ impl Crawler {
         // sites full of junk when low-quality pages don't count
         // against the quality budget.
         let total_fetched = Arc::new(AtomicUsize::new(0));
+        let in_flight = Arc::new(AtomicUsize::new(0));
         let stop_flag: Arc<Mutex<Option<StopReason>>> = Arc::new(Mutex::new(None));
-        let deadline_at = started + opts.deadline;
         let focus = Arc::new(opts.focus.clone());
+        // Failed-seed evidence, judged once the queue is empty: whether
+        // any URL other than the seed was dequeued, and how the seed's
+        // last attempt failed.
+        let other_dequeued = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seed_failed: Arc<Mutex<Option<SeedFailure>>> = Arc::new(Mutex::new(
+            preflight.as_ref().and_then(|p| p.failure(&seed)),
+        ));
 
         let workers = opts.concurrency.max(1);
-        let ghost_budget = Arc::new(AtomicUsize::new(3));
+        let ghost_budget = Arc::new(AtomicUsize::new(GHOST_BUDGET));
         let mut handles = Vec::new();
         for wid in 0..workers {
             let queue = Arc::clone(&sh_queue);
@@ -525,20 +1506,31 @@ impl Crawler {
             let chars_total = Arc::clone(&chars_total);
             let pages_done = Arc::clone(&pages_done);
             let total_fetched = Arc::clone(&total_fetched);
+            let in_flight = Arc::clone(&in_flight);
             let stop_flag = Arc::clone(&stop_flag);
             let focus = Arc::clone(&focus);
-            let fetch = self.fetch.clone();
+            let focus_idf = focus_idf.clone();
+            let fetch = fetch.clone();
+            let buffered = buffered.clone();
             let governor = Arc::clone(&self.governor);
             let ghost_hook = self.ghost.clone();
             let ghost_budget = Arc::clone(&ghost_budget);
             let opts_worker = opts.clone();
             let seed_host2 = seed_host.clone();
             let seed_norm_w = seed_norm.clone();
-            let robots = robots.clone();
+            let requested_norm_w = requested_norm.clone();
+            let other_dequeued = Arc::clone(&other_dequeued);
+            let seed_failed = Arc::clone(&seed_failed);
+            let gate = gate.clone();
+            let robots_cache = Arc::clone(&robots_cache);
+            // Pre-navigation redirect policy (v4.6): every redirect hop
+            // is checked BEFORE it is dialed — same-host, scope and
+            // robots — so an excluded target is never requested.
+            let redirect_gate =
+                build_redirect_gate(&fetch, &robots_cache, &governor, &seed_host2, &opts_worker);
             let max_pages = opts.max_pages;
             // Sitemap found ⇒ link discovery does not depend on the
             // seed fetch ⇒ even the seed is skippable in delta mode.
-            let sitemap_found = !sitemap_entries.is_empty();
             let max_total = opts.max_total_chars;
             let max_depth = opts.max_depth;
 
@@ -548,35 +1540,47 @@ impl Crawler {
                 'work: loop {
                     // ── Stop conditions ──
                     if Instant::now() >= deadline_at {
-                        let mut s = stop_flag.lock().unwrap();
+                        let mut s = stop_flag
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
                         if s.is_none() {
                             *s = Some(StopReason::Deadline);
                         }
                         break 'work;
                     }
-                    // v3: client cancellation — graceful stop; the
+                    // v3: client cancellation : graceful stop; the
                     // resume checkpoint keeps everything gathered.
                     if let Some(rx) = &opts_worker.cancel
                         && (*rx.borrow() || rx.has_changed().unwrap_or(false))
                     {
-                        let mut s = stop_flag.lock().unwrap();
+                        let mut s = stop_flag
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
                         if s.is_none() {
                             *s = Some(StopReason::Cancelled);
                         }
                         break 'work;
                     }
-                    if stop_flag.lock().unwrap().is_some() {
+                    if stop_flag
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .is_some()
+                    {
                         break 'work;
                     }
                     if pages_done.load(Ordering::SeqCst) >= max_pages {
-                        let mut s = stop_flag.lock().unwrap();
+                        let mut s = stop_flag
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
                         if s.is_none() {
                             *s = Some(StopReason::MaxPages);
                         }
                         break 'work;
                     }
                     if chars_total.load(Ordering::SeqCst) >= max_total {
-                        let mut s = stop_flag.lock().unwrap();
+                        let mut s = stop_flag
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
                         if s.is_none() {
                             *s = Some(StopReason::CharBudget);
                         }
@@ -586,7 +1590,9 @@ impl Crawler {
                     // without finding enough quality content. Prevents
                     // infinite loops on sites full of low-quality pages.
                     if total_fetched.load(Ordering::SeqCst) >= max_pages * 3 {
-                        let mut s = stop_flag.lock().unwrap();
+                        let mut s = stop_flag
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
                         if s.is_none() {
                             *s = Some(StopReason::MaxPages);
                         }
@@ -594,19 +1600,54 @@ impl Crawler {
                     }
 
                     // ── Pop next ──
-                    let next = queue.lock().unwrap().pop();
+                    // Claim under the queue lock so an empty observer cannot
+                    // race between pop and the in-flight increment.
+                    let next = {
+                        let mut q = queue
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        let next = q.pop();
+                        if next.is_some() {
+                            in_flight.fetch_add(1, Ordering::SeqCst);
+                        }
+                        next
+                    };
                     let Some(item) = next else {
-                        // Frontier empty — but other workers may add.
-                        // Grace: spin briefly, then exit.
-                        tokio::time::sleep(Duration::from_millis(150)).await;
-                        if queue.lock().unwrap().is_empty() {
-                            let mut s = stop_flag.lock().unwrap();
+                        let exhausted = {
+                            let q = queue
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            q.is_empty() && in_flight.load(Ordering::SeqCst) == 0
+                        };
+                        if exhausted {
+                            let mut s = stop_flag
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
                             if s.is_none() {
                                 *s = Some(StopReason::FrontierEmpty);
                             }
                             break 'work;
                         }
+                        tokio::time::sleep(
+                            Duration::from_millis(150)
+                                .min(deadline_at.saturating_duration_since(Instant::now())),
+                        )
+                        .await;
                         continue 'work;
+                    };
+                    let _active = WorkInFlight(&in_flight);
+                    // The seed under its requested or adopted URL; a
+                    // retry of it dequeues the same key again.
+                    let is_seed_entry = item.url == seed_norm_w || item.url == requested_norm_w;
+                    if !is_seed_entry {
+                        other_dequeued.store(true, Ordering::SeqCst);
+                    }
+                    let note_seed_failure = |failure: SeedFailure| {
+                        if is_seed_entry {
+                            *seed_failed
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(failure);
+                        }
                     };
 
                     let parsed = match Url::parse(&item.url) {
@@ -614,17 +1655,26 @@ impl Crawler {
                         Err(_) => {
                             skipped
                                 .lock()
-                                .unwrap()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
                                 .push((item.url.clone(), "unparseable".into()));
                             continue 'work;
                         }
                     };
                     if item.depth > max_depth {
-                        let mut s = stop_flag.lock().unwrap();
-                        if s.is_none() {
-                            *s = Some(StopReason::DepthLimit);
-                        }
-                        break 'work;
+                        // Skip the item and keep going: the old shape
+                        // aborted the whole crawl on the first
+                        // too-deep pop, discarding the shallower
+                        // frontier behind it (and DepthLimit never
+                        // persisted a resume token, so the work was
+                        // simply lost). Honest skip instead.
+                        skipped
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .push((
+                                item.url.clone(),
+                                format!("depth {} > max {max_depth}", item.depth),
+                            ));
+                        continue 'work;
                     }
                     let host = parsed.host_str().unwrap_or("");
                     if opts_worker.same_host && !host_matches(host, &seed_host2) {
@@ -634,18 +1684,6 @@ impl Crawler {
                     // The seed is always fetched (entry point for
                     // link discovery) but its content is scope-gated
                     // post-extraction. Non-seed URLs are filtered here.
-                    // v3 delta crawl: skip pages with a fresh recorded
-                    // fingerprint. Counted as skipped, not fetched.
-                    if let Some(should_skip) = &opts_worker.skip_unchanged
-                        && (item.url != seed_norm_w || sitemap_found)
-                        && should_skip(&item.url)
-                    {
-                        skipped
-                            .lock()
-                            .unwrap()
-                            .push((item.url.clone(), "unchanged (since_last)".into()));
-                        continue 'work;
-                    }
                     let is_seed = item.url == seed_norm_w;
                     if !is_seed
                         && !scope_allowed(
@@ -657,7 +1695,21 @@ impl Crawler {
                         filtered_out.fetch_add(1, Ordering::Relaxed);
                         continue 'work;
                     }
-                    if opts_worker.respect_robots && !robots.allowed(parsed.path()) {
+                    if opts_worker.respect_robots
+                        && !robots_allows(&fetch, &governor, &robots_cache, &parsed).await
+                    {
+                        if let Some(robots) = robots_cache.get(&sitemap::origin_of(&parsed)) {
+                            let mut failure =
+                                SeedFailure::from_robots(&item.url, RobotsRefusal::of(&robots));
+                            if is_seed_entry {
+                                failure.error = seed_failed
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                    .as_ref()
+                                    .and_then(|f| f.error.clone());
+                            }
+                            note_seed_failure(failure);
+                        }
                         filtered_out.fetch_add(1, Ordering::Relaxed);
                         continue 'work;
                     }
@@ -665,11 +1717,15 @@ impl Crawler {
                     // already-fetched pages. The first variant
                     // fetched claims the canonical path; all other
                     // language versions (de/, es/, fr/, zh-CN/...)
-                    // are blocked. The seed is exempt — it's the
+                    // are blocked. The seed is exempt : it's the
                     // entry point and always fetched.
                     if !is_seed {
                         let lcanon = frontier::locale_canonical(parsed.path());
-                        if locale_seen.lock().unwrap().contains(&lcanon) {
+                        if locale_seen
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .contains(&lcanon)
+                        {
                             filtered_out.fetch_add(1, Ordering::Relaxed);
                             continue 'work;
                         }
@@ -680,30 +1736,51 @@ impl Crawler {
                     // least-blocked for this host takes it.
                     let Some(lane) = governor.best_lane(host).cloned() else {
                         if governor.wait_for(host, "*", seq) > Duration::ZERO {
-                            // Whole host boxed — if the frontier
+                            // Whole host boxed : if the frontier
                             // holds only this host, we're done.
-                            if queue.lock().unwrap().is_empty() {
-                                let mut s = stop_flag.lock().unwrap();
+                            if queue
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .is_empty()
+                            {
+                                let mut s = stop_flag
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                                 if s.is_none() {
                                     *s = Some(StopReason::ThrottledOut);
                                 }
                                 break 'work;
                             }
                             // Requeue and yield.
-                            queue.lock().unwrap().requeue(frontier::Frontier {
-                                url: item.url.clone(),
-                                score: item.score,
-                                depth: item.depth,
-                                retries: item.retries,
-                                parent: item.parent.clone(),
-                            });
-                            tokio::time::sleep(Duration::from_millis(400)).await;
+                            queue
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .requeue(frontier::Frontier {
+                                    url: item.url.clone(),
+                                    score: item.score,
+                                    depth: item.depth,
+                                    retries: item.retries,
+                                    parent: item.parent.clone(),
+                                });
+                            tokio::time::sleep(
+                                Duration::from_millis(400)
+                                    .min(deadline_at.saturating_duration_since(Instant::now())),
+                            )
+                            .await;
                             continue 'work;
                         }
                         continue 'work;
                     };
                     seq += 1;
-                    let wait = governor.wait_for(host, &lane.id, seq);
+                    let has_buffered = buffered
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .contains_key(&item.url);
+                    let wait = if has_buffered {
+                        Duration::ZERO
+                    } else {
+                        governor.wait_for(host, &lane.id, seq)
+                    };
                     // Cap wait inside remaining deadline.
                     let remain = deadline_at.saturating_duration_since(Instant::now());
                     let wait = wait.min(remain);
@@ -711,78 +1788,202 @@ impl Crawler {
                         tokio::time::sleep(wait).await;
                     }
 
-                    let page = fetch(item.url.clone(), lane.id.clone(), item.parent.clone()).await;
+                    let mut page = fetch(
+                        item.url.clone(),
+                        lane.id.clone(),
+                        item.parent.clone(),
+                        redirect_gate.clone(),
+                    )
+                    .await;
+                    // A local rule refused this fetch: a redirect into a
+                    // denied host, or an entry that never met the queue's
+                    // rules check (restored from a resume token, a retry,
+                    // a rewrite that changed since it was queued). Final,
+                    // like the redirect-gate skip below: no retry, no
+                    // governor signal, and a skip row rather than a
+                    // denied-section entry, which lists only URLs the
+                    // crawl refused to contact.
+                    if let Some(denial) = &page.denied {
+                        let reason = policy_skip_reason(denial);
+                        note_seed_failure(SeedFailure::from_page(&page, Some(reason.clone())));
+                        skipped
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .push((item.url.clone(), reason));
+                        continue 'work;
+                    }
+                    // A redirect hop the pre-navigation policy refused
+                    // (the target was never dialed: this is the bare
+                    // redirect response) is recorded as a skip and
+                    // never counts against lane health — the lane
+                    // delivered its response correctly.
+                    if (300..400).contains(&page.status)
+                        && let Some(target) = page
+                            .headers
+                            .iter()
+                            .find(|(name, _)| name.eq_ignore_ascii_case("location"))
+                            .map(|(_, value)| value.clone())
+                    {
+                        let reason = match Url::parse(&page.url) {
+                            Ok(base) => {
+                                match crate::fetch::guards::validate_redirect_url(&base, &target) {
+                                    Ok(final_url) => {
+                                        format!("redirected out of scope -> {final_url}")
+                                    }
+                                    // The fetch loop refuses a denied hop
+                                    // before the gate, so this arm should
+                                    // not see one; matched anyway so a
+                                    // denial never reads as a bad target.
+                                    Err(error) => match crate::rules::Denial::from_error(&error) {
+                                        Some(denial) => policy_skip_reason(&denial),
+                                        None => format!("invalid redirect target: {error}"),
+                                    },
+                                }
+                            }
+                            Err(_) => format!("redirected out of scope -> {target}"),
+                        };
+                        note_seed_failure(SeedFailure::from_page(&page, Some(reason.clone())));
+                        skipped
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .push((item.url.clone(), reason));
+                        continue 'work;
+                    }
+
                     if page.cached {
-                        // Warm-cache hit: free — no governor signal.
+                        // Warm-cache hit: free : no governor signal.
                     } else {
                         match (page.status, &page.verdict) {
-                            (200, Verdict::ContentOk) => {
-                                // Skim dwell: proportional to page size,
-                                // capped at 300ms. v1 used up to 2s/page
-                                // ("a human reads a 50KB article") — but
-                                // an agent skims for extraction, not
-                                // reading, and the dwell's real job is
-                                // anti-metronome entropy, which jitter +
-                                // this small size-proportional term
-                                // already provide. 2s/page of pure sleep
-                                // was the single biggest crawl latency
-                                // cost (6.29s median in the 50-case
-                                // benchmark).
-                                let dwell = (page.body.len() / 64).min(100) as u64;
-                                governor.on_success(host, &lane.id, page.latency, dwell)
+                            (200..=299, Verdict::ContentOk) => {
+                                // No dwell: pacing is the governor's
+                                // rung/jitter ladder alone (law 11, v4
+                                // phase 3). The old size-proportional
+                                // skim dwell was a vestigial
+                                // human-reading simulation that only
+                                // bought latency.
+                                governor.on_success(host, &page.lane, page.latency)
                             }
                             (429, _) | (503, _) => {
-                                governor.on_throttled(host, &lane.id);
+                                governor.on_throttled(host, &page.lane);
                             }
-                            _ => governor.on_error(host, &lane.id),
+                            _ => governor.on_error(host, &page.lane),
                         }
                     }
 
                     // Transient retry: network errors (status 0) and
                     // 5xx non-challenge get requeued up to 2 times.
                     // Walls, 404s, 429s, and challenges are permanent.
-                    let is_transient = page.status == 0
+                    let is_transient = (page.status == 0
+                        && !page
+                            .error_hint
+                            .as_deref()
+                            .is_some_and(|e| e.starts_with("network.dns:")))
                         || (page.status >= 500 && !matches!(page.verdict, Verdict::Challenge(_)));
                     if is_transient && item.retries < 2 {
-                        queue.lock().unwrap().requeue(frontier::Frontier {
-                            url: item.url.clone(),
-                            score: item.score * 0.8,
-                            depth: item.depth,
-                            retries: item.retries + 1,
-                            parent: item.parent.clone(),
-                        });
+                        queue
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .requeue(frontier::Frontier {
+                                url: item.url.clone(),
+                                score: item.score * 0.8,
+                                depth: item.depth,
+                                retries: item.retries + 1,
+                                parent: item.parent.clone(),
+                            });
                         continue 'work;
                     }
 
-                    // Ghost escalation for bot walls: if the page
-                    // is a Challenge verdict and ghost is available,
-                    // try rendering in the headless browser before
-                    // skipping. Ghost may solve the challenge.
-                    let mut ghost_html: Option<String> = None;
-                    if matches!(page.verdict, Verdict::Challenge(_))
-                        && let Some(ref ghost_hook) = ghost_hook
+                    if let Err(refusal) = redirect_target_allowed(
+                        &fetch,
+                        &governor,
+                        &robots_cache,
+                        &opts_worker,
+                        &seed_host2,
+                        &parsed,
+                        &page.url,
+                    )
+                    .await
+                    {
+                        let mut failure =
+                            SeedFailure::from_page(&page, Some(refusal.reason.clone()));
+                        if failure.denial.is_none() {
+                            failure.denial = refusal.denial;
+                        }
+                        note_seed_failure(failure);
+                        skipped
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .push((item.url.clone(), refusal.reason));
+                        continue 'work;
+                    }
+
+                    // Shared HTTP denial policy: one browser observation for
+                    // eligible documents, including an unbranded plain 403.
+                    let mut ghost_rendered = false;
+                    if crate::detect::walls::browser_recovery(
+                        page.status,
+                        &page.headers,
+                        &page.body,
+                        page.verdict,
+                    ) && let Some(ref ghost_hook) = ghost_hook
                     {
                         let remaining = deadline_at.saturating_duration_since(Instant::now());
-                        if remaining > Duration::from_secs(25)
-                            && ghost_budget.load(Ordering::SeqCst) > 0
-                        {
-                            ghost_budget.fetch_sub(1, Ordering::SeqCst);
-                            match ghost_hook(item.url.clone()).await {
-                                Ok(gp) => ghost_html = Some(gp.html),
+                        if !remaining.is_zero() && claim_ghost_slot(&ghost_budget) {
+                            let rendered = match page.browser_request(item.url.clone(), deadline_at)
+                            {
+                                Ok(request) => {
+                                    tokio::time::timeout_at(deadline_at.into(), ghost_hook(request))
+                                        .await
+                                        .unwrap_or_else(|_| Err("crawl deadline exceeded".into()))
+                                }
+                                Err(error) => Err(error),
+                            };
+                            match rendered {
+                                Ok(gp) => {
+                                    if let Err(refusal) = redirect_target_allowed(
+                                        &fetch,
+                                        &governor,
+                                        &robots_cache,
+                                        &opts_worker,
+                                        &seed_host2,
+                                        &parsed,
+                                        &gp.document.url,
+                                    )
+                                    .await
+                                    {
+                                        let mut failure = SeedFailure::from_page(
+                                            &page,
+                                            Some(refusal.reason.clone()),
+                                        );
+                                        failure.landing = Some(gp.document.url.clone());
+                                        failure.denial = refusal.denial;
+                                        note_seed_failure(failure);
+                                        skipped
+                                            .lock()
+                                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                            .push((item.url.clone(), refusal.reason));
+                                        continue 'work;
+                                    }
+                                    page.apply_render(gp);
+                                    ghost_rendered = true;
+                                }
                                 Err(why) => {
-                                    skipped.lock().unwrap().push((
-                                        item.url.clone(),
-                                        format!("ghost escalation failed: {why}"),
-                                    ));
+                                    skipped
+                                        .lock()
+                                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                        .push((
+                                            item.url.clone(),
+                                            format!("ghost escalation failed: {why}"),
+                                        ));
                                 }
                             }
                         }
                     }
 
                     // Wall/denylist verdicts → skip honestly.
-                    // (Unless ghost rendered the page — then treat
+                    // (Unless ghost rendered the page : then treat
                     // as ContentOk and proceed to extraction.)
-                    if ghost_html.is_none() && !matches!(page.verdict, Verdict::ContentOk) {
+                    if !ghost_rendered && !matches!(page.verdict, Verdict::ContentOk) {
                         let why = if item.retries > 0 {
                             format!(
                                 "{} (failed after {} retries)",
@@ -796,34 +1997,18 @@ impl Crawler {
                                 .clone()
                                 .unwrap_or_else(|| format!("{:?}", page.verdict))
                         };
-                        skipped.lock().unwrap().push((item.url.clone(), why));
+                        note_seed_failure(SeedFailure::from_page(&page, Some(why.clone())));
+                        skipped
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .push((item.url.clone(), why));
                         continue 'work;
                     }
                     // Count every successful fetch (safety valve
                     // against sites full of low-quality pages).
                     total_fetched.fetch_add(1, Ordering::SeqCst);
 
-                    // ── Canonical URL resolution ──
-                    // Extract <link rel="canonical" href="..."> to
-                    // prevent double-fetching the same page under
-                    // different URLs (trailing slash, index.html,
-                    // tracking variants).
                     let page_url = page.url.clone();
-                    if let Some(canon_href) =
-                        extract_canonical(&String::from_utf8_lossy(&page.body))
-                        && let Ok(canon_parsed) = Url::parse(&canon_href)
-                    {
-                        let canon_norm = frontier::normalize(&canon_parsed);
-                        let fetched_norm = frontier::normalize(&parsed);
-                        if canon_norm != fetched_norm {
-                            // Mark the canonical form as seen so
-                            // it won't be fetched separately.
-                            queue.lock().unwrap().mark_seen(canon_norm.clone());
-                            // Record the canonical as the page's
-                            // true URL for output.
-                            // (page_url is updated below.)
-                        }
-                    }
 
                     // ── Binary content guard ──
                     // Skip non-HTML (images, video, fonts, archives)
@@ -834,11 +2019,11 @@ impl Crawler {
                         .find(|(n, _)| n.eq_ignore_ascii_case("content-type"))
                         .map(|(_, v)| v.as_str())
                         .unwrap_or("text/html");
-                    if ghost_html.is_none() && crate::fetch::guards::is_binary(&page.body, ctype) {
+                    if !ghost_rendered && crate::fetch::guards::is_binary(&page.body, ctype) {
                         let kind = ctype.split(';').next().unwrap_or("unknown").trim();
                         skipped
                             .lock()
-                            .unwrap()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
                             .push((item.url.clone(), format!("binary ({kind})")));
                         continue 'work;
                     }
@@ -847,11 +2032,8 @@ impl Crawler {
                     let mut eo = ExtractOptions::default();
                     eo.focus = focus.as_ref().clone();
                     eo.max_chars = Some(opts_worker.per_page_max);
-                    let body_bytes: &[u8] = ghost_html
-                        .as_deref()
-                        .map(|s| s.as_bytes())
-                        .unwrap_or(&page.body);
-                    let body_ctype = if ghost_html.is_some() {
+                    let body_bytes = page.body.as_slice();
+                    let body_ctype = if ghost_rendered {
                         crate::extract::charset::GHOST_TEXT_CT
                     } else {
                         ctype
@@ -865,44 +2047,31 @@ impl Crawler {
                     // pool with a generous timeout (5 min) that covers large
                     // PDFs (a 28 MB archive.org PDF takes ~70s) while still
                     // preventing infinite hangs. HTML stays on the fast path.
-                    let is_pdf = body_bytes.starts_with(b"%PDF-")
-                        || body_ctype.to_ascii_lowercase().contains("pdf");
-                    let extract_res: Result<
-                        crate::extract::Extracted,
-                        crate::extract::ExtractError,
-                    > = if is_pdf {
-                        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                            let body_owned = body_bytes.to_vec();
-                            let ctype_owned = body_ctype.to_owned();
-                            let url_owned = page_url.clone();
-                            let eo_owned = eo.clone();
-                            let task = handle.spawn_blocking(move || {
-                                extract::extract(&body_owned, &ctype_owned, &url_owned, &eo_owned)
-                            });
-                            match tokio::time::timeout(Duration::from_secs(300), task).await {
-                                Ok(Ok(Ok(r))) => Ok(r),
-                                Ok(Ok(Err(e))) => Err(e),
-                                Ok(Err(join_err)) => {
-                                    Err(crate::extract::ExtractError::BadSelector(format!(
-                                        "extract task failed: {join_err}"
-                                    )))
-                                }
-                                Err(_) => Err(crate::extract::ExtractError::BadSelector(
-                                    "extract timed out after 300s".into(),
-                                )),
-                            }
-                        } else {
-                            extract::extract(body_bytes, body_ctype, &page_url, &eo)
+                    let extract_res = match tokio::time::timeout_at(
+                        deadline_at.into(),
+                        extract::extract_off_worker(body_bytes, body_ctype, &page_url, &eo),
+                    )
+                    .await
+                    {
+                        Ok(result) => result,
+                        Err(_) => {
+                            queue
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .requeue(item.clone());
+                            *stop_flag
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                                Some(StopReason::Deadline);
+                            break 'work;
                         }
-                    } else {
-                        extract::extract(body_bytes, body_ctype, &page_url, &eo)
                     };
                     let mut r = match extract_res {
                         Ok(r) => r,
                         Err(e) => {
                             skipped
                                 .lock()
-                                .unwrap()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
                                 .push((item.url.clone(), format!("extract failed: {e}")));
                             continue 'work;
                         }
@@ -912,54 +2081,126 @@ impl Crawler {
                     // extraction is thin (JS shell) and the page is
                     // large enough (> 5KB, not a 404), try rendering
                     // in the headless browser. Capped at 3 per crawl;
-                    // requires 25s remaining deadline. Non-JS sites
-                    // never hit this path.
+                    // uses the original remaining deadline. Non-JS
+                    // sites never hit this path.
                     if r.thin
-                        && ghost_html.is_none()
+                        && !ghost_rendered
                         && page.body.len() > 5_000
                         && let Some(ref ghost_hook) = ghost_hook
                     {
                         let remaining = deadline_at.saturating_duration_since(Instant::now());
-                        if remaining > Duration::from_secs(25)
-                            && ghost_budget.load(Ordering::SeqCst) > 0
-                        {
-                            ghost_budget.fetch_sub(1, Ordering::SeqCst);
-                            match ghost_hook(item.url.clone()).await {
+                        if !remaining.is_zero() && claim_ghost_slot(&ghost_budget) {
+                            let rendered = match page.browser_request(item.url.clone(), deadline_at)
+                            {
+                                Ok(request) => {
+                                    tokio::time::timeout_at(deadline_at.into(), ghost_hook(request))
+                                        .await
+                                        .unwrap_or_else(|_| Err("crawl deadline exceeded".into()))
+                                }
+                                Err(error) => Err(error),
+                            };
+                            match rendered {
                                 Ok(gp) => {
-                                    if let Ok(r2) = extract::extract(
+                                    if let Err(refusal) = redirect_target_allowed(
+                                        &fetch,
+                                        &governor,
+                                        &robots_cache,
+                                        &opts_worker,
+                                        &seed_host2,
+                                        &parsed,
+                                        &gp.document.url,
+                                    )
+                                    .await
+                                    {
+                                        skipped
+                                            .lock()
+                                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                            .push((item.url.clone(), refusal.reason));
+                                        continue 'work;
+                                    }
+                                    match extract::extract(
                                         gp.html.as_bytes(),
                                         crate::extract::charset::GHOST_TEXT_CT,
-                                        &page_url,
+                                        &gp.document.url,
                                         &eo,
-                                    ) && !r2.thin
-                                    {
-                                        r = r2;
-                                        ghost_html = Some(gp.html);
+                                    ) {
+                                        Ok(rendered) => {
+                                            r = rendered;
+                                            page.apply_render(gp);
+                                        }
+                                        Err(error) => {
+                                            skipped
+                                                .lock()
+                                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                                .push((
+                                                    item.url.clone(),
+                                                    format!("browser extract failed: {error}"),
+                                                ));
+                                            continue 'work;
+                                        }
                                     }
                                 }
                                 Err(why) => {
-                                    skipped.lock().unwrap().push((
-                                        item.url.clone(),
-                                        format!("ghost escalation failed: {why}"),
-                                    ));
+                                    skipped
+                                        .lock()
+                                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                        .push((
+                                            item.url.clone(),
+                                            format!("ghost escalation failed: {why}"),
+                                        ));
                                 }
                             }
                         }
                     }
 
-                    let md = r.markdown;
+                    if page.url != item.url
+                        && let Ok(final_url) = Url::parse(&page.url)
+                    {
+                        queue
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .mark_seen(frontier::normalize(&final_url));
+                    }
+
+                    // ── Canonical URL resolution ──
+                    // Extract <link rel="canonical" href="..."> to
+                    // prevent double-fetching the same page under
+                    // different URLs (trailing slash, index.html,
+                    // tracking variants).
+                    if let Some(canon_href) =
+                        extract_canonical(&String::from_utf8_lossy(&page.body))
+                        && let Ok(canon_parsed) = Url::parse(&canon_href)
+                    {
+                        let canon_norm = frontier::normalize(&canon_parsed);
+                        let fetched_norm = Url::parse(&page.url)
+                            .map(|url| frontier::normalize(&url))
+                            .unwrap_or_default();
+                        if canon_norm != fetched_norm {
+                            // Mark the canonical form as seen so
+                            // it won't be fetched separately.
+                            queue
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .mark_seen(canon_norm.clone());
+                        }
+                    }
+
+                    let mut md = r.markdown;
 
                     // Claim the locale-canonical path: translated
                     // variants of this page (de/, es/, fr/, ...) are
                     // now blocked from the crawl budget.
                     {
                         let lcanon = frontier::locale_canonical(parsed.path());
-                        locale_seen.lock().unwrap().insert(lcanon);
+                        locale_seen
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .insert(lcanon);
                     }
 
                     // Near-dup signature: title + first 200 normalized
                     // chars of the CONTENT (frontmatter carries the
-                    // page URL — identical docs at different URLs
+                    // page URL : identical docs at different URLs
                     // must still dedup).
                     let body_md = md.split_once("\n\n").map(|x| x.1).unwrap_or(md.as_str());
                     let sig_str = format!(
@@ -978,23 +2219,33 @@ impl Crawler {
                         sig_str.hash(&mut h);
                         h.finish()
                     };
-                    let duplicate = !dup_sigs.lock().unwrap().insert(sig);
+                    let duplicate = !dup_sigs
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .insert(sig);
 
                     // Quality gate: skip near-empty pages (boilerplate,
                     // redirects, error pages). Does NOT count against
-                    // the page budget — low-quality pages should not
+                    // the page budget : low-quality pages should not
                     // steal slots from real content. The total_fetched
                     // safety valve (3x cap) prevents infinite loops.
-                    if !duplicate && r.quality < opts_worker.min_quality {
+                    // The skip is a RESULT decision only: the page's
+                    // outlinks are still harvested below, like the
+                    // navigation-only path. A hub page (link list,
+                    // ~zero prose) is the lowest-quality page on a
+                    // site and the one a crawl is seeded from; the
+                    // old `continue` here left the frontier empty
+                    // and reported the crawl complete (#249).
+                    let low_quality = !duplicate && r.quality < opts_worker.min_quality;
+                    if low_quality {
                         skipped
                             .lock()
-                            .unwrap()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
                             .push((page.url.clone(), format!("low quality ({:.2})", r.quality)));
-                        continue 'work;
                     }
 
                     // Scope gate for results: the seed is ALWAYS
-                    // in scope — the user explicitly asked to crawl it.
+                    // in scope : the user explicitly asked to crawl it.
                     // Non-seed pages already passed scope before fetching.
                     let in_scope = is_seed
                         || scope_allowed(
@@ -1003,43 +2254,164 @@ impl Crawler {
                             &opts_worker.exclude_paths,
                         );
 
-                    let chars = md.chars().count();
+                    let mut per_page_next = r.next_offset;
+                    if md.chars().count() > opts_worker.per_page_max {
+                        let cut = md
+                            .char_indices()
+                            .nth(opts_worker.per_page_max)
+                            .map(|(i, _)| i)
+                            .unwrap_or(md.len());
+                        md.truncate(cut);
+                        per_page_next = Some(cut.min(r.next_offset.unwrap_or(usize::MAX)));
+                    }
+                    let mut chars = md.chars().count();
 
-                    if !in_scope {
+                    // v4 phase 3 delta recrawl: compare the freshly
+                    // extracted fingerprint with page history. An
+                    // unchanged page is re-verified (history timestamp
+                    // refreshed) and its outlinks are still harvested
+                    // below, so changed descendants remain reachable;
+                    // it just never enters the result set or the
+                    // page/char budgets.
+                    let unchanged = opts_worker.delta_unchanged.as_ref().is_some_and(|f| {
+                        r.fingerprint.as_deref().is_some_and(|fp| f(&page.url, fp))
+                    });
+
+                    if low_quality {
+                        // Already recorded in skipped[]; fall through
+                        // to the outlink harvest.
+                    } else if !in_scope {
                         // Navigation-only: don't add to results,
                         // don't count against page budget. Still
                         // harvest outlinks (seed → in-scope pages).
                         skipped
                             .lock()
-                            .unwrap()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
                             .push((page.url.clone(), "out of scope (navigation-only)".into()));
+                    } else if unchanged {
+                        if r.partial.is_none()
+                            && !r.thin
+                            && let Some(rec) = &opts_worker.on_page
+                        {
+                            rec(
+                                &page.url,
+                                r.fingerprint.as_deref(),
+                                if per_page_next.is_none() && !r.focus_omitted {
+                                    &md
+                                } else {
+                                    ""
+                                },
+                                r.title.as_deref(),
+                            );
+                        }
+                        skipped
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .push((page.url.clone(), "unchanged since last crawl".into()));
                     } else {
-                        let done = pages_done.fetch_add(1, Ordering::SeqCst) + 1;
+                        let mut next_offset = per_page_next;
+                        let done;
+                        {
+                            // Reserve both limits under the result lock. Workers may
+                            // finish together; checking at pop time cannot enforce caps.
+                            let mut kept = pages
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            let used = chars_total.load(Ordering::SeqCst);
+                            if kept.len() >= max_pages || (!duplicate && used >= max_total) {
+                                *stop_flag
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                                    Some(if kept.len() >= max_pages {
+                                        StopReason::MaxPages
+                                    } else {
+                                        StopReason::CharBudget
+                                    });
+                                // This page has not been returned: preserve it for resume.
+                                queue
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                    .requeue(item.clone());
+                                locale_seen
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                    .remove(&frontier::locale_canonical(parsed.path()));
+                                if !duplicate {
+                                    dup_sigs
+                                        .lock()
+                                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                        .remove(&sig);
+                                }
+                                continue 'work;
+                            }
+                            if !duplicate {
+                                let remaining = max_total.saturating_sub(used);
+                                if chars > remaining {
+                                    md = md.chars().take(remaining).collect();
+                                    chars = remaining;
+                                    next_offset =
+                                        Some(md.len().min(r.next_offset.unwrap_or(usize::MAX)));
+                                    *stop_flag
+                                        .lock()
+                                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                                        Some(StopReason::CharBudget);
+                                }
+                                chars_total.fetch_add(chars, Ordering::SeqCst);
+                            }
+                            done = pages_done.fetch_add(1, Ordering::SeqCst) + 1;
+                            kept.push(CrawlPage {
+                                focus: focus.as_ref().as_ref().map(|_| FocusStats {
+                                    omitted: r.focus_omitted,
+                                    blocks_total: r.blocks_total,
+                                    blocks_shown: r.blocks_shown,
+                                }),
+                                url: page.url.clone(),
+                                title: r.title.clone().unwrap_or_default(),
+                                kind: r.content_kind,
+                                markdown: md.clone(),
+                                chars,
+                                next_offset,
+                                partial: r.partial.clone(),
+                                quality: r.quality,
+                                duplicate,
+                                parent: item.parent.clone(),
+                                score: item.score,
+                                lastmod: None,
+                                fetched_at: std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_secs())
+                                    .unwrap_or(0),
+                            });
+                        }
                         if let Some(cb) = &opts_worker.progress {
-                            cb(done, queue.lock().unwrap().len());
+                            cb(
+                                done,
+                                queue
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                    .len(),
+                            );
                         }
-                        if !duplicate {
-                            chars_total.fetch_add(chars, Ordering::SeqCst);
+                        // A returned slice cannot populate the full-content history.
+                        if r.partial.is_none()
+                            && !r.thin
+                            && let Some(rec) = &opts_worker.on_page
+                        {
+                            rec(
+                                &page.url,
+                                r.fingerprint.as_deref(),
+                                if next_offset.is_none() && !r.focus_omitted {
+                                    &md
+                                } else {
+                                    ""
+                                },
+                                r.title.as_deref(),
+                            );
                         }
-                        if let Some(rec) = &opts_worker.on_page {
-                            rec(&page.url, r.fingerprint.as_deref(), &md, r.title.as_deref());
-                        }
-                        pages.lock().unwrap().push(CrawlPage {
-                            url: page.url.clone(),
-                            title: r.title.clone().unwrap_or_default(),
-                            kind: r.content_kind,
-                            markdown: md,
-                            chars,
-                            quality: r.quality,
-                            duplicate,
-                            parent: item.parent.clone(),
-                            score: item.score,
-                            lastmod: None, // filled after worker loop from sitemap
-                        });
                         if duplicate {
                             skipped
                                 .lock()
-                                .unwrap()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
                                 .push((page.url.clone(), "near-duplicate".into()));
                             continue 'work;
                         }
@@ -1047,18 +2419,20 @@ impl Crawler {
 
                     // ── Harvest outlinks into the frontier ──
                     if item.depth < max_depth {
-                        let html = ghost_html
-                            .clone()
-                            .unwrap_or_else(|| String::from_utf8_lossy(&page.body).into_owned());
+                        let html = String::from_utf8_lossy(&page.body);
                         // <base href> handling: resolve relative
                         // links against the base URL when present.
-                        let base = if let Some(bh) = extract_base_href(&html) {
-                            Url::parse(&bh).unwrap_or_else(|_| {
-                                Url::parse(&page.url).unwrap_or_else(|_| parsed.clone())
-                            })
-                        } else {
-                            Url::parse(&page.url).unwrap_or_else(|_| parsed.clone())
-                        };
+                        // The base itself resolves against the
+                        // document URL (HTML §4.2.3): `<base
+                        // href="/app/">` is the common form, and
+                        // Url::parse alone refused it, so every link
+                        // under it resolved against the page instead.
+                        let page_url_parsed =
+                            Url::parse(&page.url).unwrap_or_else(|_| parsed.clone());
+                        let base = extract_base_href(&html)
+                            .and_then(|bh| page_url_parsed.join(&bh).ok())
+                            .filter(|b| matches!(b.scheme(), "http" | "https"))
+                            .unwrap_or(page_url_parsed);
 
                         // Harvest <a href> links early so we can check
                         // focus match across all link sources (pagination,
@@ -1073,12 +2447,16 @@ impl Crawler {
                         });
 
                         // Pagination: <link rel="next"> continues a
-                        // linear chain — push at the SAME depth so
+                        // linear chain : push at the SAME depth so
                         // pagination doesn't consume depth budget.
                         let next_hrefs = extract_link_rel(&html, "next");
                         {
-                            let ls = locale_seen.lock().unwrap();
-                            let mut q = queue.lock().unwrap();
+                            let ls = locale_seen
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            let mut q = queue
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
                             for nh in &next_hrefs {
                                 if let Some(nu) = frontier::resolve(&base, nh) {
                                     if opts_worker.same_host
@@ -1096,7 +2474,8 @@ impl Crawler {
                                     ) {
                                         continue;
                                     }
-                                    if opts_worker.respect_robots && !robots.allowed(nu.path()) {
+                                    if opts_worker.respect_robots && !robots_cache.peek_allows(&nu)
+                                    {
                                         continue;
                                     }
                                     // Focus gate for pagination: hard filter
@@ -1108,14 +2487,18 @@ impl Crawler {
                                         if any_focus_match || item.depth > 0 {
                                             continue;
                                         }
-                                        let s =
-                                            score::score_candidate("", nu.path(), focus.as_deref())
-                                                - 100.0;
-                                        q.push_with_parent(
+                                        let s = score::score_candidate_with_idf(
+                                            "",
+                                            nu.path(),
+                                            focus.as_deref(),
+                                            focus_idf.as_deref(),
+                                        ) - 100.0;
+                                        gate.push(
+                                            &mut q,
                                             nu,
                                             s,
                                             item.depth,
-                                            Some(item.url.clone()),
+                                            Some(page.url.clone()),
                                         );
                                         continue;
                                     }
@@ -1123,8 +2506,13 @@ impl Crawler {
                                     if ls.contains(&lcanon) {
                                         continue;
                                     }
-                                    let s = score::score_candidate("", nu.path(), focus.as_deref());
-                                    q.push_with_parent(nu, s, item.depth, Some(item.url.clone()));
+                                    let s = score::score_candidate_with_idf(
+                                        "",
+                                        nu.path(),
+                                        focus.as_deref(),
+                                        focus_idf.as_deref(),
+                                    );
+                                    gate.push(&mut q, nu, s, item.depth, Some(page.url.clone()));
                                 }
                             }
                         } // ls + q dropped before feed discovery's await
@@ -1158,9 +2546,13 @@ impl Crawler {
                             if !fw.is_zero() {
                                 tokio::time::sleep(fw).await;
                             }
-                            let feed_page =
-                                fetch(fu.to_string(), lane.id.clone(), Some(item.url.clone()))
-                                    .await;
+                            let feed_page = fetch(
+                                fu.to_string(),
+                                lane.id.clone(),
+                                Some(page.url.clone()),
+                                redirect_gate.clone(),
+                            )
+                            .await;
                             total_fetched.fetch_add(1, Ordering::SeqCst);
                             if !matches!(feed_page.verdict, Verdict::ContentOk) {
                                 continue;
@@ -1168,8 +2560,12 @@ impl Crawler {
                             let feed_text = String::from_utf8_lossy(&feed_page.body);
                             let entries = parse_feed_urls(&feed_text, 200);
                             {
-                                let ls = locale_seen.lock().unwrap();
-                                let mut q = queue.lock().unwrap();
+                                let ls = locale_seen
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                let mut q = queue
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                                 for eu in &entries {
                                     if let Ok(u) = Url::parse(eu) {
                                         if opts_worker.same_host
@@ -1187,7 +2583,9 @@ impl Crawler {
                                         ) {
                                             continue;
                                         }
-                                        if opts_worker.respect_robots && !robots.allowed(u.path()) {
+                                        if opts_worker.respect_robots
+                                            && !robots_cache.peek_allows(&u)
+                                        {
                                             continue;
                                         }
                                         let lcanon = frontier::locale_canonical(u.path());
@@ -1203,26 +2601,33 @@ impl Crawler {
                                             if any_focus_match || item.depth > 0 {
                                                 continue;
                                             }
-                                            let s = score::score_candidate(
+                                            let s = score::score_candidate_with_idf(
                                                 "",
                                                 u.path(),
                                                 focus.as_deref(),
+                                                focus_idf.as_deref(),
                                             ) - 100.0;
-                                            q.push_with_parent(
+                                            gate.push(
+                                                &mut q,
                                                 u,
                                                 s,
                                                 item.depth + 1,
-                                                Some(item.url.clone()),
+                                                Some(page.url.clone()),
                                             );
                                             continue;
                                         }
-                                        let s =
-                                            score::score_candidate("", u.path(), focus.as_deref());
-                                        q.push_with_parent(
+                                        let s = score::score_candidate_with_idf(
+                                            "",
+                                            u.path(),
+                                            focus.as_deref(),
+                                            focus_idf.as_deref(),
+                                        );
+                                        gate.push(
+                                            &mut q,
                                             u,
                                             s,
                                             item.depth + 1,
-                                            Some(item.url.clone()),
+                                            Some(page.url.clone()),
                                         );
                                     }
                                 }
@@ -1231,7 +2636,9 @@ impl Crawler {
 
                         // Standard <a href> harvest.
                         let filtered: Vec<(url::Url, String, f64)> = {
-                            let ls = locale_seen.lock().unwrap();
+                            let ls = locale_seen
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
                             links
                                 .into_iter()
                                 .filter_map(|(child, anchor)| {
@@ -1253,7 +2660,8 @@ impl Crawler {
                                         filtered_out.fetch_add(1, Ordering::Relaxed);
                                         return None;
                                     }
-                                    if opts_worker.respect_robots && !robots.allowed(cu.path()) {
+                                    if opts_worker.respect_robots && !robots_cache.peek_allows(&cu)
+                                    {
                                         filtered_out.fetch_add(1, Ordering::Relaxed);
                                         return None;
                                     }
@@ -1262,11 +2670,22 @@ impl Crawler {
                                         filtered_out.fetch_add(1, Ordering::Relaxed);
                                         return None;
                                     }
-                                    let s = score::score_candidate(
+                                    let mut s = score::score_candidate_with_idf(
                                         &anchor,
                                         cu.path(),
                                         focus.as_deref(),
+                                        focus_idf.as_deref(),
                                     );
+                                    // V10: with no focus query there is no
+                                    // relevance signal, and the seed page's
+                                    // own links ARE the topic neighborhood.
+                                    // Boost them so they outrank the sitemap
+                                    // recency flood instead of tying it and
+                                    // losing (a WebGPU seed crawled
+                                    // RTCRtpTransceiver-class sibling nav).
+                                    if focus.is_none() && item.depth == 0 {
+                                        s += SEED_NEIGHBOR_BOOST;
+                                    }
                                     // Focus gate: when a focus query is set,
                                     // non-matching links are filtered.
                                     // Hard filter when: (a) this page has
@@ -1290,9 +2709,11 @@ impl Crawler {
                         }; // ls dropped here
 
                         {
-                            let mut q = queue.lock().unwrap();
+                            let mut q = queue
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
                             for (cu, _anchor, s) in filtered {
-                                q.push_with_parent(cu, s, item.depth + 1, Some(item.url.clone()));
+                                gate.push(&mut q, cu, s, item.depth + 1, Some(page.url.clone()));
                             }
                         } // q dropped here
                     }
@@ -1307,17 +2728,34 @@ impl Crawler {
         // ── Result + resume token ──────────────────────────
         let elapsed = started.elapsed();
         let (final_pages, stop, queued_entries) = {
-            let p = std::mem::take(&mut *pages.lock().unwrap());
+            let p = std::mem::take(
+                &mut *pages
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            );
             let s = stop_flag
                 .lock()
                 .unwrap()
                 .unwrap_or(StopReason::FrontierEmpty);
-            let q = sh_queue.lock().unwrap().snapshot_entries();
+            let q = sh_queue
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .snapshot_entries();
             (p, s, q)
         };
+        // Links the queue let go at its ceiling were in scope and
+        // allowed; the model is told they were not followed.
+        let dropped_at_ceiling = sh_queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .dropped();
 
-        let skipped_v = std::mem::take(&mut *skipped.lock().unwrap());
-        let filtered = filtered_out.load(Ordering::Relaxed);
+        let skipped_v = std::mem::take(
+            &mut *skipped
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        let filtered = filtered_out.load(Ordering::Relaxed) + dropped_at_ceiling;
 
         // Lastmod lookup from sitemap entries + relevance-sorted
         // output (seed first, then by score desc).
@@ -1337,9 +2775,19 @@ impl Crawler {
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
 
-        // Resume token only when stopped by budget (not frontier-empty).
+        // Resume token when stopped with work still queued:
+        // budget stops, a client cancellation, or the host's
+        // penalty box. The MCP surface promises both Cancelled
+        // ("resume with the token above") and ThrottledOut ("wait
+        // and resume") partial progress, so both must persist the
+        // frontier; only a drained frontier (FrontierEmpty) and a
+        // completed crawl have nothing to resume.
         let resume = match stop {
-            StopReason::MaxPages | StopReason::CharBudget | StopReason::Deadline => {
+            StopReason::MaxPages
+            | StopReason::CharBudget
+            | StopReason::Deadline
+            | StopReason::Cancelled
+            | StopReason::ThrottledOut => {
                 if !queued_entries.is_empty() {
                     let id = {
                         let n = self.token_seq.fetch_add(1, Ordering::Relaxed);
@@ -1355,28 +2803,17 @@ impl Crawler {
                             .iter()
                             .map(|(u, s, d, r, p)| (u.clone(), *s, *d, *r, p.clone()))
                             .collect(),
-                        seen: sh_queue.lock().unwrap().seen_snapshot(),
+                        seen: sh_queue
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .seen_snapshot(),
+                        denied: gate
+                            .denied
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .clone(),
                     };
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0);
-                    let mut store = ResumeFile::load();
-                    store.sweep();
-                    store.entries.insert(id.clone(), (state, now));
-                    // Cap the file: drop oldest beyond 50 tokens.
-                    if store.entries.len() > 50 {
-                        let mut keyed: Vec<(u64, String)> = store
-                            .entries
-                            .iter()
-                            .map(|(k, (_, at))| (*at, k.clone()))
-                            .collect();
-                        keyed.sort();
-                        for (_, k) in keyed.into_iter().take(store.entries.len() - 50) {
-                            store.entries.remove(&k);
-                        }
-                    }
-                    store.save();
+                    resume_store_issue(&id, &state);
                     Some(id)
                 } else {
                     None
@@ -1385,7 +2822,27 @@ impl Crawler {
             _ => None,
         };
 
+        // A failed seed is the crawl's failure only when nothing else
+        // could have produced a page: judged here, from what the workers
+        // did, because a transient seed is retried and a walled one may
+        // be rescued by the browser. A resumed crawl has no preflight
+        // and no seed row, so the rule does not apply to it.
+        let seed_failure = if resume_token.is_none()
+            && final_pages.is_empty()
+            && stop == StopReason::FrontierEmpty
+            && !other_dequeued.load(Ordering::SeqCst)
+        {
+            seed_failed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+                .map(|f| f.settle(&requested_seed, opts.mode != CrawlMode::Content))
+        } else {
+            None
+        };
+
         Ok(CrawlResult {
+            inventory,
             crawl_delay: robots.crawl_delay,
             seed: seed.to_string(),
             pages: final_pages,
@@ -1399,8 +2856,36 @@ impl Crawler {
             elapsed,
             map,
             resume,
+            denied: std::mem::take(
+                &mut *gate
+                    .denied
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            ),
+            seed_failure,
         })
     }
+}
+
+/// Case-insensitive ASCII byte search. Every pattern this file
+/// scans for is ASCII (<tag, rel="...", href...), and ASCII case
+/// folding never changes byte lengths, so a match start is always
+/// a char boundary of the ORIGINAL string (ASCII bytes cannot
+/// occur inside a multi-byte UTF-8 sequence). This replaces the
+/// old whole-document `to_lowercase()` scan: Unicode folding is
+/// NOT length-stable ('İ' == 2 bytes lowercases to "i̇" == 3), so
+/// offsets measured on the lowered copy drifted when applied to
+/// the original and sliced mid-character or past the end.
+fn find_ascii_ci(hay: &str, needle: &str, from: usize) -> Option<usize> {
+    let h = hay.as_bytes();
+    let n = needle.as_bytes();
+    if n.is_empty() || from >= h.len() || n.len() > h.len().saturating_sub(from) {
+        return None;
+    }
+    h[from..]
+        .windows(n.len())
+        .position(|w| w.eq_ignore_ascii_case(n))
+        .map(|p| from + p)
 }
 
 /// Extract `<link rel="canonical" href="...">` from HTML.
@@ -1413,25 +2898,25 @@ fn extract_canonical(html: &str) -> Option<String> {
 /// Extract all href values from `<link>` tags with a given `rel`
 /// attribute value. Byte-scan, no DOM parse.
 fn extract_link_rel(html: &str, rel: &str) -> Vec<String> {
-    let lower = html.to_lowercase();
-    let rel_pat = format!("rel=\"{rel}\"");
+    let rel_pat1 = format!("rel=\"{rel}\"");
     let rel_pat2 = format!("rel='{rel}'");
     let rel_pat3 = format!("rel={rel}");
     let mut out = Vec::new();
     let mut pos = 0usize;
-    while let Some(link_start) = lower[pos..].find("<link") {
-        let abs = pos + link_start;
-        let Some(tag_end) = lower[abs..].find('>') else {
+    while let Some(abs) = find_ascii_ci(html, "<link", pos) {
+        let Some(tag_end) = html[abs..].find('>') else {
             break;
         };
         let tag_end_abs = abs + tag_end + 1;
-        let tag = &lower[abs..tag_end_abs];
+        let tag = &html[abs..tag_end_abs];
         pos = tag_end_abs;
-        if !(tag.contains(&rel_pat) || tag.contains(&rel_pat2) || tag.contains(&rel_pat3)) {
+        if !(find_ascii_ci(tag, &rel_pat1, 0).is_some()
+            || find_ascii_ci(tag, &rel_pat2, 0).is_some()
+            || find_ascii_ci(tag, &rel_pat3, 0).is_some())
+        {
             continue;
         }
-        let orig_tag = &html[abs..tag_end_abs];
-        if let Some(href) = extract_href(orig_tag) {
+        if let Some(href) = extract_href(tag) {
             out.push(href);
         }
     }
@@ -1440,21 +2925,18 @@ fn extract_link_rel(html: &str, rel: &str) -> Vec<String> {
 
 /// Extract `<base href="...">` from HTML. First one wins.
 fn extract_base_href(html: &str) -> Option<String> {
-    let lower = html.to_lowercase();
     let mut pos = 0usize;
-    while let Some(base_start) = lower[pos..].find("<base") {
-        let abs = pos + base_start;
-        let Some(tag_end) = lower[abs..].find('>') else {
+    while let Some(abs) = find_ascii_ci(html, "<base", pos) {
+        let Some(tag_end) = html[abs..].find('>') else {
             break;
         };
         let tag_end_abs = abs + tag_end + 1;
-        let tag = &lower[abs..tag_end_abs];
+        let tag = &html[abs..tag_end_abs];
         pos = tag_end_abs;
-        if !tag.contains("href") {
+        if find_ascii_ci(tag, "href", 0).is_none() {
             continue;
         }
-        let orig_tag = &html[abs..tag_end_abs];
-        return extract_href(orig_tag);
+        return extract_href(tag);
     }
     None
 }
@@ -1463,28 +2945,27 @@ fn extract_base_href(html: &str) -> Option<String> {
 /// `<link rel="alternate" type="application/rss+xml" href="...">`
 /// or `type="application/atom+xml"`.
 fn extract_feed_links(html: &str) -> Vec<String> {
-    let lower = html.to_lowercase();
     let mut out = Vec::new();
     let mut pos = 0usize;
-    while let Some(link_start) = lower[pos..].find("<link") {
-        let abs = pos + link_start;
-        let Some(tag_end) = lower[abs..].find('>') else {
+    while let Some(abs) = find_ascii_ci(html, "<link", pos) {
+        let Some(tag_end) = html[abs..].find('>') else {
             break;
         };
         let tag_end_abs = abs + tag_end + 1;
-        let tag = &lower[abs..tag_end_abs];
+        let tag = &html[abs..tag_end_abs];
         pos = tag_end_abs;
-        if !tag.contains("rel=\"alternate\"")
-            && !tag.contains("rel='alternate'")
-            && !tag.contains("rel=alternate")
+        if !(find_ascii_ci(tag, "rel=\"alternate\"", 0).is_some()
+            || find_ascii_ci(tag, "rel='alternate'", 0).is_some()
+            || find_ascii_ci(tag, "rel=alternate", 0).is_some())
         {
             continue;
         }
-        if !tag.contains("application/rss+xml") && !tag.contains("application/atom+xml") {
+        if find_ascii_ci(tag, "application/rss+xml", 0).is_none()
+            && find_ascii_ci(tag, "application/atom+xml", 0).is_none()
+        {
             continue;
         }
-        let orig_tag = &html[abs..tag_end_abs];
-        if let Some(href) = extract_href(orig_tag) {
+        if let Some(href) = extract_href(tag) {
             out.push(href);
         }
     }
@@ -1497,48 +2978,47 @@ fn extract_feed_links(html: &str) -> Vec<String> {
 /// Skips `rel="self"` and `rel="enclosure"` (feed metadata).
 fn parse_feed_urls(xml: &str, cap: usize) -> Vec<String> {
     let mut urls = Vec::new();
-    let lower = xml.to_lowercase();
     // RSS: <link>URL</link>
     let mut pos = 0usize;
     while urls.len() < cap {
-        let Some(open) = lower[pos..].find("<link>") else {
+        let Some(open) = find_ascii_ci(xml, "<link>", pos) else {
             break;
         };
-        let abs = pos + open;
-        let after = abs + 6;
-        let Some(close_rel) = lower[after..].find("</link>") else {
+        let after = open + 6;
+        // Case-insensitive like the open-tag scan above : a
+        // case-sensitive close made "<LINK>u</LINK>" span to the
+        // next item's lowercase </link>.
+        let Some(close) = find_ascii_ci(xml, "</link>", after) else {
             break;
         };
-        let text = xml[after..after + close_rel].trim();
+        let text = xml[after..close].trim();
         if text.starts_with("http") {
             urls.push(text.to_string());
         }
-        pos = after + close_rel + 7;
+        pos = close + 7;
     }
     // Atom: <link href="URL" .../>
     if urls.len() < cap {
         pos = 0;
         while urls.len() < cap {
-            let Some(link_start) = lower[pos..].find("<link ") else {
+            let Some(abs) = find_ascii_ci(xml, "<link ", pos) else {
                 break;
             };
-            let abs = pos + link_start;
-            let Some(tag_end) = lower[abs..].find('>') else {
+            let Some(tag_end) = xml[abs..].find('>') else {
                 break;
             };
             let tag_end_abs = abs + tag_end + 1;
-            let tag = &lower[abs..tag_end_abs];
+            let tag = &xml[abs..tag_end_abs];
             pos = tag_end_abs;
             // Skip non-content links.
-            if tag.contains("rel=\"self\"")
-                || tag.contains("rel='self'")
-                || tag.contains("rel=\"enclosure\"")
-                || tag.contains("rel='enclosure'")
+            if find_ascii_ci(tag, "rel=\"self\"", 0).is_some()
+                || find_ascii_ci(tag, "rel='self'", 0).is_some()
+                || find_ascii_ci(tag, "rel=\"enclosure\"", 0).is_some()
+                || find_ascii_ci(tag, "rel='enclosure'", 0).is_some()
             {
                 continue;
             }
-            let orig_tag = &html_orig(xml, abs, tag_end_abs);
-            if let Some(href) = extract_href(orig_tag)
+            if let Some(href) = extract_href(tag)
                 && href.starts_with("http")
             {
                 urls.push(href);
@@ -1548,15 +3028,9 @@ fn parse_feed_urls(xml: &str, cap: usize) -> Vec<String> {
     urls
 }
 
-/// Safe slice of the original XML (not lowered) for href extraction.
-fn html_orig(xml: &str, from: usize, to: usize) -> &str {
-    &xml[from..to.min(xml.len())]
-}
-
 /// Extract the `href` attribute value from an HTML tag string.
 fn extract_href(tag: &str) -> Option<String> {
-    let lower = tag.to_lowercase();
-    let href_pos = lower.find("href")?;
+    let href_pos = find_ascii_ci(tag, "href", 0)?;
     let after = &tag[href_pos + 4..];
     // Skip whitespace and =.
     let after = after.trim_start();
@@ -1585,7 +3059,11 @@ fn self_harvest_static(html: &str, _base: &Url) -> Vec<(String, String)> {
         let Some(href) = a.value().attr("href") else {
             continue;
         };
-        let anchor: String = a.text().collect::<String>().trim().to_string();
+        // Visible text only: a script inside an anchor is tracking
+        // code, never a link label (#288's class).
+        let anchor: String = crate::extract::inline::visible_text_raw(a)
+            .trim()
+            .to_string();
         out.push((href.to_string(), anchor));
     }
     out
@@ -1597,4 +3075,164 @@ fn host_matches(a: &str, b: &str) -> bool {
     let a = a.strip_prefix("www.").unwrap_or(a);
     let b = b.strip_prefix("www.").unwrap_or(b);
     a.eq_ignore_ascii_case(b)
+}
+
+/// Recheck a candidate's actual final URL before extraction or browser recovery.
+/// Build the per-request redirect gate for a crawl: consulted for
+/// every redirect hop BEFORE it is dialed. Refuses same-host,
+/// scope and robots violations; the hop's response then returns as
+/// the bare redirect and the caller records the skip.
+fn build_redirect_gate(
+    fetch: &PageFetcher,
+    robots: &Arc<sitemap::RobotsCache>,
+    governor: &Arc<Governor>,
+    seed_host: &str,
+    opts: &CrawlOptions,
+) -> Option<crate::fetch::client::RedirectGate> {
+    Some(Arc::new({
+        let fetch = Arc::clone(fetch);
+        let robots = Arc::clone(robots);
+        let governor = Arc::clone(governor);
+        let seed = seed_host.to_string();
+        let policy = opts.clone();
+        move |target: url::Url| {
+            let fetch = fetch.clone();
+            let robots = Arc::clone(&robots);
+            let governor = Arc::clone(&governor);
+            let seed = seed.clone();
+            let policy = policy.clone();
+            Box::pin(async move {
+                if policy.same_host
+                    && !target
+                        .host_str()
+                        .is_some_and(|host| host_matches(host, &seed))
+                {
+                    return false;
+                }
+                if !scope_allowed(target.path(), &policy.include_paths, &policy.exclude_paths) {
+                    return false;
+                }
+                if policy.respect_robots
+                    && !robots_allows(&fetch, &governor, &robots, &target).await
+                {
+                    return false;
+                }
+                true
+            })
+        }
+    }))
+}
+
+/// Why `redirect_target_allowed` refused a landing URL: the skip
+/// reason, plus the rule payload when a local rule was the cause.
+struct RedirectRefusal {
+    reason: String,
+    denial: Option<crate::rules::Denial>,
+}
+
+async fn redirect_target_allowed(
+    fetch: &PageFetcher,
+    governor: &Governor,
+    robots: &sitemap::RobotsCache,
+    opts: &CrawlOptions,
+    seed_host: &str,
+    queued: &Url,
+    target: &str,
+) -> Result<(), RedirectRefusal> {
+    // Matched on the typed error before anything formats it: a denial
+    // here yields the same policy skip row as a denied fetch.
+    let final_url = crate::fetch::guards::validate_url_basic(target).map_err(|error| {
+        match crate::rules::Denial::from_error(&error) {
+            Some(denial) => RedirectRefusal {
+                reason: policy_skip_reason(&denial),
+                denial: Some(denial),
+            },
+            None => RedirectRefusal {
+                reason: format!("invalid redirect target: {error}"),
+                denial: None,
+            },
+        }
+    })?;
+    if final_url != *queued
+        && ((opts.same_host
+            && !final_url
+                .host_str()
+                .is_some_and(|host| host_matches(host, seed_host)))
+            || !scope_allowed(final_url.path(), &opts.include_paths, &opts.exclude_paths)
+            || (opts.respect_robots && !robots_allows(fetch, governor, robots, &final_url).await))
+    {
+        return Err(RedirectRefusal {
+            reason: format!("redirected out of scope -> {target}"),
+            denial: None,
+        });
+    }
+    Ok(())
+}
+
+/// The per-origin robots gate used at fetch time (and the redirect
+/// recheck): ensure the URL's own origin's robots.txt has been read
+/// (fetching it on first contact), apply that origin's declared
+/// `Crawl-delay` to the governor once, and decide the URL against
+/// its own origin's rules. Every fetched URL passes this gate, so no
+/// request to an origin can precede its robots.txt.
+async fn robots_allows(
+    fetch: &PageFetcher,
+    governor: &Governor,
+    cache: &sitemap::RobotsCache,
+    url: &Url,
+) -> bool {
+    let (rules, fresh) = cache.ensure(fetch, url).await;
+    if fresh && let Some(host) = url.host_str() {
+        governor.set_host_crawl_delay(host, rules.crawl_delay);
+    }
+    rules.allows_url(url)
+}
+
+#[cfg(test)]
+mod anchor_text_guard_tests {
+    use super::self_harvest_static;
+
+    // A script inside an <a> is tracking code, never a link label
+    // (#288's class, crawl side).
+    #[test]
+    fn anchor_labels_never_carry_script_text() {
+        let html = "<a href=\"/docs\">Docs<script>void 0;</script></a>";
+        let found = self_harvest_static(html, &url::Url::parse("https://example.com/").unwrap());
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].0, "/docs");
+        assert_eq!(found[0].1, "Docs");
+    }
+}
+
+#[cfg(all(test, unix))]
+mod resume_store_mode_tests {
+    use super::{ResumeState, write_token_file};
+
+    // Frontier URLs can name a private target: the token file is
+    // owner-only, same seal as the session-bearing stores (the
+    // 4.3.7 page-history class, continued 2026-09-29).
+    #[test]
+    fn a_resume_token_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("donsetch-token-mode-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = ResumeState {
+            seed: "https://intranet.example/secret-plan".into(),
+            queue: vec![(
+                "https://intranet.example/secret-plan/deep".into(),
+                1.0,
+                1,
+                0,
+                None,
+            )],
+            seen: vec!["https://intranet.example/secret-plan".into()],
+            denied: Default::default(),
+        };
+        assert!(write_token_file(&dir, "c0001", &state));
+        let p = dir.join("c0001.json");
+        let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "resume token is {mode:o}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

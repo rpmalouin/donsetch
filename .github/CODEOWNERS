@@ -1,7 +1,18 @@
 * @dondai44423
 
-# Auto-request review from co-maintainer.
-/src/search/ @Mart-Bogdan
+# Auto-request review from co-maintainers.
+/src/search/ @Mart-Bogdan @mnaza
 /src/ghost/ @Mart-Bogdan
 /src/fetch/ @Mart-Bogdan
 /.github/ @Mart-Bogdan
+
+# Subsystem owners (triage): structural review signal, no merge power.
+/src/pdf/ @mnaza
+/src/transport/h2/ @mnaza
+/src/fetch/cookies.rs @mnaza
+/src/mcp/ @adaaaaaaaaaaaaaaaaaaaaaa
+/src/spec.rs @adaaaaaaaaaaaaaaaaaaaaaa
+/tests/ @adaaaaaaaaaaaaaaaaaaaaaa
+Dockerfile @imonlinux
+docker-compose.yml @imonlinux
+/src/mcp/http.rs @imonlinux

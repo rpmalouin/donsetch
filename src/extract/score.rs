@@ -18,13 +18,16 @@ struct Stats {
 pub fn find_main<'a>(doc: &'a Html) -> Option<ElementRef<'a>> {
     let body = doc.select(&scraper::Selector::parse("body").ok()?).next()?;
     let (body_stats, best) = walk(body, 0);
-    if std::env::var_os("DONSIFT_DEBUG").is_some() {
-        eprintln!(
+    if crate::config::cfg().debug.extract {
+        crate::diag!(
             "[donsift] body stats: text={} link={} punct={} paras={}",
-            body_stats.text_len, body_stats.link_text_len, body_stats.punct, body_stats.paras
+            body_stats.text_len,
+            body_stats.link_text_len,
+            body_stats.punct,
+            body_stats.paras
         );
         if let Some((score, el)) = best {
-            eprintln!(
+            crate::diag!(
                 "[donsift] main = <{}> id={:?} class={:?} score={score:.0}",
                 el.value().name(),
                 el.value().id(),
@@ -145,7 +148,7 @@ fn walk<'a>(el: ElementRef<'a>, depth: usize) -> (Stats, Option<(f64, ElementRef
             * content_factor
             + tag_prior(name)
             + class_prior(el.value());
-        // Body is always a wrapper — it includes nav, sidebar,
+        // Body is always a wrapper : it includes nav, sidebar,
         // footer, and content. Without this penalty, large pages
         // (old.reddit with comments) score body higher than the
         // real content container, and extraction drowns in

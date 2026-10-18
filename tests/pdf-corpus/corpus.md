@@ -1,6 +1,6 @@
 # DonSheet corpus
 
-Real-world PDFs the battery asserts on. NOT committed — fetch with
+Real-world PDFs the battery asserts on. NOT committed : fetch with
 `scripts/download-corpus.sh` from the repo root. Tests skip silently
 when files are missing.
 
@@ -17,7 +17,7 @@ when files are missing.
 
 # Battle corpus (head-to-head)
 
-The 40-document stress set DonSheet v2 was wounded on. NOT committed —
+The 40-document stress set DonSheet v2 was wounded on. NOT committed :
 regenerate with `scripts/download-battle-corpus.sh` (23 real-world docs
 into `bench/battle-corpus/`) and `scripts/generate-platform-corpus.sh`
 (11 hand-authored Chromium print jobs covering layouts no real corpus
@@ -32,7 +32,7 @@ vit/resnet/mlp-mixer/swin/t5/mamba/gpt-3/vit-lm/palm), IRS forms
 (Greek/Hebrew/Japanese/Russian/broken-encoding Nepali), TLCL + Pro Git.
 
 Headline results (2026-08-06, 40 docs): zero garbage output everywhere;
-6–14× faster than pymupdf4llm on every document; coverage ≥95% on
+6-14× faster than pymupdf4llm on every document; coverage ≥95% on
 born-digital text; total wins on scanned (OCR recovers, pymupdf emits 0
 characters) and the broken-ToUnicode Nepali UDHR (10,542 usable Devanagari
 characters vs pymupdf’s 28).

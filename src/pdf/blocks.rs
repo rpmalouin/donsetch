@@ -56,8 +56,8 @@ pub fn classify(pages: &[PageLines], ordered_by_page: &[Vec<Line>], ctx: &FontCt
         }
         let fusion = pages[pi].fusion.as_ref();
         classify_page_fused(lines, ctx, n_pages > 1, &mut blocks, fusion);
-        if std::env::var("DONSHEET_DEBUG").is_ok() {
-            eprintln!(
+        if crate::config::cfg().debug.pdf {
+            crate::diag!(
                 "[classify] page {pi}/{} done ({} blocks)",
                 n_pages,
                 blocks.len()
@@ -92,7 +92,7 @@ fn classify_page_fused(
         }
 
         // Code run: consecutive mono lines. Precondition excludes
-        // mono lines that are also headings — otherwise the inner
+        // mono lines that are also headings : otherwise the inner
         // loop can never advance past the first one (deadlock).
         if line.mono && !is_heading(line, ctx) {
             let mut j = i;
@@ -421,7 +421,7 @@ pub fn is_heading(l: &Line, ctx: &FontCtx) -> bool {
         return false;
     }
     // A line that starts with a list marker is a list item. Never a
-    // heading — AcroForm widgets emit as "- **name**: value" lines and
+    // heading : AcroForm widgets emit as "- **name**: value" lines and
     // must not promote into the heading ladder on small-body forms.
     if t.starts_with("- ") || t.starts_with("* ") {
         return false;

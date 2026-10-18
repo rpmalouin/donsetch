@@ -1,5 +1,5 @@
 //! GitHub adapter: issues / PRs / releases / commits pages
-//! restructured from server-rendered HTML — no auth, no API-key
+//! restructured from server-rendered HTML : no auth, no API-key
 //! rate jail. The generic pipeline mangles these (sidebars,
 //! reaction rows, filter bars); the agent wants the thread.
 //!
@@ -10,7 +10,7 @@
 
 use scraper::{ElementRef, Html, Selector};
 
-use crate::extract::{ContentKind, ExtractOptions, Extracted};
+use crate::extract::{ContentKind, ExtractOptions, Extracted, inline};
 
 const MAX_ITEMS: usize = 30;
 const MAX_COMMENTS: usize = 60;
@@ -34,7 +34,9 @@ pub fn extract(html: &str, url: &str, opts: &ExtractOptions) -> Option<Extracted
             render_thread(&doc, owner, repo, number)
         }
         [_owner, _repo, "releases"] => render_releases(&doc),
-        [_owner, _repo, "commits"] => render_commits(&doc),
+        // The canonical commits URL carries the ref
+        // (/commits/master): the arm takes any trailing segments.
+        [_owner, _repo, "commits", ..] => render_commits(&doc),
         _ => None,
     }?;
 
@@ -42,6 +44,7 @@ pub fn extract(html: &str, url: &str, opts: &ExtractOptions) -> Option<Extracted
     let max = opts.max_chars.unwrap_or(16_000).max(200);
     let (slice, next) = crate::extract::paginate_public(&md, opts.offset, max);
     Some(Extracted {
+        tokens_est: slice.len() / 4,
         markdown: slice,
         title: doc_title(&doc),
         byline: None,
@@ -51,7 +54,7 @@ pub fn extract(html: &str, url: &str, opts: &ExtractOptions) -> Option<Extracted
         next_offset: next,
         blocks_total: 0,
         blocks_shown: 0,
-        tokens_est: total / 4,
+        focus_omitted: false,
         thin: false,
         content_kind: ContentKind::Forum,
         lang: "en".to_string(),
@@ -60,6 +63,7 @@ pub fn extract(html: &str, url: &str, opts: &ExtractOptions) -> Option<Extracted
         images: Vec::new(),
         fingerprint: None,
         via: Some("adapter:github-html"),
+        partial: None,
     })
 }
 
@@ -72,7 +76,9 @@ fn doc_title(doc: &Html) -> Option<String> {
 }
 
 fn text_of(el: ElementRef) -> String {
-    el.text().collect::<String>().trim().to_string()
+    // Visible text only: a script/style subtree inside the element is
+    // source, not content (#288).
+    inline::visible_text_raw(el).trim().to_string()
 }
 
 // ── Issue / PR list ───────────────────────────────────────────
@@ -80,7 +86,7 @@ fn text_of(el: ElementRef) -> String {
 fn render_issue_list(doc: &Html) -> Option<String> {
     // GitHub shipped a React list (2025+): CSS-module hashed
     // classnames, but stable data-testid hooks. The old
-    // li.js-issue-row markup still exists on some surfaces —
+    // li.js-issue-row markup still exists on some surfaces :
     // try the new shape first, keep the old as fallback.
     if let Some(md) = render_issue_list_modern(doc) {
         return Some(md);
@@ -308,11 +314,11 @@ fn render_thread_modern(doc: &Html, owner: &str, repo: &str, number: &str) -> Op
             md.push_str("\n\n");
         }
     }
-    // Comments stream via JS — say so instead of silently
+    // Comments stream via JS : say so instead of silently
     // omitting the discussion.
     if doc.select(&skeleton_sel).next().is_some() {
         md.push_str(
-            "*(comments load dynamically — re-fetch with tier=2 to read the discussion)*\n",
+            "*(comments load dynamically : re-fetch with tier=2 to read the discussion)*\n",
         );
     }
     Some(md.trim_end().to_string())
@@ -394,16 +400,24 @@ fn render_thread_legacy(doc: &Html, owner: &str, repo: &str, number: &str) -> Op
 // ── Releases ──────────────────────────────────────────────────
 
 fn render_releases(doc: &Html) -> Option<String> {
-    // release entries: section.release or div.Box with h1 tag;
-    // fallback to .release.
-    let rel_sel = Selector::parse("section.release, div.release").ok()?;
-    let tag_sel = Selector::parse("h1 a, h2 a, .release-title a").ok()?;
+    // Release entries: the legacy section.release and the 2025+
+    // server-rendered page (section[data-release-anchor]).
+    let rel_sel =
+        Selector::parse("section.release, div.release, section[data-release-anchor]").ok()?;
+    // Both markups point the tag link at /releases/tag/...; the
+    // legacy heading shape stays as a fallback.
+    let tag_sel = Selector::parse("a[href*='/releases/tag/']").ok()?;
+    let tag_fallback_sel = Selector::parse("h1 a, h2 a, .release-title a").ok()?;
     let date_sel = Selector::parse("relative-time").ok()?;
     let notes_sel = Selector::parse("div.markdown-body").ok()?;
     let mut md = String::from("# Releases\n\n");
     let mut n = 0;
     for rel in doc.select(&rel_sel).take(15) {
-        let Some(tag_el) = rel.select(&tag_sel).next() else {
+        let Some(tag_el) = rel
+            .select(&tag_sel)
+            .next()
+            .or_else(|| rel.select(&tag_fallback_sel).next())
+        else {
             continue;
         };
         let tag = text_of(tag_el);
@@ -417,7 +431,7 @@ fn render_releases(doc: &Html) -> Option<String> {
             .map(|d| d.chars().take(10).collect::<String>())
             .unwrap_or_default();
         n += 1;
-        md.push_str(&format!("## {tag} — {date}\n\n"));
+        md.push_str(&format!("## {tag} : {date}\n\n"));
         if let Some(notes) = rel.select(&notes_sel).next() {
             let notes_md =
                 crate::extract::inline::markdown(notes, "https://github.com", &gh_inline_opts()).0;
@@ -435,6 +449,106 @@ fn render_releases(doc: &Html) -> Option<String> {
 // ── Commits ───────────────────────────────────────────────────
 
 fn render_commits(doc: &Html) -> Option<String> {
+    if let Some(md) = render_commits_modern(doc) {
+        return Some(md);
+    }
+    render_commits_legacy(doc)
+}
+
+/// The 2025+ React list: rows carry stable data-testids and the
+/// full sha in `data-commit-link`; the per-group h3 titles carry
+/// the date (a row's own date renders client-side, as a skeleton
+/// in the SSR HTML).
+fn render_commits_modern(doc: &Html) -> Option<String> {
+    let any_sel =
+        Selector::parse("[data-testid='commit-group-title'], [data-testid='commit-row-item']")
+            .ok()?;
+    let msg_sel = Selector::parse("h4 a").ok()?;
+    let author_sel = Selector::parse("a[href*='commits?author=']").ok()?;
+    let mut md = String::from("# Commits\n\n");
+    let mut n = 0;
+    let mut date = String::new();
+    for el in doc.select(&any_sel) {
+        match el.value().attr("data-testid") {
+            Some("commit-group-title") => {
+                let t = text_of(el);
+                date = iso_date(&t).unwrap_or(t);
+            }
+            Some("commit-row-item") => {
+                let Some(msg_el) = el.select(&msg_sel).next() else {
+                    continue;
+                };
+                let msg = text_of(msg_el);
+                if msg.is_empty() {
+                    continue;
+                }
+                let sha = el
+                    .value()
+                    .attr("data-commit-link")
+                    .and_then(|href| href.rsplit('/').next())
+                    .filter(|s| s.len() >= 7 && s.chars().all(|c| c.is_ascii_hexdigit()))
+                    .map(|s| s.chars().take(7).collect::<String>())
+                    .unwrap_or_default();
+                let author = el
+                    .select(&author_sel)
+                    .next()
+                    .map(text_of)
+                    .filter(|a| !a.is_empty())
+                    .unwrap_or_default();
+                n += 1;
+                md.push_str(&format!("- {msg}"));
+                let meta: Vec<String> = [
+                    (!author.is_empty()).then_some(format!("u/{author}")),
+                    (!date.is_empty()).then_some(date.clone()),
+                    (!sha.is_empty()).then_some(sha),
+                ]
+                .into_iter()
+                .flatten()
+                .collect();
+                if !meta.is_empty() {
+                    md.push_str(&format!(" ({})", meta.join(", ")));
+                }
+                md.push('\n');
+                if n >= MAX_ITEMS {
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    if n == 0 {
+        return None;
+    }
+    Some(md)
+}
+
+/// "Commits on Sep 23, 2026" -> "2026-09-23"; `None` when the
+/// shape is not recognized (the caller keeps the raw text).
+fn iso_date(s: &str) -> Option<String> {
+    let rest = s.trim().strip_prefix("Commits on")?.trim();
+    let mut it = rest.split_whitespace();
+    let mon = it.next()?;
+    let day = it.next()?.trim_end_matches(',');
+    let year = it.next()?;
+    let m = match mon {
+        "Jan" => 1,
+        "Feb" => 2,
+        "Mar" => 3,
+        "Apr" => 4,
+        "May" => 5,
+        "Jun" => 6,
+        "Jul" => 7,
+        "Aug" => 8,
+        "Sep" => 9,
+        "Oct" => 10,
+        "Nov" => 11,
+        "Dec" => 12,
+        _ => return None,
+    };
+    Some(format!("{year}-{m:02}-{day:0>2}"))
+}
+
+fn render_commits_legacy(doc: &Html) -> Option<String> {
     let commit_sel = Selector::parse("li.commit, div.commit").ok()?;
     let msg_sel = Selector::parse("a.js-navigation-open, a.Link--primary").ok()?;
     let author_sel = Selector::parse("a.commit-author, a.author").ok()?;
@@ -491,7 +605,7 @@ fn render_commits(doc: &Html) -> Option<String> {
 }
 
 // Links ARE the content on GitHub threads (commit refs, cross
-// links) — always render them.
+// links) : always render them.
 fn gh_inline_opts() -> crate::extract::ExtractOptions {
     ExtractOptions {
         include_links: true,
@@ -574,7 +688,7 @@ mod tests {
           </section>
         </body></html>"#;
         let ex = extract(html, "https://github.com/o/r/releases", &opts()).unwrap();
-        assert!(ex.markdown.contains("## v2.0.0 — 2026-02-01"));
+        assert!(ex.markdown.contains("## v2.0.0 : 2026-02-01"));
         assert!(ex.markdown.contains("Big rewrite"));
     }
 
@@ -592,5 +706,40 @@ mod tests {
         assert!(ex.markdown.contains("fix: off-by-one"));
         assert!(ex.markdown.contains("u/carol"));
         assert!(ex.markdown.contains("abcdef1"));
+    }
+
+    #[test]
+    fn releases_modern_render() {
+        let html = r#"<html><body>
+          <section id="release-v4.3.2" data-release-anchor="release-v4.3.2">
+            <h2 class="sr-only" id="hd-1">v4.3.2</h2>
+            <span class="tmp-mr-3 f1 text-bold d-inline"><a href="/o/r/releases/tag/v4.3.2" class="Link--primary Link">v4.3.2</a></span>
+            <relative-time class="no-wrap" prefix="" datetime="2026-09-23T00:56:50Z">23 Sep 00:56</relative-time>
+            <div data-test-selector="body-content" class="markdown-body tmp-my-3"><p>DonSeTch v4.3.2 notes</p></div>
+          </section>
+        </body></html>"#;
+        let ex = extract(html, "https://github.com/o/r/releases", &opts()).unwrap();
+        assert!(ex.markdown.contains("## v4.3.2 : 2026-09-23"));
+        assert!(ex.markdown.contains("DonSeTch v4.3.2 notes"));
+    }
+
+    #[test]
+    fn commits_modern_render_with_group_dates() {
+        let html = r#"<html><body>
+          <h3 data-testid="commit-group-title">Commits on Sep 23, 2026</h3>
+          <li class="ListItem-module__listItem__wBJcm CommitRow-module__ListItem_0__u0LMo" data-testid="commit-row-item" data-commit-link="/o/r/commit/5d4d277ab42aff4d76d1ab3bcb05478ade43bceb">
+            <div class="Title-module__container__ZzhV_"><h4 class="Title-module__heading__tHuYV"><a class="Title-module__anchor__dBbYy" href="/o/r/commit/5d4d277ab42aff4d76d1ab3bcb05478ade43bceb"><span>chore(release): 4.3.2</span></a></h4></div>
+            <div class="CommitAttribution-module__CommitAttributionContainer__I_rfs"><a href="/dondai44423/donsetch/commits?author=dondai44423" aria-label="commits by dondai44423">dondai44423</a></div>
+          </li>
+          <h3 data-testid="commit-group-title">Commits on Sep 22, 2026</h3>
+          <li class="ListItem-module__listItem__wBJcm CommitRow-module__ListItem_0__u0LMo" data-testid="commit-row-item" data-commit-link="/o/r/commit/2b50798aa11bb22cc33dd44ee55ff66aa77bb88c">
+            <div class="Title-module__container__ZzhV_"><h4 class="Title-module__heading__tHuYV"><a href="/o/r/commit/2b50798aa11bb22cc33dd44ee55ff66aa77bb88c"><span>fix(fetch): reddit session</span></a></h4></div>
+            <div class="CommitAttribution-module__CommitAttributionContainer__I_rfs"><a href="/o/r/commits?author=other" aria-label="commits by other">other</a></div>
+          </li>
+        </body></html>"#;
+        let ex = extract(html, "https://github.com/o/r/commits/master", &opts()).unwrap();
+        assert!(ex.markdown.contains("chore(release): 4.3.2"));
+        assert!(ex.markdown.contains("(u/dondai44423, 2026-09-23, 5d4d277)"));
+        assert!(ex.markdown.contains("(u/other, 2026-09-22, 2b50798)"));
     }
 }

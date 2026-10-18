@@ -1,8 +1,13 @@
-//! SERP parsers — one per engine, scraper-based, with
+//! SERP parsers : one per engine, scraper-based, with
 //! layered fallbacks. A parse that yields <3 hits counts
 //! as engine failure (the health system hears about it).
 
+use base64::Engine as _;
+use base64::alphabet;
+use base64::engine::general_purpose::{GeneralPurpose, PAD_INDIFFERENT};
 use scraper::{Html, Selector};
+
+pub mod google_wml;
 
 /// One raw hit from one engine.
 #[derive(Debug, Clone)]
@@ -16,12 +21,9 @@ pub struct Hit {
 }
 
 fn text(el: scraper::ElementRef) -> String {
-    el.text()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
+    // Visible text only: a script/style subtree in a SERP cell is
+    // source, never snippet text (#288's class, search side).
+    crate::extract::inline::visible_text(el)
 }
 
 fn sel(css: &str) -> Selector {
@@ -29,7 +31,7 @@ fn sel(css: &str) -> Selector {
 }
 
 /// DDG html endpoint wraps links in /l/?uddg= redirects.
-/// Decode to the real URL — consensus matching depends on
+/// Decode to the real URL : consensus matching depends on
 /// every engine reporting the SAME url.
 fn decode_ddg(href: &str) -> String {
     if let Some((_, q)) = href.split_once("uddg=") {
@@ -79,7 +81,7 @@ fn decode_bing(href: &str) -> String {
         }
     }
     // If this is a bing.com/ck/a stub we couldn't decode,
-    // return empty — the is_serp_url filter and the
+    // return empty : the is_serp_url filter and the
     // starts_with("http") check will drop it.
     if href.contains("bing.com/ck/a") {
         return String::new();
@@ -87,38 +89,26 @@ fn decode_bing(href: &str) -> String {
     href.to_string()
 }
 
+/// base64url (RFC 4648 section 5), padded or not, decoded to UTF-8.
+/// `None` when the input is not base64url or not UTF-8.
 fn base64url_decode(s: &str) -> Option<String> {
-    const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-    let mut vals = Vec::with_capacity(s.len());
-    for &c in s.as_bytes() {
-        if c == b'=' {
-            break;
-        }
-        let pos = T.iter().position(|&t| t == c)?;
-        vals.push(pos as u32);
-    }
-    let mut out = Vec::with_capacity(vals.len() * 6 / 8);
-    for chunk in vals.chunks(4) {
-        let mut n = 0u32;
-        for (i, &v) in chunk.iter().enumerate() {
-            n |= v << (18 - 6 * i);
-        }
-        out.push((n >> 16) as u8);
-        if chunk.len() > 2 {
-            out.push((n >> 8) as u8);
-        }
-        if chunk.len() > 3 {
-            out.push(n as u8);
-        }
-    }
-    String::from_utf8(out).ok()
+    // Lenient on purpose, matching the hand-rolled decoder this
+    // replaced: Bing's `u=` value is third-party data, seen both with
+    // and without `=`, and nonzero unused bits in the last symbol do
+    // not change the bytes a URL decodes to.
+    const BING_URL_SAFE: GeneralPurpose = GeneralPurpose::new(
+        &alphabet::URL_SAFE,
+        PAD_INDIFFERENT.with_decode_allow_trailing_bits(true),
+    );
+    let bytes = BING_URL_SAFE.decode(s).ok()?;
+    String::from_utf8(bytes).ok()
 }
 
 /// Check if a URL is a search engine results page (SERP).
-/// These should never appear as search results — they leak
+/// These should never appear as search results : they leak
 /// through parsers when redirect decoding fails or when
 /// broad selectors match pagination/header links.
-fn is_serp_url(url: &str) -> bool {
+pub(crate) fn is_serp_url(url: &str) -> bool {
     let lower = url.to_lowercase();
     let serp_patterns = [
         // General SERPs
@@ -146,12 +136,23 @@ fn is_serp_url(url: &str) -> bool {
 }
 
 pub fn parse(engine: &str, html: &str) -> Vec<Hit> {
+    parse_with_instant(engine, html).0
+}
+
+/// One DOM parse feeds both the organic hit list and the C5
+/// instant layer. html5ever on a multi-MB SERP is the expensive
+/// part; doing it twice per engine was pure waste.
+pub fn parse_with_instant(
+    engine: &str,
+    html: &str,
+) -> (Vec<Hit>, Option<super::instant::InstantAnswer>) {
     let doc = Html::parse_document(html);
     let mut hits = match engine {
         "brave" => parse_brave(&doc),
-        "google" => parse_google(&doc),
+        "google" => google_wml::parse(&doc),
+        "google_ghost" => parse_google(&doc),
         "bing" => parse_bing(&doc),
-        // DDG primary is now lite — the html endpoint serves a
+        // DDG primary is now lite : the html endpoint serves a
         // CAPTCHA challenge to proxy IPs.  parse_ddg (html parser)
         // is kept for the ddg_html fallback engine.
         "ddg" => parse_ddg_lite(&doc),
@@ -165,20 +166,21 @@ pub fn parse(engine: &str, html: &str) -> Vec<Hit> {
     // search.yahoo.com/search pagination links, undecoded
     // r.search.yahoo.com redirects, bing.com/ck/a stubs).
     hits.retain(|h| !is_serp_url(&h.url));
-    if hits.is_empty() && std::env::var_os("DONSEEK_DEBUG").is_some() {
+    let instant = super::instant::parse_instant_doc(engine, &doc);
+    if hits.is_empty() && crate::config::cfg().debug.search {
         let dump = std::env::temp_dir().join(format!("donseek_debug_{engine}.html"));
         let dump = dump.to_string_lossy().into_owned();
         let _ = std::fs::write(&dump, html);
-        eprintln!(
+        crate::diag!(
             "[donseek] {engine}: 0 hits, dumped {len} bytes to {dump}",
             len = html.len()
         );
     }
-    hits
+    (hits, instant)
 }
 
 /// Google URL unwrapping: Google wraps result URLs in
-/// /url?q=REAL_URL&sa=U&ved=... — extract and decode the
+/// /url?q=REAL_URL&sa=U&ved=... : extract and decode the
 /// real URL. Direct http(s) links pass through unchanged.
 fn decode_google(href: &str) -> String {
     if let Some((_, q)) = href.split_once("/url?") {
@@ -355,16 +357,22 @@ fn parse_brave(doc: &Html) -> Vec<Hit> {
 
 fn parse_bing(doc: &Html) -> Vec<Hit> {
     let items = sel("li.b_algo");
-    // Primary: h2 a; fallback: h2 > a, a.tilk, a[data-h]
-    let link = sel("h2 a, h2 > a, a.tilk, a[data-h]");
+    // Keep the title link and the attribution link separate. A grouped
+    // selector returns matches in document order, not selector-preference
+    // order; Bing places `a.tilk` (site + breadcrumb) before `h2 a`, so the
+    // old grouped selector silently used the breadcrumb as both URL and
+    // title on every result.
+    let title_link = sel("h2 a");
+    let fallback_link = sel("a.tilk, a[data-h]");
     // Primary: .b_caption p; fallback: .b_lineclamp*, [data-text]
     let cap = sel(".b_caption p, .b_lineclamp2, .b_lineclamp3, .b_lineclamp4, p[data-text]");
     let h2 = sel("h2");
     let mut hits = Vec::new();
     for (rank, li) in doc.select(&items).enumerate() {
         let Some(a) = li
-            .select(&link)
+            .select(&title_link)
             .next()
+            .or_else(|| li.select(&fallback_link).next())
             .or_else(|| li.select(&sel("a[href]")).next())
         else {
             continue;
@@ -418,7 +426,7 @@ fn parse_ddg(doc: &Html) -> Vec<Hit> {
 }
 
 fn parse_ddg_lite(doc: &Html) -> Vec<Hit> {
-    // Lite: a table — result-link anchors then snippet tds.
+    // Lite: a table : result-link anchors then snippet tds.
     let links = sel("a.result-link");
     let snippets = sel("td.result-snippet");
     let snippet_vec: Vec<String> = doc.select(&snippets).map(text).collect();
@@ -472,7 +480,7 @@ fn parse_mojeek(doc: &Html) -> Vec<Hit> {
 
 /// Yahoo redirect links: r.search.yahoo.com/...RU=REAL_URL
 /// or r.search.yahoo.com/..._url=REAL_URL. Decode to the
-/// real URL — consensus matching depends on every engine
+/// real URL : consensus matching depends on every engine
 /// reporting the SAME url.
 ///
 /// Yahoo embeds tracking parameters (/RK=, /RS=, /RV=) inside
@@ -501,7 +509,7 @@ fn decode_yahoo(href: &str) -> String {
             return strip_yahoo_tracking(&decoded);
         }
     }
-    // Can't decode — return empty so the parser's `starts_with("http")`
+    // Can't decode : return empty so the parser's `starts_with("http")`
     // check filters it out. Previously this returned the raw Yahoo
     // SERP URL, which leaked search.yahoo.com/search?p=... as a result.
     String::new()
@@ -539,12 +547,12 @@ fn parse_yahoo(doc: &Html) -> Vec<Hit> {
         if !url.starts_with("http") {
             continue;
         }
-        let title = text(a);
-        let title = if title.is_empty() {
-            item.select(&h3).next().map(text).unwrap_or_default()
-        } else {
-            title
-        };
+        // Yahoo nests the breadcrumb and the h3 inside the same outer link.
+        // `text(a)` therefore concatenates site name + URL + real title. Use
+        // the dedicated heading first and retain the outer text only as a
+        // fallback for older layouts without an h3.
+        let heading = item.select(&h3).next().map(text).unwrap_or_default();
+        let title = if heading.is_empty() { text(a) } else { heading };
         let snippet = item.select(&cap).next().map(text).unwrap_or_default();
         if !title.is_empty() {
             hits.push(Hit {
@@ -563,7 +571,8 @@ fn parse_yahoo(doc: &Html) -> Vec<Hit> {
 pub fn serp_url(engine: &str, query: &str) -> Option<String> {
     let q = url::form_urlencoded::byte_serialize(query.as_bytes()).collect::<String>();
     match engine {
-        "google" => Some(format!(
+        "google" => Some(google_wml::url(query)),
+        "google_ghost" => Some(format!(
             "https://www.google.com/search?q={q}&hl=en&gl=us&num=15&ie=utf-8&oe=utf-8"
         )),
         "brave" => Some(format!("https://search.brave.com/search?q={q}")),
@@ -581,6 +590,20 @@ pub fn serp_url(engine: &str, query: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn google_http_and_browser_keep_distinct_endpoints_and_parsers() {
+        assert!(serp_url("google", "rust").unwrap().contains("/wml/search?"));
+        assert!(
+            serp_url("google_ghost", "rust")
+                .unwrap()
+                .contains("/search?")
+        );
+        assert!(!serp_url("google_ghost", "rust").unwrap().contains("/wml/"));
+        let desktop = r#"<div class="g"><a href="https://example.org/"><h3>Title</h3></a><div class="VwiEFb">Snippet</div></div>"#;
+        assert_eq!(parse("google_ghost", desktop).len(), 1);
+        assert!(parse("google", desktop).is_empty());
+    }
 
     #[test]
     fn serp_url_detection() {
@@ -648,6 +671,70 @@ mod tests {
     }
 
     #[test]
+    fn bing_decodes_live_unpadded_redirects() {
+        // `u=` values from a live SERP (2026-09-26): URL-safe alphabet,
+        // `a1` prefix, `=` padding stripped, so the last group can be
+        // 2, 3 or 4 symbols long. One case per tail length.
+        let ck = |u: &str| format!("https://www.bing.com/ck/a?!&&p=abc&ptn=3&ver=2&u=a1{u}&ntb=1");
+        for (u, url) in [
+            (
+                "aHR0cHM6Ly9kb2NzLnJzL2Jhc2U2NC9sYXRlc3QvYmFzZTY0Lw",
+                "https://docs.rs/base64/latest/base64/",
+            ),
+            (
+                "aHR0cHM6Ly9kb2NzLnJzL2NyYXRlL2Jhc2U2NC9sYXRlc3Q",
+                "https://docs.rs/crate/base64/latest",
+            ),
+            (
+                "aHR0cHM6Ly9naXRodWIuY29tL21hcnNoYWxscGllcmNlL3J1c3QtYmFzZTY0",
+                "https://github.com/marshallpierce/rust-base64",
+            ),
+        ] {
+            assert_eq!(decode_bing(&ck(u)), url, "{u}");
+        }
+    }
+
+    #[test]
+    fn bing_decode_uses_the_url_safe_alphabet() {
+        // `-` and `_` are 62 and 63 in base64url; the standard `+`/`/`
+        // alphabet would reject both.
+        assert_eq!(
+            base64url_decode("aHR0cHM6Ly9leGFtcGxlLmNvbS9hP2I9fn5-Pg").as_deref(),
+            Some("https://example.com/a?b=~~~>")
+        );
+        // The vertical-nav stubs in tests/fixtures/bing-serp.html decode
+        // to a relative path, which decode_bing then drops.
+        assert_eq!(
+            base64url_decode("L2ltYWdlcy9zZWFyY2g_cT10ZXN0K3F1ZXJ5JkZPUk09SERSU0My").as_deref(),
+            Some("/images/search?q=test+query&FORM=HDRSC2")
+        );
+        assert_eq!(
+            decode_bing(
+                "https://www.bing.com/ck/a?!&&p=x&u=a1L2ltYWdlcy9zZWFyY2g_cT10ZXN0K3F1ZXJ5JkZPUk09SERSU0My&ntb=1"
+            ),
+            ""
+        );
+    }
+
+    #[test]
+    fn bing_decode_is_lenient_like_the_hand_rolled_decoder() {
+        // Padded and unpadded forms decode alike.
+        assert_eq!(base64url_decode("aHR0cA==").as_deref(), Some("http"));
+        assert_eq!(base64url_decode("aHR0cA").as_deref(), Some("http"));
+        // Nonzero unused bits in the last symbol (`B` instead of `A`)
+        // are ignored rather than rejected.
+        assert_eq!(base64url_decode("aHR0cB").as_deref(), Some("http"));
+        // Standard-alphabet symbols and invalid UTF-8 are rejected, as
+        // before.
+        assert_eq!(base64url_decode("aHR0cA+/"), None);
+        assert_eq!(base64url_decode("_w"), None);
+        // A lone trailing symbol carries only 6 bits and no encoder
+        // emits one. The old decoder guessed a byte from it ("htt" +
+        // 'p' here); now the input is refused.
+        assert_eq!(base64url_decode("aHR0c"), None);
+    }
+
+    #[test]
     fn parse_filters_serp_urls() {
         // Yahoo HTML with a SERP self-link mixed in with real results.
         let html = r#"
@@ -666,5 +753,69 @@ mod tests {
         assert_eq!(hits.len(), 1, "SERP URL should be filtered, got {hits:?}");
         assert_eq!(hits[0].url, "https://doc.rust-lang.org/book");
         assert_eq!(hits[0].title, "The Rust Book");
+    }
+
+    #[test]
+    fn bing_prefers_result_heading_over_earlier_attribution_link() {
+        let html = r#"
+        <html><body><ol>
+          <li class="b_algo">
+            <div class="b_tpcn">
+              <a class="tilk" href="https://www.bing.com/site-attribution">
+                <span>rust-lang.org</span><cite>https://doc.rust-lang.org › book</cite>
+              </a>
+            </div>
+            <h2><a href="https://doc.rust-lang.org/book/">The Rust Programming Language</a></h2>
+            <div class="b_caption"><p>Learn Rust ownership and borrowing.</p></div>
+          </li>
+        </ol></body></html>
+        "#;
+        let hits = parse("bing", html);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].title, "The Rust Programming Language");
+        assert_eq!(hits[0].url, "https://doc.rust-lang.org/book/");
+        assert!(!hits[0].title.contains("https://"));
+    }
+
+    #[test]
+    fn yahoo_extracts_heading_instead_of_outer_link_breadcrumb() {
+        let html = r#"
+        <html><body>
+          <div class="compTitle options-toggle">
+            <a data-matarget="algo" href="https://example.com/ownership">
+              <div><span>Example</span>https://example.com › ownership</div>
+              <h3 class="title"><span>Understanding Ownership</span></h3>
+            </a>
+            <div class="compText"><p>A focused explanation.</p></div>
+          </div>
+        </body></html>
+        "#;
+        let hits = parse("yahoo", html);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].title, "Understanding Ownership");
+        assert!(!hits[0].title.contains("https://"));
+    }
+}
+
+#[cfg(test)]
+mod visible_text_guard_tests {
+    use super::*;
+
+    // #288's class, search side: a script/style subtree inside a SERP
+    // cell is source, never snippet text.
+    #[test]
+    fn snippets_never_carry_script_text() {
+        let doc =
+            Html::parse_fragment("<div>Result title<script>window.r=1;</script> and body</div>");
+        let root = doc.root_element();
+        let el = root
+            .children()
+            .filter_map(scraper::ElementRef::wrap)
+            .next()
+            .unwrap();
+        let t = text(el);
+        assert!(!t.contains("window.r"), "{t}");
+        assert!(t.contains("Result title"), "{t}");
+        assert!(t.contains("and body"), "{t}");
     }
 }

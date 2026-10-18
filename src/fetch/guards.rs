@@ -11,11 +11,11 @@ use std::net::IpAddr;
 ///
 /// Handles literal IPs and well-known localhost names. This
 /// is a synchronous helper that only handles literal/obvious
-/// names — hostname DNS safety is enforced by the async
+/// names : hostname DNS safety is enforced by the async
 /// `ensure_url_safe` which resolves hostnames and rejects
 /// private addresses.
 pub fn is_ssrf_host(host: &str) -> bool {
-    // url::Url::host_str() keeps brackets on IPv6 literals —
+    // url::Url::host_str() keeps brackets on IPv6 literals :
     // strip them so the IP parser actually sees an IP.
     let unbracketed = host
         .strip_prefix('[')
@@ -43,6 +43,34 @@ pub fn is_ssrf_ip(ip: &IpAddr) -> bool {
     is_private_ip(ip)
 }
 
+/// IP-level SSRF check for DNS-resolved addresses (post-resolution
+/// pinning tier): same strictness as `is_ssrf_ip` EXCEPT the RFC
+/// 2544 benchmarking block 198.18.0.0/15. Fake-ip TUN networks
+/// (mihomo/Clash/Surge/etc.) map every hostname into that block and
+/// route the actual dial through the TUN device; treating it as
+/// private bricks the tool for those users while protecting nothing:
+/// the block is an IETF-reserved no-service range, not a reachable
+/// private network. Every real SSRF surface (RFC 1918, loopback,
+/// link-local, CGNAT, ULA, documentation ranges) stays blocked at
+/// the resolved tier. Literal 198.18.x in a URL stays blocked via
+/// `is_ssrf_ip`: a literal has no legitimate destination.
+pub fn is_ssrf_resolved_ip(ip: &IpAddr) -> bool {
+    if let IpAddr::V4(v4) = ip {
+        let o = v4.octets();
+        if o[0] == 198 && (o[1] == 18 || o[1] == 19) {
+            return false;
+        }
+    }
+    is_private_ip(ip)
+}
+
+/// Escape hatch for deliberate private egress (CLI power users,
+/// local services): DONSETCH_ALLOW_PRIVATE_EGRESS must be explicitly
+/// true to disable the SSRF guard chain end to end. Default off.
+pub(crate) fn private_egress_allowed() -> bool {
+    crate::config::cfg().fetch.allow_private_egress
+}
+
 fn is_private_ip(ip: &IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
@@ -58,11 +86,11 @@ fn is_private_ip(ip: &IpAddr) -> bool {
                 || (v4.octets()[0] == 0) // 0.0.0.0/8 (software)
                 // Carrier-grade NAT: 100.64.0.0/10
                 || (v4.octets()[0] == 100 && (v4.octets()[1] & 0xc0) == 0x40)
-                // 192.88.99.0/24 (6to4 relay anycast) — deprecated/reserved
+                // 192.88.99.0/24 (6to4 relay anycast) : deprecated/reserved
                 || (v4.octets()[0] == 192 && v4.octets()[1] == 88 && v4.octets()[2] == 99)
         }
         IpAddr::V6(v6) => {
-            // IPv4-mapped (::ffff:a.b.c.d) is the v4 address —
+            // IPv4-mapped (::ffff:a.b.c.d) is the v4 address :
             // check it as v4 or it slips past every v6 rule.
             if let Some(v4) = v6.to_ipv4_mapped() {
                 return is_private_ip(&IpAddr::V4(v4));
@@ -76,6 +104,19 @@ fn is_private_ip(ip: &IpAddr) -> bool {
                 if segs[0] == 0 && segs[1] == 0 && segs[2] == 0 && segs[3] == 0 && segs[4] == 0 {
                     return is_private_ip(&IpAddr::V4(v4));
                 }
+            }
+            // Translated / tunnelled forms carry a v4 address in the
+            // low bits, and the box that turns them back into v4
+            // packets sits INSIDE the network: NAT64 (RFC 6052
+            // well-known 64:ff9b::/96, RFC 8215 local-use
+            // 64:ff9b:1::/48) is how IPv6-only hosts reach v4 at all,
+            // so 64:ff9b::a9fe:a9fe is 169.254.169.254 there. 6to4
+            // (2002:V4::/16) embeds it in the next 32 bits. Judge the
+            // embedded address, as the mapped form above is judged.
+            if let Some(v4) = embedded_ipv4(v6)
+                && is_private_ip(&IpAddr::V4(v4))
+            {
+                return true;
             }
             v6.is_loopback()
                 || v6.is_unspecified()
@@ -93,37 +134,80 @@ fn is_private_ip(ip: &IpAddr) -> bool {
     }
 }
 
+/// The IPv4 address a NAT64 or 6to4 IPv6 address stands for, if any.
+fn embedded_ipv4(v6: &std::net::Ipv6Addr) -> Option<std::net::Ipv4Addr> {
+    let s = v6.segments();
+    let low = |a: u16, b: u16| std::net::Ipv4Addr::from(((a as u32) << 16) | b as u32);
+    // NAT64 well-known prefix 64:ff9b::/96 and local-use 64:ff9b:1::/48.
+    if s[0] == 0x0064 && s[1] == 0xff9b {
+        if s[2..6] == [0, 0, 0, 0] {
+            return Some(low(s[6], s[7]));
+        }
+        if s[2] == 0x0001 {
+            return Some(low(s[6], s[7]));
+        }
+    }
+    // 6to4: 2002:AABB:CCDD::/48 stands for AA.BB.CC.DD.
+    if s[0] == 0x2002 {
+        return Some(low(s[1], s[2]));
+    }
+    None
+}
+
 /// Centralized URL safety check (synchronous part).
 ///
 /// Validates:
 /// - scheme is http or https only
 /// - no credentials in URL (username/password)
 /// - host present and not SSRF (literal IP ranges, localhost names)
+/// - not denied by the installed local rules (`crate::rules::rules()`):
+///   a winning `deny` rule returns `FetchError::Denied`
 /// - does NOT do DNS resolution (use `ensure_url_safe` for that)
 ///
 /// Returns the parsed Url on success, or a FetchError that the
 /// caller should surface directly. This is the single sync gate
 /// used by both fetch and browser tiers.
 pub fn validate_url_basic(url_str: &str) -> Result<url::Url, crate::error::FetchError> {
+    validate_url_basic_with_policy(url_str, private_egress_allowed(), crate::rules::rules())
+}
+
+/// The sync guard core behind `validate_url_basic` and
+/// `ensure_url_safe`, with the egress policy and the ruleset passed in.
+/// Order: parse, scheme, credentials, host present, rule denial, SSRF
+/// host. Only a winning `deny` rule refuses; an `allow` winner passes
+/// the URL exactly as an empty ruleset would. `allow_private_egress`
+/// does not lift a denial.
+pub(crate) fn validate_url_basic_with_policy(
+    url_str: &str,
+    allow_private_egress: bool,
+    rules: &crate::rules::RuleSet,
+) -> Result<url::Url, crate::error::FetchError> {
     let url = url::Url::parse(url_str)
         .map_err(|_| crate::error::FetchError::InvalidUrl(url_str.into()))?;
     let scheme = url.scheme();
     if scheme != "http" && scheme != "https" {
-        return Err(crate::error::FetchError::Http(format!(
-            "blocked: scheme {scheme} not allowed — only http/https"
+        return Err(crate::error::FetchError::Ssrf(format!(
+            "scheme {scheme} not allowed : only http/https : blocked by design"
         )));
     }
     if !url.username().is_empty() || url.password().is_some() {
-        return Err(crate::error::FetchError::Http(
-            "blocked: URL contains credentials — SSRF guard".into(),
+        return Err(crate::error::FetchError::Ssrf(
+            "URL contains credentials : SSRF guard".into(),
         ));
     }
     let host = url
         .host_str()
         .ok_or_else(|| crate::error::FetchError::InvalidUrl(url_str.into()))?;
-    if is_ssrf_host(host) {
-        return Err(crate::error::FetchError::Http(format!(
-            "blocked: {host} is a private/loopback address — SSRF guard"
+    // The operator's rules run before the SSRF host check so a denied
+    // host reports the rule, not a private-address block, and before
+    // any DNS work in `ensure_url_safe`. Moving or changing this check
+    // needs the same change in docs/rules-architecture.md.
+    if let Some(denial) = rules.denial(&url) {
+        return Err(denial.into_error(url.as_str()));
+    }
+    if is_ssrf_host(host) && !allow_private_egress {
+        return Err(crate::error::FetchError::Ssrf(format!(
+            "{host} is a private/loopback address : SSRF guard (set DONSETCH_ALLOW_PRIVATE_EGRESS to override)"
         )));
     }
     // Also check host_str for bracketed IPv6 that Url keeps brackets on? is_ssrf_host handles it.
@@ -150,53 +234,44 @@ pub fn validate_url_basic(url_str: &str) -> Result<url::Url, crate::error::Fetch
 /// The transport layer (`transport::tcp::happy_connect`) re-validates
 /// resolved addresses at connect time and filters private IPs, so
 /// an attacker that returns public at validation and private at
-/// connect is still blocked at connect. However, without full
-/// DNS pinning (reusing the validated IPs for the connect) there
-/// is a residual window between the two resolutions. Full pinning
-/// is not implemented; this is documented as a residual limitation.
+/// connect is still blocked at connect. Both sides now resolve through
+/// `transport::dns`, so inside the cache TTL they see the SAME answer,
+/// which narrows the window to one answer per TTL instead of one per
+/// step; outside it, the window between the two resolutions remains.
+/// Full DNS pinning (forcing the dial onto the validated addresses) is
+/// still not implemented.
 /// Redirects are re-validated per hop via `validate_redirect_url`
 /// (sync) and `ensure_url_safe` (async) where applicable.
 pub async fn ensure_url_safe(url_str: &str) -> Result<url::Url, crate::error::FetchError> {
-    let url = validate_url_basic(url_str)?;
+    let allow_private_egress = private_egress_allowed();
+    let url = validate_url_basic_with_policy(url_str, allow_private_egress, crate::rules::rules())?;
+    // Deliberate opt-out: skip the DNS resolution tier entirely.
+    if allow_private_egress {
+        return Ok(url);
+    }
     let host: String = url.host_str().unwrap_or("").to_owned();
     // Literal IP already blocked by validate_url_basic; only hostnames need DNS.
     // Fail closed on resolution errors for browser/network navigation.
+    // Resolved through the shared cache (transport::dns): the connect that
+    // follows this check asks for the same name, and the resolver is a
+    // network round trip on a box with no local caching daemon.
     let port = url.port_or_known_default().unwrap_or(443);
-    let lookup = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        tokio::net::lookup_host((host.as_str(), port)),
-    )
-    .await;
-    match lookup {
-        Ok(Ok(addrs)) => {
-            let mut any = false;
-            for addr in addrs {
-                any = true;
-                if is_ssrf_ip(&addr.ip()) {
-                    return Err(crate::error::FetchError::Http(format!(
-                        "blocked: {host} resolves to private/loopback address {} — SSRF guard",
-                        addr.ip()
-                    )));
-                }
-            }
-            if !any {
-                return Err(crate::error::FetchError::Http(format!(
-                    "blocked: {host} DNS returned no addresses — fail-closed SSRF guard"
-                )));
-            }
-            Ok(url)
+    for addr in crate::transport::dns::resolve(&host, port).await? {
+        if is_ssrf_resolved_ip(&addr.ip()) {
+            return Err(crate::error::FetchError::Ssrf(format!(
+                "{host} resolves to private/loopback address {} : SSRF guard (set DONSETCH_ALLOW_PRIVATE_EGRESS to override)",
+                addr.ip()
+            )));
         }
-        Ok(Err(e)) => Err(crate::error::FetchError::Http(format!(
-            "blocked: DNS resolution failed for {host}: {e} — fail-closed SSRF guard"
-        ))),
-        Err(_) => Err(crate::error::FetchError::Http(format!(
-            "blocked: DNS resolution timeout for {host} — fail-closed SSRF guard"
-        ))),
     }
+    Ok(url)
 }
 
 /// Validate a redirect target URL string relative to a base URL.
-/// Rejects non-http(s) schemes and SSRF hosts. Used per redirect hop.
+/// Used per redirect hop. A non-http(s) scheme is
+/// `FetchError::NonHttpRedirect` carrying the scheme; everything else
+/// is judged by `validate_url_basic` (credentials, SSRF hosts, local
+/// rules, so a hop into a denied host is `FetchError::Denied`).
 pub fn validate_redirect_url(
     base: &url::Url,
     location: &str,
@@ -205,10 +280,9 @@ pub fn validate_redirect_url(
         .join(location)
         .map_err(|_| crate::error::FetchError::Http(format!("bad redirect target: {location}")))?;
     if !matches!(next.scheme(), "http" | "https") {
-        return Err(crate::error::FetchError::Http(format!(
-            "blocked redirect to non-http(s) scheme: {}",
-            next.scheme()
-        )));
+        return Err(crate::error::FetchError::NonHttpRedirect(
+            next.scheme().to_string(),
+        ));
     }
     // Apply centralized validation to the joined URL so missing hosts
     // and credentials are rejected consistently with direct fetches.
@@ -271,7 +345,6 @@ pub fn is_binary_body(body: &[u8]) -> bool {
         b"\x89PNG",
         b"\xff\xd8\xff",
         b"GIF8",
-        b"BM",
         b"\x1f\x8b",
         b"PK\x03\x04",
         b"\x7fELF",
@@ -284,6 +357,16 @@ pub fn is_binary_body(body: &[u8]) -> bool {
         if body.starts_with(m) {
             return true;
         }
+    }
+    // BMP is a bare 2-byte "BM" + a 4-byte LE file size. A text/plain
+    // document can also start with "BM" ("BMW..."), so require the
+    // declared size field to be plausible against the body length
+    // (E16); anything else falls through to the byte statistics below.
+    if body.len() >= 6
+        && body.starts_with(b"BM")
+        && u32::from_le_bytes([body[2], body[3], body[4], body[5]]) as usize <= body.len()
+    {
+        return true;
     }
     let scan = &body[..body.len().min(1024)];
     let nulls = scan.iter().filter(|&&b| b == 0).count();
@@ -299,6 +382,19 @@ pub fn is_binary(body: &[u8], content_type: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn bm_text_prefix_is_not_binary_but_real_bmp_is() {
+        // A plain-text article starting with "BM": declared size field
+        // is nonsense against the body length -> text.
+        let text = b"BMW just unveiled the 2027 iX5 with 800km range";
+        assert!(!is_binary_body(text), "E16: BM text false positive");
+        // A real BMP: header size field = plausible file length.
+        let mut bmp = b"BM".to_vec();
+        bmp.extend_from_slice(&100u32.to_le_bytes());
+        bmp.extend_from_slice(&[0u8; 96]);
+        assert!(is_binary_body(&bmp), "real BMP still binary");
+    }
     use super::*;
 
     #[test]
@@ -349,6 +445,53 @@ mod tests {
         assert!(is_ssrf_host("[::ffff:10.0.0.1]"));
         assert!(is_ssrf_host("[fd12:3456::1]"));
         assert!(is_ssrf_host("[fe80::1]"));
+    }
+
+    // End to end through the async tier: the literal now reaches
+    // dns::resolve as an answer (no lookup) and is judged there too.
+    #[tokio::test]
+    async fn ensure_url_safe_refuses_a_nat64_literal_and_reads_a_public_v6_literal() {
+        let e = ensure_url_safe("http://[64:ff9b::a9fe:a9fe]/")
+            .await
+            .unwrap_err();
+        assert!(matches!(e, crate::error::FetchError::Ssrf(_)), "{e:?}");
+        let e = ensure_url_safe("http://[::1]:8799/").await.unwrap_err();
+        assert!(matches!(e, crate::error::FetchError::Ssrf(_)), "{e:?}");
+        // A public v6 literal used to die here with Dns("[2606:...]").
+        let u = ensure_url_safe("http://[2606:4700::1111]/").await.unwrap();
+        assert_eq!(u.host_str(), Some("[2606:4700::1111]"));
+    }
+
+    // A NAT64 translator delivers 64:ff9b::<v4> to <v4> from inside
+    // the network; 6to4 embeds the v4 address the same way. The
+    // embedded address is judged like the mapped form, at every tier
+    // (literal, resolved AAAA, connect-time filter share this
+    // predicate).
+    #[test]
+    fn ssrf_blocks_nat64_and_6to4_embedding_a_private_v4() {
+        // NAT64 well-known prefix: metadata, loopback, RFC1918.
+        assert!(is_ssrf_host("[64:ff9b::a9fe:a9fe]"));
+        assert!(is_ssrf_host("[64:ff9b::7f00:1]"));
+        assert!(is_ssrf_host("[64:ff9b::169.254.169.254]"));
+        assert!(is_ssrf_host("[64:ff9b::10.0.0.1]"));
+        // RFC 8215 local-use prefix.
+        assert!(is_ssrf_host("[64:ff9b:1::7f00:1]"));
+        assert!(is_ssrf_host("[64:ff9b:1:abcd::a9fe:a9fe]"));
+        // 6to4 with an embedded loopback / link-local.
+        assert!(is_ssrf_host("[2002:7f00:1::1]"));
+        assert!(is_ssrf_host("[2002:a9fe:a9fe::]"));
+        // The same forms around a public v4 stay reachable.
+        assert!(!is_ssrf_host("[64:ff9b::5db8:d822]")); // 93.184.216.34
+        assert!(!is_ssrf_host("[64:ff9b:1::5db8:d822]"));
+        assert!(!is_ssrf_host("[2002:5db8:d822::1]"));
+        // Neighbouring prefixes are ordinary global addresses.
+        assert!(!is_ssrf_host("[64:ff9c::7f00:1]"));
+        assert!(!is_ssrf_host("[2003:7f00:1::1]"));
+        let ip: IpAddr = "64:ff9b::a9fe:a9fe".parse().unwrap();
+        assert!(
+            is_ssrf_resolved_ip(&ip),
+            "a resolved AAAA is judged the same way"
+        );
     }
 
     #[test]
@@ -494,9 +637,127 @@ mod tests {
         let base = url::Url::parse("https://example.com/").unwrap();
         assert!(validate_redirect_url(&base, "http://127.0.0.1/evil").is_err());
         assert!(validate_redirect_url(&base, "http://10.0.0.1/").is_err());
-        assert!(validate_redirect_url(&base, "file:///etc/passwd").is_err());
+        assert!(matches!(
+            validate_redirect_url(&base, "file:///etc/passwd"),
+            Err(crate::error::FetchError::NonHttpRedirect(ref s)) if s == "file"
+        ));
         assert!(validate_redirect_url(&base, "https://example.com/other").is_ok());
         assert!(validate_redirect_url(&base, "/relative").is_ok());
+    }
+
+    // The non-web scheme has its own variant so the redirect loop can
+    // tell it apart without reading text; an SSRF hop keeps `Ssrf`.
+    #[test]
+    fn a_non_http_redirect_is_its_own_variant() {
+        let base = url::Url::parse("https://example.com/").unwrap();
+        assert!(matches!(
+            validate_redirect_url(&base, "mailto:someone@example.com"),
+            Err(crate::error::FetchError::NonHttpRedirect(ref s)) if s == "mailto"
+        ));
+        assert!(matches!(
+            validate_redirect_url(&base, "http://127.0.0.1/evil"),
+            Err(crate::error::FetchError::Ssrf(_))
+        ));
+    }
+
+    fn compiled_rules(section: serde_json::Value) -> crate::rules::RuleSet {
+        let section: crate::rules::RulesSection = serde_json::from_value(section).unwrap();
+        crate::rules::RuleSet::compile(&section).unwrap()
+    }
+
+    fn banned_deny() -> crate::rules::RuleSet {
+        compiled_rules(serde_json::json!({
+            "url": {
+                "banned.example": {
+                    "action": "deny",
+                    "reason": "ip_ban",
+                    "message": "use BladeBrowser for this site, or ask the human operator to download the file",
+                },
+            },
+        }))
+    }
+
+    // Pure: the ruleset is compiled locally and passed in, so this runs
+    // on any runner without installing a config.
+    #[test]
+    fn a_denied_host_is_refused_with_the_rule_payload() {
+        let rules = banned_deny();
+        for target in [
+            "https://banned.example/",
+            "https://www.banned.example/publication/123_Example",
+            "http://www.banned.example:8443/x?y=1",
+        ] {
+            let e = validate_url_basic_with_policy(target, false, &rules).unwrap_err();
+            let crate::error::FetchError::Denied {
+                rule,
+                message,
+                kind,
+                reason,
+                url,
+            } = &e
+            else {
+                panic!("{target}: expected Denied, got {e:?}");
+            };
+            assert_eq!(rule, "banned.example");
+            assert!(message.starts_with("use BladeBrowser"), "{message}");
+            assert_eq!(*kind, "walled");
+            assert_eq!(reason.as_deref(), Some("ip_ban"));
+            assert_eq!(url, target);
+        }
+        // The private-egress opt-out lifts the SSRF guard, not a rule.
+        assert!(matches!(
+            validate_url_basic_with_policy("https://www.banned.example/", true, &rules),
+            Err(crate::error::FetchError::Denied { .. })
+        ));
+    }
+
+    #[test]
+    fn an_allowed_host_passes_a_ruleset_unchanged() {
+        let rules = banned_deny();
+        let u = validate_url_basic_with_policy("https://example.com/a?b=1", false, &rules).unwrap();
+        assert_eq!(u.as_str(), "https://example.com/a?b=1");
+        // A lookalike host is not a subdomain of the rule's host.
+        assert!(
+            validate_url_basic_with_policy("https://notbanned.example/", false, &rules).is_ok()
+        );
+        // An allow winner passes exactly as no rule would.
+        let carve_out = compiled_rules(serde_json::json!({
+            "url": {
+                "banned.example": { "action": "deny", "message": "go elsewhere" },
+                ".banned.example": { "action": "allow" },
+            },
+        }));
+        assert!(
+            validate_url_basic_with_policy("https://banned.example/", false, &carve_out).is_ok()
+        );
+        assert!(matches!(
+            validate_url_basic_with_policy("https://www.banned.example/", false, &carve_out),
+            Err(crate::error::FetchError::Denied { .. })
+        ));
+        // The empty set changes nothing.
+        let empty = crate::rules::RuleSet::empty();
+        assert!(
+            validate_url_basic_with_policy("https://www.banned.example/", false, &empty).is_ok()
+        );
+    }
+
+    // The scheme and credential checks run before the rules, and the
+    // SSRF host check still applies to hosts no rule names.
+    #[test]
+    fn the_rule_check_sits_between_the_url_checks_and_the_ssrf_check() {
+        let rules = banned_deny();
+        assert!(matches!(
+            validate_url_basic_with_policy("ftp://banned.example/", false, &rules),
+            Err(crate::error::FetchError::Ssrf(_))
+        ));
+        assert!(matches!(
+            validate_url_basic_with_policy("https://user:pw@banned.example/", false, &rules),
+            Err(crate::error::FetchError::Ssrf(_))
+        ));
+        assert!(matches!(
+            validate_url_basic_with_policy("http://127.0.0.1/", false, &rules),
+            Err(crate::error::FetchError::Ssrf(_))
+        ));
     }
 
     #[tokio::test]
@@ -523,10 +784,89 @@ mod tests {
         // This proves we do not swallow DNS errors for browser tier.
         let res = ensure_url_safe("https://this-host-does-not-exist-12345.invalid/").await;
         assert!(res.is_err(), "non-resolvable host must fail closed, got Ok");
-        let msg = res.unwrap_err().to_string().to_lowercase();
+        let err = res.unwrap_err();
+        // #248: fail closed, but as a NAME failure. This used to be an
+        // `Http` string ending in "fail-closed SSRF guard", which the tool
+        // classifier mapped back to `guard.ssrf`: an agent read a typo as
+        // a target forbidden by policy.
         assert!(
-            msg.contains("dns") || msg.contains("fail-closed") || msg.contains("blocked"),
-            "error must mention DNS/fail-closed, got: {msg}"
+            matches!(err, crate::error::FetchError::Dns(_)),
+            "a host that does not resolve is a DNS failure, got {err:?}"
         );
+        assert!(
+            !format!("{err}").to_lowercase().contains("ssrf"),
+            "a resolution failure must not read as a policy block: {err}"
+        );
+    }
+
+    // ---- fake-ip / RFC 2544 tiering (issue #83) ----
+
+    #[test]
+    fn rfc2544_resolved_tier_allows_fake_ip_block() {
+        // Fake-ip TUN networks (mihomo/Clash/Surge) resolve every
+        // hostname into 198.18.0.0/15. The resolved tier must pass
+        // those; the literal tier must keep blocking them.
+        for addr in [
+            "198.18.0.0",
+            "198.18.0.25",
+            "198.18.255.255",
+            "198.19.0.1",
+            "198.19.255.254",
+        ]
+        .iter()
+        .map(|a| a.parse::<IpAddr>().unwrap())
+        {
+            assert!(
+                !is_ssrf_resolved_ip(&addr),
+                "resolved tier must allow fake-ip fabric address {addr}"
+            );
+            assert!(is_ssrf_ip(&addr), "literal tier must still block {addr}");
+        }
+    }
+
+    #[test]
+    fn resolved_tier_still_blocks_real_private_ranges() {
+        for addr in [
+            "10.0.0.1",
+            "192.168.1.1",
+            "172.16.0.1",
+            "172.31.255.255",
+            "169.254.169.254",
+            "100.64.0.1",
+            "0.0.0.0",
+            "224.0.0.1",
+            "255.255.255.255",
+            "240.0.0.1",
+            "192.0.2.1",
+            "198.51.100.1",
+            "203.0.113.1",
+            "192.88.99.1",
+            "::1",
+            "fe80::1",
+            "fc00::1",
+            "fd12:3456::1",
+            "2001:db8::1",
+        ]
+        .iter()
+        .map(|a| a.parse::<IpAddr>().unwrap())
+        {
+            assert!(
+                is_ssrf_resolved_ip(&addr),
+                "resolved tier must keep blocking {addr}"
+            );
+        }
+    }
+
+    #[test]
+    fn private_egress_policy_controls_literal_guard() {
+        for target in [
+            "http://127.0.0.1/",
+            "http://198.18.0.25/",
+            "http://[::ffff:169.254.169.254]/",
+        ] {
+            let rules = crate::rules::RuleSet::empty();
+            assert!(validate_url_basic_with_policy(target, true, &rules).is_ok());
+            assert!(validate_url_basic_with_policy(target, false, &rules).is_err());
+        }
     }
 }

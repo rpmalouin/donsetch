@@ -1,4 +1,4 @@
-//! Tables 2.0 — pixel-fused structure detection.
+//! Tables 2.0 : pixel-fused structure detection.
 //!
 //! v1 guessed columns from text gaps alone. v2 never guesses: every cut
 //! must be backed by evidence, and the evidence is ranked:
@@ -194,7 +194,7 @@ fn build_table(run: &[Line], fusion: Option<&FusionData>) -> Option<Block> {
     cuts.sort_by(|a, b| a.x.total_cmp(&b.x));
     // Bar: pixel-backed cuts pass on one vote; a pure-text cut needed the
     // v1 bar (n >= need) to enter at all. When ALL three sources disagree
-    // wildly (no overlap), votes stay 1 everywhere — that's fine, each
+    // wildly (no overlap), votes stay 1 everywhere : that's fine, each
     // source alone is still evidence; garbage is filtered by the straddle
     // audit below.
     if cuts.is_empty() {

@@ -1,4 +1,4 @@
-//! DonSeek — keyless multi-engine search.
+//! DonSeek : keyless multi-engine search.
 //!
 //! Intent → fan-out (engines across egresses + verticals
 //! direct) → weighted RRF merge → ranked results with
@@ -8,35 +8,75 @@ pub mod byok;
 pub mod coverage;
 pub mod egress;
 pub mod engines;
+pub mod instant;
 pub mod intent;
+pub mod query;
 pub mod rank;
 pub mod rerank;
 pub mod verticals;
 
 mod authority;
+mod enrich;
+mod persist;
+mod render;
+mod tasks;
+
+pub use persist::load_for_status as persist_load_for_status;
+pub use persist::load_outcome_for_status as persist_load_outcome_for_status;
+pub use persist::load_quality_for_status as persist_load_quality_for_status;
+pub use persist::outcome_class;
+
+pub use render::{render_compact_markdown, render_markdown, render_meta};
+
+use enrich::PrewarmCache;
+use persist::{
+    OutcomeMap, QualityMap, load_cache_disk, load_health_disk, load_outcome_disk,
+    load_quality_disk, save_cache_disk, save_health_disk_if_dirty, save_outcome_disk_if_dirty,
+    save_quality_disk_if_dirty,
+};
+use tasks::{EngineResult, TaskFut, engine_task, ghost_engine_task, vertical_task};
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use serde_json::{Value, json};
-
-use crate::detect::walls::Verdict;
 use crate::error::FetchError;
 use crate::fetch::client::Fetcher;
 
 use egress::EgressPool;
 use intent::Intent;
 use rank::Merged;
-use scraper::Selector;
 
 const ENGINE_TIMEOUT: Duration = Duration::from_secs(8);
+const RETRY_TIMEOUT: Duration = Duration::from_secs(3);
+
+tokio::task_local! {
+    pub(crate) static SEARCH_DEADLINE: Option<tokio::time::Instant>;
+}
+
+fn stage_budget(cap: Duration, reserve: Duration) -> Duration {
+    SEARCH_DEADLINE
+        .try_with(|deadline| {
+            deadline.map_or(cap, |deadline| {
+                cap.min(
+                    deadline
+                        .saturating_duration_since(tokio::time::Instant::now())
+                        .saturating_sub(reserve),
+                )
+            })
+        })
+        .unwrap_or(cap)
+}
+
+/// Chronic-failure bench time. A walled engine stops wasting a
+/// fan-out slot for this long after 3 consecutive strikes.
+const QUARANTINE_TTL: Duration = Duration::from_secs(600);
 
 /// Intent + recency-aware cache TTL. Every cached query
-/// is a query that never touches an egress — the #1 rate
+/// is a query that never touches an egress : the #1 rate
 /// reducer. But a cached answer presented as fresh is
 /// WORSE than honest latency when the world moved:
-/// time-sensitive queries (even outside news intent —
+/// time-sensitive queries (even outside news intent :
 /// "X release date", "inflation 2026") get news-grade
 /// TTLs regardless of detected intent.
 fn cache_ttl(intent: Intent, query: &str) -> Duration {
@@ -53,13 +93,9 @@ fn cache_ttl(intent: Intent, query: &str) -> Duration {
         "deadline",
         "release date",
         "news",
-        "2024",
-        "2025",
-        "2026",
-        "2027",
     ];
     let q = query.to_lowercase();
-    if RECENCY.iter().any(|s| q.contains(s)) {
+    if RECENCY.iter().any(|s| q.contains(s)) || recency_year_in(&q) {
         return Duration::from_secs(300);
     }
     match intent {
@@ -67,6 +103,30 @@ fn cache_ttl(intent: Intent, query: &str) -> Duration {
         Intent::Code => Duration::from_secs(900),
         _ => Duration::from_secs(1800),
     }
+}
+
+/// Year mentions inside the [current-2, current+1] window are
+/// time-sensitive ("inflation 2026"); outside years ("cars 1998",
+/// "medieval 1400") cache normally. Generated from the clock so the
+/// window rolls forward automatically (was a hardcoded list that
+/// would rot in 2028).
+fn recency_year_in(q: &str) -> bool {
+    let y = current_year();
+    ((y - 2)..=(y + 1)).any(|yy| q.contains(&yy.to_string()))
+}
+
+/// UTC calendar year without a date dependency: days since epoch ->
+/// civil year (Howard Hinnant's algorithm).
+fn current_year() -> i64 {
+    let days = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() / 86_400)
+        .unwrap_or(0) as i64;
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    era * 400 + yoe + 1
 }
 
 /// Normalize a query for cache keys: casing, punctuation
@@ -77,98 +137,171 @@ fn norm_query(q: &str) -> String {
         "a", "an", "the", "is", "are", "was", "were", "of", "in", "on", "at", "to", "for", "and",
         "or", "what", "which", "how", "do", "does", "i", "you", "it",
     ];
+    // '+' is kept (as the intent tokenizer does): stripping it made
+    // "rust vs c++ performance" and "rust vs c performance" share
+    // one cache key, serving the first query's results to the
+    // second as cached.
     q.to_lowercase()
-        .split(|c: char| !c.is_alphanumeric())
+        .split(|c: char| !c.is_alphanumeric() && c != '+')
         .filter(|w| !w.is_empty() && !STOP.contains(w))
         .collect::<Vec<_>>()
         .join(" ")
 }
 
+/// Cache key for BYOK provider results (issue #195). The `byok|`
+/// prefix keeps them out of the local path's `query|intent` slot, so
+/// switching the `default` between local and a provider can never
+/// serve one path's results under the other's name.
+fn byok_cache_key(query: &str, intent: Intent) -> String {
+    format!("byok|{}|{}", norm_query(query), intent.code())
+}
+
+/// Whether a failure `status` reflects the engine actually behaving
+/// badly (worth quarantining via `record_outcome` and eroding trust
+/// via `bump_trust`), as opposed to infra noise -- a dead egress
+/// (`"dead-proxy"`), a BYOK key problem (`"auth-fail"`), or simply
+/// no results (`"no-results"`). Everything else (blocked, empty-parse,
+/// timeout, net) erodes trust. A single predicate so quarantine and
+/// trust tracking can't drift out of sync with each other again.
+fn is_engine_fault(status: &str) -> bool {
+    !status.starts_with("dead")
+        && status != "auth-fail"
+        && status != "no-results"
+        && status != "invalid-config"
+        && !status.starts_with("invalid-config:")
+        && status != "pacing-timeout"
+        && status != "budget-skipped"
+}
+
+/// C1 roster hygiene: Mojeek answers blocked traffic with HTTP 200
+/// and a parse that yields <3 hits (`empty-parse`). That is a
+/// CHRONIC signal, not a one-off — burn trust harder so it drops
+/// out of the default width instead of occupying a slot every
+/// query. The parser stays; proxy paths still fan out to it.
+fn trust_target_for(engine: &str, status: &str, ok: bool) -> f64 {
+    if ok {
+        return 1.2;
+    }
+    if engine == "mojeek" && status == "empty-parse" {
+        return 0.15;
+    }
+    0.3
+}
+
+/// C4: enough independent families already agree on a top-3 URL
+/// that waiting for the stragglers cannot change the answer.
+fn early_consensus_enough(outcomes: &[(String, EngineResult)]) -> bool {
+    use std::collections::{HashMap, HashSet};
+    let mut url_families: HashMap<String, HashSet<&str>> = HashMap::new();
+    let mut families_ok: HashSet<&str> = HashSet::new();
+    for (label, result) in outcomes {
+        let Ok((hits, _, _, _, _)) = result else {
+            continue;
+        };
+        let fam = rank::engine_family(engine_name(label));
+        families_ok.insert(fam);
+        for h in hits.iter().take(3) {
+            let key = rank::norm_key(&h.url);
+            url_families.entry(key).or_default().insert(fam);
+        }
+    }
+    families_ok.len() >= 3 && url_families.values().any(|fams| fams.len() >= 3)
+}
+
 pub struct Searcher {
     fetcher: Fetcher,
-    pool: EgressPool,
+    /// Shared with crawl + fetch (v4 A2): one health world for
+    /// every proxied path. Clone of the daemon's Arc.
+    pool: std::sync::Arc<EgressPool>,
+    google: engines::google_wml::ProfileSelector,
     /// engine -> trust EWMA (1.0 seed; 0.2..2.0 clamp).
+    /// Persisted to disk: an engine that learned "this walled me"
+    /// keeps that memory across daemon restarts instead of
+    /// re-paying the same failure every boot.
     trust: Mutex<HashMap<String, f64>>,
+    /// B2: per-intent trust (`engine|intent_code` -> EWMA). Roster
+    /// order prefers the intent sample; engine-global is the
+    /// fallback and still moves on every outcome.
+    trust_intent: Mutex<HashMap<String, f64>>,
+    /// Set on any health-map mutation; the disk save swaps it off
+    /// and skips the write entirely when nothing changed (was: a
+    /// clone + serialize + write on every uncached search).
+    health_dirty: std::sync::atomic::AtomicBool,
     /// normalized-query cache: zero egress cost on repeats.
     /// Stores up to 12 results; reads truncate to the
     /// requested max so max_results variants share entries.
     #[allow(clippy::type_complexity)]
-    cache: Mutex<HashMap<String, (Instant, Vec<Merged>, usize)>>,
+    cache: Mutex<HashMap<String, (Instant, Vec<Merged>, usize, Vec<EngineReport>)>>,
     /// Chronic-failure quarantine: engine -> (consecutive
     /// failures, last failure). 3 strikes across any
     /// egresses = benched for QUARANTINE_TTL so a walled
     /// engine stops wasting a fan-out slot every query.
+    /// Failure streaks persist too: a benched engine stays
+    /// benched across a crash + restart instead of being
+    /// re-paid three times from zero.
     failures: Mutex<HashMap<String, (u32, Instant)>>,
     /// Single-flight: two identical in-flight queries spend
-    /// egress budget ONCE — the follower awaits the
+    /// egress budget ONCE : the follower awaits the
     /// leader's result. Stampedes are an agent reality
     /// (parallel tool calls love the same query).
     inflight: Mutex<std::collections::HashSet<String>>,
+    /// BYOK single-flight: a metered provider is not re-billed by a
+    /// concurrent identical query (the local fan-out has `inflight`
+    /// for the same reason). Keyed on the byok cache key.
+    byok_inflight: Mutex<std::collections::HashSet<String>>,
     /// v3 warm handoff: enrichment bodies cached for the
     /// subsequent `web_fetch` of a top result (search → fetch
     /// is THE agent pipeline). One-shot, TTL'd, bounded.
     prewarms: std::sync::Arc<std::sync::Mutex<PrewarmCache>>,
+    /// Browser render capability (2026 Google serves a JS
+    /// shell to plain HTTP but renders fine in our own
+    /// headless Chrome: live-proven). Used ONLY by the
+    /// thinness-gated cascade lane; None in test builds.
+    ghost: Option<crate::crawl::GhostHook>,
+    /// B3: learned host quality (www-stripped host -> EWMA).
+    /// Filled by enrich/prefetch outcomes; nudges ranking
+    /// slightly after enough samples. Kill: search.quality_prior.
+    quality: Mutex<QualityMap>,
+    quality_dirty: std::sync::atomic::AtomicBool,
+    /// B4: agent-outcome demotes (`class|host` -> EWMA).
+    /// Default off (`search.outcome_feedback`); never extra fetches.
+    outcome: Mutex<OutcomeMap>,
+    outcome_dirty: std::sync::atomic::AtomicBool,
 }
 
-/// v3 F1: search→fetch warm handoff store.
-pub struct PrewarmCache {
-    entries: HashMap<String, PrewarmEntry>,
-}
-
-pub struct PrewarmEntry {
-    pub body: Vec<u8>,
-    pub content_type: String,
-    pub at: Instant,
-}
-
-const PREWARM_CAP: usize = 10;
-const PREWARM_BODY_MAX: usize = 1_500_000;
-const PREWARM_TTL: Duration = Duration::from_secs(600);
-
-impl PrewarmCache {
-    fn new() -> Self {
-        Self {
-            entries: HashMap::new(),
-        }
+#[cfg(feature = "rerank")]
+/// Run synchronous ranking outside Tokio's async worker set.
+///
+/// Semantic reranking can enter ONNX inference and wait on the shared session
+/// mutex. The ranking API stays synchronous, so the blocking pool is the narrow
+/// boundary that keeps unrelated async work progressing.
+async fn run_blocking_ranking<F, T>(job: F) -> Result<Option<T>, FetchError>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    let budget = stage_budget(Duration::from_secs(30), Duration::from_millis(500));
+    if budget.is_zero() {
+        return Ok(None);
     }
-
-    fn put(&mut self, url: &str, body: Vec<u8>, content_type: String) {
-        if body.len() > PREWARM_BODY_MAX {
-            return; // huge pages: extraction is cheap, RAM isn't
-        }
-        // Bound: evict oldest beyond cap.
-        if self.entries.len() >= PREWARM_CAP
-            && !self.entries.contains_key(url)
-            && let Some(oldest) = self
-                .entries
-                .iter()
-                .min_by_key(|(_, e)| e.at)
-                .map(|(k, _)| k.clone())
-        {
-            self.entries.remove(&oldest);
-        }
-        self.entries.insert(
-            url.to_string(),
-            PrewarmEntry {
-                body,
-                content_type,
-                at: Instant::now(),
-            },
-        );
-    }
-
-    /// One-shot: a served prewarm is consumed — the second
-    /// fetch of the same URL goes to the network for freshness.
-    pub fn take(&mut self, url: &str) -> Option<PrewarmEntry> {
-        let e = self.entries.remove(url)?;
-        (e.at.elapsed() < PREWARM_TTL).then_some(e)
+    match tokio::time::timeout(budget, tokio::task::spawn_blocking(job)).await {
+        Ok(result) => result
+            .map(Some)
+            .map_err(|e| FetchError::Http(format!("search: ranking worker failed: {e}"))),
+        Err(_) => Ok(None),
     }
 }
+
+// v3 F1: search→fetch warm handoff store : filled by enrichment, drained
+// by the fetch tool. Implementation + the enrichment pass live in
+// `search::enrich`.
 
 /// Per-engine outcome for honest reporting.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct EngineReport {
     pub engine: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
     pub status: String,
     pub hits: usize,
     pub ms: u64,
@@ -189,39 +322,229 @@ pub struct SearchOutcome {
     pub provider: Option<String>,
     /// Cross-encoder reranking applied (feature on + model loaded).
     pub reranked: bool,
+    /// C5: byte-derived featured snippet / instant / knowledge.
+    /// Never merged into `results`. None when absent.
+    pub instant: Option<instant::InstantAnswer>,
+    /// Post-fan-out phase timings for the search-debug meta:
+    /// (stage, ms). Empty for the cache/BYOK paths.
+    pub stage_ms: Vec<(&'static str, u128)>,
+}
+
+impl SearchOutcome {
+    /// Unavailable unique backends and total backends tried. A successful or
+    /// cached attempt wins over failed retries; `report` keeps every attempt.
+    pub(crate) fn engine_health(&self) -> (Vec<&EngineReport>, usize) {
+        let mut engines = std::collections::BTreeMap::new();
+        for report in &self.report {
+            let current = engines.entry(report.engine.as_str()).or_insert(report);
+            if matches!(report.status.as_str(), "ok" | "cached") {
+                *current = report;
+            }
+        }
+        let total = engines.len();
+        let failed = engines
+            .into_values()
+            .filter(|report| !matches!(report.status.as_str(), "ok" | "cached"))
+            .collect();
+        (failed, total)
+    }
 }
 
 impl Searcher {
     pub fn new(fetcher: Fetcher, pool: EgressPool) -> Self {
+        Self::new_shared(fetcher, std::sync::Arc::new(pool))
+    }
+
+    /// Share one process-wide pool (daemon path).
+    pub fn new_shared(fetcher: Fetcher, pool: std::sync::Arc<EgressPool>) -> Self {
+        let (trust, trust_intent, failures) = load_health_disk();
         Self {
             fetcher,
             pool,
-            trust: Mutex::new(HashMap::new()),
+            google: engines::google_wml::ProfileSelector::from_env(),
+            trust: Mutex::new(trust),
+            trust_intent: Mutex::new(trust_intent),
+            health_dirty: std::sync::atomic::AtomicBool::new(false),
             cache: Mutex::new(load_cache_disk()),
-            failures: Mutex::new(HashMap::new()),
+            failures: Mutex::new(failures),
             inflight: Mutex::new(std::collections::HashSet::new()),
+            byok_inflight: Mutex::new(std::collections::HashSet::new()),
             prewarms: std::sync::Arc::new(std::sync::Mutex::new(PrewarmCache::new())),
+            ghost: None,
+            quality: Mutex::new(load_quality_disk()),
+            quality_dirty: std::sync::atomic::AtomicBool::new(false),
+            outcome: Mutex::new(load_outcome_disk()),
+            outcome_dirty: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
-    /// v3 F1: warm-handoff store — filled by enrichment, drained
+    /// The shared egress pool (crawl/fetch attach the same Arc).
+    pub fn egress_pool(&self) -> &std::sync::Arc<EgressPool> {
+        &self.pool
+    }
+
+    /// Attach the browser-render capability (cascade lane).
+    pub fn with_ghost(mut self, ghost: crate::crawl::GhostHook) -> Self {
+        self.ghost = Some(ghost);
+        self
+    }
+
+    /// v3 F1: warm-handoff store : filled by enrichment, drained
     /// by the fetch tool.
     pub fn prewarms(&self) -> &std::sync::Arc<std::sync::Mutex<PrewarmCache>> {
         &self.prewarms
     }
 
-    /// Proxy preflight: probe every proxy at startup so
-    /// dead lines are benched BEFORE a query ever gets
-    /// assigned to them. Runs in the background; the first
-    /// queries just use healthy lanes.
-    pub fn preflight(self: &Arc<Self>) {
+    /// Issue #195: serve a repeat BYOK query from the same TTL'd
+    /// cache the local path uses, so a metered provider is not
+    /// re-billed for an identical query inside the freshness window.
+    /// Returns a `cached: true` outcome (provider recovered from the
+    /// stored report) when a fresh entry exists. BYOK entries live in
+    /// their own key namespace so a `default` switch between local and
+    /// a provider never cross-serves one for the other.
+    pub fn byok_cache_get(
+        &self,
+        query: &str,
+        intent: Intent,
+        max_results: usize,
+    ) -> Option<SearchOutcome> {
+        let t0 = Instant::now();
+        let key = byok_cache_key(query, intent);
+        let cache = self
+            .cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (at, cached, _total, report) = cache.get(&key)?;
+        if at.elapsed() >= cache_ttl(intent, query) {
+            return None;
+        }
+        // The provider name is the engine label the BYOK path stored.
+        let provider = report.first().map(|r| r.engine.clone());
+        let mut results: Vec<Merged> = cached
+            .iter()
+            .take(max_results.clamp(1, 12))
+            .cloned()
+            .collect();
+        site_filter(query, &mut results);
+        query::intitle_filter(query, &mut results);
+        query::filetype_filter(query, &mut results);
+        let weak = results.is_empty() || rank::relevance_is_weak(&results, query);
+        Some(SearchOutcome {
+            results,
+            weak,
+            intent,
+            report: report.clone(),
+            cached: true,
+            elapsed: t0.elapsed(),
+            provider,
+            reranked: false,
+            // BYOK providers do not surface a byte-derived SERP
+            // instant layer; keep the slot honest.
+            instant: None,
+            stage_ms: Vec::new(),
+        })
+    }
+
+    /// Issue #195: persist a fresh BYOK outcome under the BYOK key
+    /// namespace, TTL'd like the local cache. Skips an empty result
+    /// set (the provider path errors on empty, so this is defensive).
+    /// The single-flight key for a BYOK query: the byok cache key,
+    /// deliberately NOT carrying max_results (the leader publishes
+    /// the provider's full top-12, so a max=2 caller and a max=10
+    /// caller share one provider round-trip).
+    pub fn byok_flight_key(&self, query: &str, intent: Intent) -> String {
+        byok_cache_key(query, intent)
+    }
+
+    /// BYOK single-flight: a concurrent identical query JOINS the
+    /// leader's provider round-trip instead of double-billing the
+    /// metered provider. Followers poll the byok cache (the leader
+    /// publishes there before filtering); a leader that dies or
+    /// stalls past 12s computes itself, exactly like the local
+    /// fan-out flight above.
+    pub async fn byok_flight(
+        &self,
+        key: String,
+        query: &str,
+        intent: Intent,
+        max: usize,
+        compute: impl std::future::Future<Output = Result<SearchOutcome, String>>,
+    ) -> Result<SearchOutcome, String> {
+        let leader = {
+            let mut m = self
+                .byok_inflight
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            m.insert(key.clone())
+        };
+        if !leader {
+            for _ in 0..120 {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                if let Some(hit) = self.byok_cache_get(query, intent, max) {
+                    return Ok(hit);
+                }
+            }
+            // Leader died or stalled : compute ourselves.
+        }
+        let _guard = InflightGuard {
+            map: &self.byok_inflight,
+            key,
+        };
+        compute.await
+    }
+
+    pub fn byok_cache_put(&self, query: &str, out: &SearchOutcome) {
+        if out.results.is_empty() {
+            return;
+        }
+        let key = byok_cache_key(query, out.intent);
+        let mut cache = self
+            .cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // LRU-ish cap, same rule as the local write path.
+        if cache.len() >= 500
+            && let Some(oldest) = cache
+                .iter()
+                .max_by_key(|(_, (at, _, _, _))| at.elapsed())
+                .map(|(k, _)| k.clone())
+        {
+            cache.remove(&oldest);
+        }
+        let results: Vec<Merged> = out.results.iter().take(12).cloned().collect();
+        let total = results.len();
+        cache.insert(key, (Instant::now(), results, total, out.report.clone()));
+        save_cache_disk(&cache);
+    }
+
+    /// Probe configured proxies in the background and seed their RTTs.
+    /// Generic failures bench lanes only after a completed batch with a
+    /// successful echo; authentication failures are applied immediately.
+    /// One global batch budget caps the whole run: a pool of stalled
+    /// lanes cannot cost N * 6s of startup. The caller owns the returned
+    /// task and must abort it on shutdown.
+    pub fn preflight(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
         let this = Arc::clone(self);
         tokio::spawn(async move {
+            // Per-probe liveness timeout plus one ceiling for the whole
+            // batch. A probe never outlives the remaining budget, and
+            // lanes the budget never reaches stay unprobed (inconclusive:
+            // nothing is published for them).
+            const PROBE_TIMEOUT: Duration = Duration::from_secs(6);
+            const BATCH_BUDGET: Duration = Duration::from_secs(20);
             let proxies = this.pool.proxies();
-            let total = proxies.len();
-            let mut dead = 0usize;
+            let batch_started = Instant::now();
+            let mut completed = true;
+            let mut echo_available = false;
+            let mut dead = Vec::new();
             for proxy in proxies {
+                let remaining = BATCH_BUDGET.saturating_sub(batch_started.elapsed());
+                if remaining.is_zero() {
+                    completed = false;
+                    break;
+                }
                 let id = proxy.id();
+                let started = Instant::now();
                 let probe = this.fetcher.fetch_once_via(
                     "https://api.ipify.org/",
                     &[],
@@ -229,35 +552,47 @@ impl Searcher {
                     false,
                     None,
                 );
-                match tokio::time::timeout(Duration::from_secs(6), probe).await {
-                    Ok(Ok(o)) if o.status == 200 => {}
+                match tokio::time::timeout(PROBE_TIMEOUT.min(remaining), probe).await {
+                    Ok(Ok(o)) if o.status == 200 => {
+                        echo_available = true;
+                        this.pool.observe_rtt(&id, started.elapsed());
+                    }
                     Ok(Err(e)) if format!("{e}").contains("CONNECT -> 407") => {
                         this.pool.report_auth_fail(&id);
                     }
                     _ => {
-                        dead += 1;
-                        this.pool.report_dead(&id);
+                        dead.push(id);
                     }
                 }
             }
-            // ALL proxies failing means the PROBE endpoint
-            // died, not the pool — clear the marks rather
-            // than bench every lane over our own bug.
-            if total > 0 && dead == total {
-                this.pool.revive_all();
+            // An entirely unavailable shared echo is inconclusive. Publish
+            // failures only after a completed batch; temporary benches can
+            // otherwise move an in-flight caller onto direct before the
+            // last result. Existing dead/auth evidence is not cleared by a
+            // failed probe, and a budget-cut partial batch publishes
+            // nothing at all.
+            if completed && echo_available {
+                for id in dead {
+                    this.pool.report_dead(&id);
+                }
             }
-        });
+        })
     }
 
     /// True when an engine is benched for chronic failure.
     fn quarantined(&self, engine: &str) -> bool {
-        const QUARANTINE_TTL: Duration = Duration::from_secs(600);
-        let f = self.failures.lock().unwrap();
+        let f = self
+            .failures
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         matches!(f.get(engine), Some(&(n, at)) if n >= 3 && at.elapsed() < QUARANTINE_TTL)
     }
 
     fn record_outcome(&self, engine: &str, ok: bool) {
-        let mut f = self.failures.lock().unwrap();
+        let mut f = self
+            .failures
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if ok {
             f.remove(engine);
         } else {
@@ -265,6 +600,8 @@ impl Searcher {
             e.0 += 1;
             e.1 = Instant::now();
         }
+        self.health_dirty
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub async fn search(
@@ -274,10 +611,20 @@ impl Searcher {
         forced_intent: Option<Intent>,
     ) -> Result<SearchOutcome, FetchError> {
         let started = Instant::now();
+        if let Some(problem) = validate_query(query) {
+            return Err(FetchError::Http(format!("search: {problem}")));
+        }
         let intent_probe = forced_intent.unwrap_or_else(|| intent::detect(query));
-        let sf_key = format!("{}|{intent_probe:?}|{max_results}", norm_query(query));
+        // Single-flight keys on the CACHE key (query + intent), NOT
+        // max_results: the leader publishes the full top-12 into
+        // the cache, so a query run once at max=2 and again at
+        // max=10 shares one fan-out instead of paying two.
+        let sf_key = format!("{}|{}", norm_query(query), intent_probe.code());
         let leader = {
-            let mut m = self.inflight.lock().unwrap();
+            let mut m = self
+                .inflight
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             m.insert(sf_key.clone())
         };
         if !leader {
@@ -289,28 +636,34 @@ impl Searcher {
                 let hit = self
                     .cache
                     .lock()
-                    .unwrap()
-                    .get(&format!("{}|{intent_probe:?}", norm_query(query)))
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .get(&format!("{}|{}", norm_query(query), intent_probe.code()))
                     .cloned();
-                if let Some((at, cached, total)) = hit
+                if let Some((at, cached, total, reports)) = hit
                     && at.elapsed() < cache_ttl(intent_probe, query)
                 {
-                    let weak = rank::is_weak(&cached, total);
                     let mut results = cached.iter().take(max_results).cloned().collect();
                     site_filter(query, &mut results);
+                    query::intitle_filter(query, &mut results);
+                    query::filetype_filter(query, &mut results);
+                    let weak = rank::is_weak(&results, total, query);
                     return Ok(SearchOutcome {
                         results,
                         weak,
                         intent: intent_probe,
-                        report: Vec::new(),
+                        report: reports,
                         cached: true,
                         elapsed: started.elapsed(),
                         provider: None,
-                        reranked: crate::search::rerank::active(),
+                        reranked: crate::search::rerank::loaded(),
+                        // Instant is not cached: a stale featured
+                        // snippet presented as fresh would lie.
+                        instant: None,
+                        stage_ms: Vec::new(),
                     });
                 }
             }
-            // Leader died or timed out — compute ourselves.
+            // Leader died or timed out : compute ourselves.
         }
         let _inflight_guard = InflightGuard {
             map: &self.inflight,
@@ -331,28 +684,51 @@ impl Searcher {
         // re-lists the same tail.
         let max_results = max_results.clamp(1, 12);
         let intent = forced_intent.unwrap_or_else(|| intent::detect(query));
-        let cache_key = format!("{}|{intent:?}", norm_query(query));
+        let cache_key = format!("{}|{}", norm_query(query), intent.code());
 
-        if let Some((at, cached, total)) = self.cache.lock().unwrap().get(&cache_key)
+        if let Some((at, cached, total, reports)) = self
+            .cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&cache_key)
             && at.elapsed() < cache_ttl(intent, query)
         {
-            let weak = rank::is_weak(cached, *total);
             let mut results = cached.iter().take(max_results).cloned().collect();
             site_filter(query, &mut results);
+            query::intitle_filter(query, &mut results);
+            query::filetype_filter(query, &mut results);
+            let weak = rank::is_weak(&results, *total, query);
             return Ok(SearchOutcome {
                 results,
                 weak,
                 intent,
-                report: Vec::new(),
+                report: reports.clone(),
                 cached: true,
                 elapsed: started.elapsed(),
                 provider: None,
-                reranked: crate::search::rerank::active(),
+                reranked: crate::search::rerank::loaded(),
+                // Instant is not cached: a stale featured
+                // snippet presented as fresh would lie.
+                instant: None,
+                stage_ms: Vec::new(),
             });
         }
 
         let engines = intent::engines_for(intent);
-        let verticals = intent::verticals_for(intent, query);
+        // C2: compile operators once; each engine gets the form it
+        // actually honors (DDG lite strips site: so BM25 is not
+        // polluted with the literal token).
+        let compiled = query::compile(query);
+        let mut verticals = intent::verticals_for(intent, query);
+        // site:github.com / site:stackoverflow.com / etc. join the
+        // fan-out as the site's own API.
+        if let Some(site) = &compiled.site
+            && let Some(sv) = query::site_vertical(site)
+            && !verticals.contains(&sv)
+        {
+            verticals.push(sv);
+        }
+        let verticals = intent::trim_verticals_for_stress(verticals, self.pool.stress());
 
         // Fan out: engines each get their own egress
         // (spreading is the anti-rate-limit move).
@@ -366,36 +742,61 @@ impl Searcher {
         // goes only to the first two engines (top trust).
         let mut live: Vec<&str> = engines
             .iter()
-            .filter(|e| !self.quarantined(e))
+            .filter(|e| !self.quarantined(engine_health_key(e)))
             .copied()
             .collect();
         // Rank engines by learned trust so width cuts drop
-        // the weakest first.
+        // the weakest first. Per-intent sample wins; engine-global
+        // is the fallback (B2).
         {
-            let trust = self.trust.lock().unwrap();
-            live.sort_by(|a, b| {
-                trust
-                    .get(*b)
+            let key = |e: &str| persist::trust_intent_key(engine_health_key(e), intent);
+            let trust = self
+                .trust
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let trust_i = self
+                .trust_intent
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let score = |e: &str| -> f64 {
+                trust_i
+                    .get(&key(e))
+                    .or_else(|| trust.get(engine_health_key(e)))
                     .copied()
                     .unwrap_or(1.0)
-                    .total_cmp(&trust.get(*a).copied().unwrap_or(1.0))
-            });
+            };
+            live.sort_by(|a, b| score(b).total_cmp(&score(a)));
         }
         // ── Adaptive fan-out width: the governor. Under
         // stress the system shrinks its appetite instead of
-        // burning lanes — consensus survives at width 2 by
+        // burning lanes : consensus survives at width 2 by
         // construction (two independent index families).
         let width = width_for_stress(self.pool.stress(), live.len());
         live.truncate(width);
         let mut assignments: Vec<(String, String)> = live
             .iter()
-            .map(|e| (e.to_string(), query.to_string()))
+            .map(|e| (e.to_string(), query::for_engine(&compiled, e)))
             .collect();
-        // Recall variants spend lanes — only when the
+        // Recall variants spend lanes : only when the
         // governor did NOT cut the roster (healthy pool).
         if queries.len() > 1 && self.pool.stress() < 0.15 {
             for e in live.iter().take(2) {
                 assignments.push((e.to_string(), queries[1].clone()));
+            }
+        }
+        // Authority cannot lift a source absent from the candidate pool.
+        // Two scoped recalls join the initial wave, on an engine that honors
+        // site:, only while the pool is healthy. Results still need ranking.
+        if matches!(intent, Intent::Web | Intent::Code) && self.pool.stress() < 0.15 {
+            let engine = live
+                .iter()
+                .find(|e| matches!(**e, "bing" | "ddg_html"))
+                .copied()
+                .or_else(|| live.contains(&"ddg").then_some("ddg_html"));
+            if let Some(engine) = engine {
+                for q in authority::official_queries(&compiled) {
+                    assignments.push((engine.to_string(), q));
+                }
             }
         }
 
@@ -406,30 +807,22 @@ impl Searcher {
         // proxy-averse engines can share direct (with pacing).
         // Non-averse engines spread across proxies.
         //
-        // We only exclude proxy egresses from reuse — direct
+        // We only exclude proxy egresses from reuse : direct
         // is shared, not exclusive.
-        let has_proxies = self.pool.has_proxies();
-        for (engine, q) in assignments {
-            let Some(eg) = self.pool.pick(&engine, &used_egresses, true) else {
-                break;
-            };
-            // Exclude proxy egresses (spread across proxies)
-            // but NOT direct (multiple PROXY_AVERSE engines
-            // share the direct lane with pacing).
-            if has_proxies && eg.proxy.is_some() {
-                used_egresses.push(eg.id.clone());
-            }
-            futures.push(Box::pin(engine_task(
-                engine,
-                q,
-                eg.id,
-                eg.proxy,
-                &self.fetcher,
-                &self.pool,
-            )));
+        let context = tasks::EngineContext {
+            fetcher: &self.fetcher,
+            pool: self.pool.as_ref(),
+            google: &self.google,
+        };
+        for (engine, q, eg) in assign_egresses(self.pool.as_ref(), assignments, &mut used_egresses)
+        {
+            futures.push(Box::pin(engine_task(engine, q, eg.id, eg.proxy, context)));
         }
         // Verticals: direct, friendly APIs.
-        let verticals: Vec<&&str> = verticals.iter().filter(|v| !self.quarantined(v)).collect();
+        let verticals: Vec<&str> = verticals
+            .into_iter()
+            .filter(|v| !self.quarantined(v))
+            .collect();
         for v in verticals {
             futures.push(Box::pin(vertical_task(
                 v.to_string(),
@@ -439,30 +832,61 @@ impl Searcher {
             )));
         }
 
-        let outcomes = futures_util::future::join_all(futures).await;
+        // C4 adaptive early-return: collect completions as they
+        // land; once ≥3 independent families agree on a top-3 URL,
+        // drop the stragglers (their futures are cancelled). Kill:
+        // search.search_early=false / DONSETCH_NO_SEARCH_EARLY.
+        let early = crate::config::cfg().search.search_early;
+        let outcomes: Vec<(String, EngineResult)> = if early {
+            use futures_util::stream::{FuturesUnordered, StreamExt};
+            let mut futs = FuturesUnordered::new();
+            for f in futures {
+                futs.push(f);
+            }
+            let mut acc: Vec<(String, EngineResult)> = Vec::new();
+            while let Some(outcome) = futs.next().await {
+                acc.push(outcome);
+                if early_consensus_enough(&acc) {
+                    break;
+                }
+            }
+            acc
+        } else {
+            futures_util::future::join_all(futures).await
+        };
 
         // ── Retry wave: failed engines get one more shot
-        // through a fresh egress — but ONLY when the first
+        // through a fresh egress : but ONLY when the first
         // wave left the merge thin. A healthy merge never
         // pays retry latency; a degraded one recovers.
         let ok_engines = outcomes.iter().filter(|(_, r)| r.is_ok()).count();
         let ok_hits: usize = outcomes
             .iter()
             .filter_map(|(_, r)| r.as_ref().ok())
-            .map(|(h, _, _, _)| h.len())
+            .map(|(h, _, _, _, _)| h.len())
             .sum();
         let merge_thin = ok_engines < 3 || ok_hits < 15;
         let failed: Vec<String> = if merge_thin {
             outcomes
                 .iter()
-                .filter(|(_, r)| matches!(r, Err((s, _, _)) if s != "no-results"))
+                .filter(|(_, r)| matches!(r, Err((s, _, _)) if retry_engine_failure(s)))
                 .map(|(e, _)| e.split('@').next().unwrap_or(e).to_string())
                 .collect()
         } else {
             Vec::new()
         };
         let mut retry_futures: Vec<TaskFut> = Vec::new();
+        let mut retried = std::collections::HashSet::new();
         for engine in &failed {
+            if !retried.insert(engine) {
+                continue;
+            }
+            if outcomes
+                .iter()
+                .any(|(label, outcome)| engine_name(label) == engine && outcome.is_ok())
+            {
+                continue;
+            }
             let is_vertical = matches!(
                 engine.as_str(),
                 "github"
@@ -480,11 +904,18 @@ impl Searcher {
                 let Some(eg) = self.pool.pick("github", &[], false) else {
                     continue;
                 };
-                retry_futures.push(Box::pin(vertical_task(
+                let task = Box::pin(vertical_task(
                     engine.clone(),
                     query.to_string(),
                     &self.fetcher,
                     eg.proxy,
+                ));
+                retry_futures.push(Box::pin(bounded_retry(
+                    task,
+                    engine.clone(),
+                    eg.id,
+                    false,
+                    stage_budget(RETRY_TIMEOUT, Duration::from_secs(2)),
                 )));
                 continue;
             }
@@ -493,40 +924,100 @@ impl Searcher {
             let Some(eg) = self.pool.pick(engine, &used_egresses, true) else {
                 continue;
             };
-            retry_futures.push(Box::pin(engine_task(
+            let previous = outcomes.iter().find_map(|(label, result)| {
+                if engine_name(label) == engine
+                    && let Err((status, _, _)) = result
+                {
+                    Some((label.as_str(), status.as_str()))
+                } else {
+                    None
+                }
+            });
+            retry_futures.push(Box::pin(tasks::engine_task_with_budget(
                 retry_engine.to_string(),
                 query.to_string(),
                 eg.id,
                 eg.proxy,
-                &self.fetcher,
-                &self.pool,
+                context,
+                stage_budget(RETRY_TIMEOUT, Duration::from_secs(2)),
+                previous,
             )));
         }
-        let retry_outcomes = if retry_futures.is_empty() {
-            Vec::new()
-        } else {
-            tokio::time::timeout(
-                Duration::from_secs(3),
-                futures_util::future::join_all(retry_futures),
-            )
-            .await
-            .unwrap_or_default()
+        // Start the independent browser index alongside recovery requests.
+        // Waiting for failed HTTP retries first only delays a lane that can
+        // succeed without them. A healthy first merge keeps the cheap path.
+        let force_lane = crate::config::cfg().search.ghost_lane == crate::config::GhostLane::Always;
+        let google_http_ok = outcomes
+            .iter()
+            .any(|(engine, result)| engine_name(engine) == "google" && result.is_ok());
+        let lane_permitted = self.ghost.is_some()
+            && crate::config::cfg().search.ghost_lane != crate::config::GhostLane::Never
+            && !self.quarantined("google_ghost");
+        let browser_recovery = async {
+            if !lane_permitted
+                || !google_ghost_wanted(force_lane, google_http_ok, ok_engines, ok_hits)
+            {
+                return Vec::new();
+            }
+            let hook = self.ghost.as_ref().unwrap().clone();
+            let budget = stage_budget(Duration::from_secs(30), Duration::from_secs(2));
+            if budget.is_zero() {
+                return vec![(
+                    "google_ghost".to_string(),
+                    Err(("budget-skipped".into(), "ghost".into(), true)),
+                )];
+            }
+            vec![
+                ghost_engine_task(
+                    "google_ghost".to_string(),
+                    query.to_string(),
+                    hook,
+                    &self.pool,
+                    budget,
+                )
+                .await,
+            ]
         };
+        let (retry_outcomes, lane_outcomes) = tokio::join!(
+            futures_util::future::join_all(retry_futures),
+            browser_recovery
+        );
 
         let mut per_engine: Vec<(String, Vec<engines::Hit>)> = Vec::new();
         let mut report = Vec::new();
-        let all: Vec<(String, EngineResult)> = outcomes.into_iter().chain(retry_outcomes).collect();
-        for (engine, outcome) in all {
+        // C5: best instant answer across lanes (first non-empty wins
+        // by engine trust order, which outcomes already respect).
+        let mut instant: Option<instant::InstantAnswer> = None;
+        let all: Vec<(String, EngineResult)> = outcomes
+            .into_iter()
+            .chain(retry_outcomes)
+            .chain(lane_outcomes)
+            .collect();
+        for (label, outcome) in all {
+            let profile = label.split_once('@').map(|(_, p)| p.to_string());
+            let engine = engine_name(&label).to_string();
+            let ghost_lane = engine == "google_ghost";
             match outcome {
-                Ok((hits, ms, egress_id, was_engine)) => {
-                    let base = engine.split('_').next().unwrap_or(&engine);
+                Ok((hits, ms, egress_id, was_engine, lane_instant)) => {
+                    let base = engine_health_key(&engine);
                     self.record_outcome(base, true);
-                    if was_engine {
-                        self.pool.report_ok(base, &egress_id);
-                        self.bump_trust(base, true);
+                    if was_engine && !ghost_lane {
+                        // "ghost" is not an egress id: pool
+                        // bookkeeping must not record lanes that
+                        // the pool never assigned.
+                        self.pool.report_ok(&engine, &egress_id);
+                    }
+                    if was_engine || ghost_lane {
+                        self.bump_trust(base, intent, true);
+                    }
+                    if instant.is_none()
+                        && let Some(ans) = lane_instant
+                    {
+                        instant = Some(ans);
                     }
                     report.push(EngineReport {
                         engine: engine.clone(),
+                        profile: profile.clone(),
                         status: "ok".into(),
                         hits: hits.len(),
                         ms,
@@ -535,27 +1026,28 @@ impl Searcher {
                     per_engine.push((engine, hits));
                 }
                 Err((status, egress_id, was_engine)) => {
-                    let base = engine.split('_').next().unwrap_or(&engine);
-                    // Dead proxies are egress failures, not
-                    // engine failures — don't quarantine.
-                    if !status.starts_with("dead")
-                        && status != "auth-fail"
-                        && status != "no-results"
-                    {
+                    let base = engine_health_key(&engine);
+                    // Dead proxies and auth failures are egress/BYOK
+                    // problems, not engine failures : don't quarantine
+                    // or distrust the engine over them.
+                    if is_engine_fault(&status) {
                         self.record_outcome(base, false);
                     }
-                    if was_engine {
+                    if (was_engine || ghost_lane) && !ghost_lane {
                         if status.starts_with("dead") {
                             self.pool.report_dead(&egress_id);
                         } else if status == "auth-fail" {
                             self.pool.report_auth_fail(&egress_id);
-                        } else if status != "no-results" {
-                            self.pool.report_blocked(base, &egress_id);
-                            self.bump_trust(base, false);
+                        } else if is_engine_fault(&status) {
+                            self.pool.report_blocked(&engine, &egress_id);
                         }
+                    }
+                    if (was_engine || ghost_lane) && is_engine_fault(&status) {
+                        self.bump_trust_status(base, intent, false, &status);
                     }
                     report.push(EngineReport {
                         engine,
+                        profile,
                         status,
                         hits: 0,
                         ms: 0,
@@ -566,8 +1058,23 @@ impl Searcher {
         }
 
         if per_engine.is_empty() {
+            {
+                let t = self
+                    .trust
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let ti = self
+                    .trust_intent
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let f = self
+                    .failures
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                save_health_disk_if_dirty(self, &t, &ti, &f);
+            }
             return Err(FetchError::Http(format!(
-                "search: all engines failed — {}",
+                "search: all engines failed : {}",
                 report
                     .iter()
                     .map(|r| format!("{}:{}", r.engine, r.status))
@@ -576,52 +1083,175 @@ impl Searcher {
             )));
         }
 
-        let trust = self.trust.lock().unwrap().clone();
+        let mut trust = self
+            .trust
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        // Public result names stay stable; ranking must use the new HTTP
+        // health namespace, never legacy browser health stored as `google`.
+        let google_trust = trust
+            .get(engine_health_key("google"))
+            .copied()
+            .unwrap_or(1.0);
+        trust.insert("google".into(), google_trust);
         let total = rank::merged_total(&per_engine);
         // Always merge 12 results for the cache, then trim to
         // max_results for the response. Without this, a first
         // search with max=2 caches only 2 results, and a later
         // search with max=10 returns the stale 2 from cache.
+        // With semantic reranking enabled, merge includes synchronous ONNX
+        // inference. Core builds keep the existing inline fast path below.
+        #[cfg(feature = "rerank")]
+        let (mut results, ranking_finished) = {
+            let fallback = rank::merge_lexical(&per_engine, query, intent, &trust, 12);
+            let query = query.to_string();
+            match run_blocking_ranking(move || rank::merge(&per_engine, &query, intent, &trust, 12))
+                .await?
+            {
+                Some(results) => (results, true),
+                None => (fallback, false),
+            }
+        };
+        #[cfg(not(feature = "rerank"))]
+        let ranking_finished = true;
+        #[cfg(not(feature = "rerank"))]
         let mut results = rank::merge(&per_engine, query, intent, &trust, 12);
-        let weak = rank::is_weak(&results, total);
+        // B3: learned host quality nudge. After merge (and its
+        // diversity cap) so it only reorders survivors with a
+        // small weight; consensus still dominates.
+        {
+            let quality = self
+                .quality
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            persist::apply_quality_prior(&mut results, &quality);
+        }
+        // B4: soft demote hosts that chronically failed agent
+        // outcomes (default off).
+        {
+            let outcome = self
+                .outcome
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            persist::apply_outcome_demote(&mut results, &outcome);
+        }
+        results.sort_by(|a, b| b.score.total_cmp(&a.score));
 
         // ── Result enrichment: prefetch top results to extract
         // real <title> and <meta description> from the actual
         // pages. Richer than SERP snippets, filters dead links.
         // The genius feature: results carry the page's own title
         // and description, not the SERP's truncated version.
-        self.enrich_results(&mut results).await;
+        let enrich_t = std::time::Instant::now();
+        let _ = tokio::time::timeout(
+            stage_budget(Duration::from_secs(4), Duration::from_millis(500)),
+            self.enrich_results(&mut results),
+        )
+        .await;
+        let enrich_ms = enrich_t.elapsed().as_millis();
 
-        // ── site: operator enforcement: engines don't strictly
-        // respect `site:domain.com` — some results leak through
-        // from other domains. Filter them out post-merge so the
-        // agent only gets results from the requested domain.
+        // ── site:/intitle:/filetype: post-merge enforcement:
+        // engines don't strictly respect operators : some results
+        // leak through. Filter them out post-merge so the agent
+        // only sees what it asked for.
+        let filters_t = std::time::Instant::now();
         site_filter(query, &mut results);
-        // Poisoning guard: a merge built while engines
-        // were down must NOT persist for 30 minutes —
-        // degraded-period results expire with the moment.
-        let cacheable = ok_engines >= 2 && total >= 8;
-        if cacheable {
-            let mut cache = self.cache.lock().unwrap();
-            // LRU-ish cap: drop oldest when full.
-            if cache.len() >= 500
-                && let Some(oldest) = cache
-                    .iter()
-                    .max_by_key(|(_, (at, _, _))| at.elapsed())
-                    .map(|(k, _)| k.clone())
+        query::intitle_filter(query, &mut results);
+        query::filetype_filter(query, &mut results);
+        let filters_ms = filters_t.elapsed().as_millis();
+
+        // Post-enrichment top-up: the cross-encoder now sees the
+        // real page titles/descriptions on the top slice, not the
+        // SERP fragments. Bounded additive nudge, then re-sort.
+        // DONSEEK_NO_TOPUP is the A/B kill switch for benching.
+        #[cfg(feature = "rerank")]
+        let topup_ms: u128 = {
+            if crate::config::cfg().search.rerank_topup
+                && !stage_budget(Duration::from_secs(1), Duration::from_millis(500)).is_zero()
             {
-                cache.remove(&oldest);
+                let t = std::time::Instant::now();
+                let q = query.to_string();
+                let mut owned = results.clone();
+                let r = run_blocking_ranking(move || {
+                    crate::search::rerank::topup(&q, &mut owned, 8);
+                    owned
+                });
+                if let Some(ranked) = r.await? {
+                    results = ranked;
+                }
+                t.elapsed().as_millis()
+            } else {
+                0
             }
-            cache.insert(
-                cache_key,
-                (
-                    Instant::now(),
-                    results.iter().take(12).cloned().collect(),
-                    total,
-                ),
-            );
-            save_cache_disk(&cache);
+        };
+        // Without the rerank feature the stage is a no-op: report a
+        // flat zero so stage_ms stays schema-stable on all feature
+        // halves of the build matrix.
+        #[cfg(not(feature = "rerank"))]
+        let topup_ms: u128 = 0;
+        let weak = rank::is_weak(&results, total, query);
+        // Poisoning guard: a merge built while engines
+        // were down must NOT persist for 30 minutes :
+        // degraded-period results expire with the moment.
+        let cacheable = ranking_finished && ok_engines >= 2 && total >= 8;
+        if cacheable {
+            let snapshot = {
+                let mut cache = self
+                    .cache
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                // LRU-ish cap: drop oldest when full.
+                if cache.len() >= 500
+                    && let Some(oldest) = cache
+                        .iter()
+                        .max_by_key(|(_, (at, _, _, _))| at.elapsed())
+                        .map(|(k, _)| k.clone())
+                {
+                    cache.remove(&oldest);
+                }
+                cache.insert(
+                    cache_key,
+                    (
+                        Instant::now(),
+                        results.iter().take(12).cloned().collect(),
+                        total,
+                        report.clone(),
+                    ),
+                );
+                cache.clone()
+                // Serialize + write with NO lock held: the save is a
+                // 1-2MB JSON write, and holding the cache mutex
+                // across it queued every cache hit and every
+                // single-flight follower poll behind one disk write.
+            };
+            save_cache_disk(&snapshot);
         }
+
+        // Persist learned engine health once per search (single
+        // small write; failures inside the loop are already
+        // recorded, so this snapshot is always consistent).
+        {
+            let t = self
+                .trust
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let ti = self
+                .trust_intent
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let f = self
+                .failures
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            save_health_disk_if_dirty(self, &t, &ti, &f);
+        }
+
+        let stages = vec![
+            ("enrich", enrich_ms),
+            ("filters", filters_ms),
+            ("topup", topup_ms),
+        ];
 
         Ok(SearchOutcome {
             results: results.into_iter().take(max_results).collect(),
@@ -631,280 +1261,196 @@ impl Searcher {
             cached: false,
             elapsed: started.elapsed(),
             provider: None,
-            reranked: crate::search::rerank::active(),
+            reranked: ranking_finished && crate::search::rerank::loaded(),
+            instant,
+            stage_ms: stages,
         })
     }
 
-    fn bump_trust(&self, base_engine: &str, ok: bool) {
-        let mut trust = self.trust.lock().unwrap();
-        let t = trust.entry(base_engine.to_string()).or_insert(1.0);
-        let target = if ok { 1.2 } else { 0.3 };
-        *t = (*t * 0.7 + target * 0.3).clamp(0.2, 2.0);
+    fn bump_trust(&self, base_engine: &str, intent: Intent, ok: bool) {
+        self.bump_trust_status(base_engine, intent, ok, "");
     }
 
-    /// Enrich top results by prefetching destination pages.
-    ///
-    /// Extracts real <title> and <meta name="description">
-    /// from the actual page HTML — richer than any SERP
-    /// snippet. Dead links (404/timeout) get demoted 50%.
-    /// Pages behind bot walls are left untouched (still
-    /// valid results, agent fetches via tier 2).
-    ///
-    /// This is what makes our search better than any
-    /// individual engine: results carry the page's own
-    /// title and description, not the SERP's truncated
-    /// version. Works even when SERP parsers return empty
-    /// snippets. Dead links that rank well are demoted.
-    async fn enrich_results(&self, results: &mut [Merged]) {
-        const ENRICH_TOP: usize = 5;
-        const ENRICH_TIMEOUT: Duration = Duration::from_secs(4);
+    /// C1: Mojeek `empty-parse` (blocked:200) burns trust harder so
+    /// it leaves the default width instead of occupying a slot.
+    fn bump_trust_status(&self, base_engine: &str, intent: Intent, ok: bool, status: &str) {
+        let target = trust_target_for(base_engine, status, ok);
+        {
+            let mut trust = self
+                .trust
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let t = trust.entry(base_engine.to_string()).or_insert(1.0);
+            *t = (*t * 0.7 + target * 0.3).clamp(0.2, 2.0);
+        }
+        {
+            let mut trust_i = self
+                .trust_intent
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let key = persist::trust_intent_key(base_engine, intent);
+            let t = trust_i.entry(key).or_insert(1.0);
+            *t = (*t * 0.7 + target * 0.3).clamp(0.2, 2.0);
+        }
+        self.health_dirty
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
 
-        let n = results.len().min(ENRICH_TOP);
-        if n == 0 {
+    /// Engine-global + per-intent trust for receipts / status.
+    pub fn trust_snapshot(&self) -> (usize, usize, usize) {
+        let trust = self
+            .trust
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let trust_i = self
+            .trust_intent
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let failures = self
+            .failures
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let low = trust.values().filter(|&&t| t < 0.5).count()
+            + trust_i.values().filter(|&&t| t < 0.5).count();
+        (trust.len(), trust_i.len(), low + failures.len())
+    }
+
+    /// B3: record one enrich/prefetch outcome for a host.
+    /// Clean content raises density; dead/soft-404 lowers it.
+    /// No-op when the quality prior is killed.
+    pub(crate) fn observe_quality(&self, host: &str, ok: bool) {
+        if !crate::config::cfg().search.quality_prior {
             return;
         }
-
-        // Spawn parallel fetches for top N results.
-        let fetcher = &self.fetcher;
-        type EnrichFut<'a> = std::pin::Pin<
-            Box<
-                dyn std::future::Future<Output = (usize, Option<String>, Option<String>)>
-                    + Send
-                    + 'a,
-            >,
-        >;
-        let prewarms = self.prewarms.clone();
-        let mut futures: Vec<EnrichFut> = Vec::new();
-        for (i, r) in results.iter().take(n).enumerate() {
-            let url = r.url.clone();
-            let sink = prewarms.clone();
-            futures.push(Box::pin(async move {
-                let out = tokio::time::timeout(
-                    ENRICH_TIMEOUT,
-                    fetcher.fetch_once_via(&url, &[], None, false, None),
-                )
-                .await;
-                match out {
-                    Err(_) | Ok(Err(_)) => (i, None, None),
-                    Ok(Ok(o)) => {
-                        // Dead link (4xx/5xx) → demote.
-                        if o.status >= 400 {
-                            return (i, None, None);
-                        }
-                        // Bot wall (200 but not ContentOk) →
-                        // don't enrich, don't demote.
-                        if !matches!(o.verdict, Verdict::ContentOk) {
-                            return (i, None, Some(String::new()));
-                        }
-                        let ct = o
-                            .headers
-                            .iter()
-                            .find(|(n, _)| n.eq_ignore_ascii_case("content-type"))
-                            .map(|(_, v)| v.clone())
-                            .unwrap_or_default();
-                        let html = crate::extract::charset::decode(&o.body, &ct);
-                        let title = extract_title(&html);
-                        let desc = extract_description(&html);
-                        // v3 F1: keep the body for the warm handoff.
-                        sink.lock().unwrap().put(&url, o.body.clone(), ct);
-                        (i, title, desc)
-                    }
-                }
-            }));
+        {
+            let mut quality = self
+                .quality
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            persist::observe_quality(&mut quality, host, ok);
         }
+        self.quality_dirty
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
 
-        let enriched = futures_util::future::join_all(futures).await;
+    /// Persist quality map if it changed since the last save.
+    pub(crate) fn save_quality_if_dirty(&self) {
+        let quality = self
+            .quality
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        save_quality_disk_if_dirty(self, &quality);
+    }
 
-        for (i, title, desc) in enriched {
-            if i >= results.len() {
-                continue;
-            }
-            let r = &mut results[i];
-            match (&title, &desc) {
-                (None, None) => {
-                    // Dead link — demote 50%.
-                    r.score *= 0.5;
-                }
-                (None, Some(d)) if d.is_empty() => {
-                    // Bot wall — leave untouched.
-                }
-                _ => {
-                    if let Some(t) = title {
-                        let bad =
-                            |t: &str| t.contains(" › ") || t.starts_with("http") || t.len() < 3;
-                        if !bad(&t) && (bad(&r.title) || t.len() > r.title.len()) {
-                            r.title = t;
-                        }
-                    }
-                    if let Some(d) = desc
-                        && !d.is_empty()
-                        && d.len() > r.snippet.len()
-                    {
-                        r.snippet = d;
-                    }
-                }
-            }
+    /// B4: record one agent-outcome miss. No-op unless
+    /// `search.outcome_feedback` is on. Never fetches anything.
+    pub fn observe_outcome_miss(&self, class: &str, host: &str) {
+        if !crate::config::cfg().search.outcome_feedback {
+            return;
         }
-
-        // Re-sort after enrichment (dead links demoted).
-        results.sort_by(|a, b| b.score.total_cmp(&a.score));
+        {
+            let mut outcome = self
+                .outcome
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            persist::observe_outcome_miss(&mut outcome, class, host);
+        }
+        self.outcome_dirty
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let outcome = self
+            .outcome
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        save_outcome_disk_if_dirty(self, &outcome);
     }
 }
 
-type EngineResult = Result<(Vec<engines::Hit>, u64, String, bool), (String, String, bool)>;
-
-type TaskFut<'a> =
-    std::pin::Pin<Box<dyn std::future::Future<Output = (String, EngineResult)> + Send + 'a>>;
-
-async fn engine_task(
-    engine: String,
-    query: String,
-    egress_id: String,
-    proxy: Option<crate::transport::proxy::Proxy>,
-    fetcher: &Fetcher,
+/// Assignment only: eligibility remains owned by EgressPool::pick.
+/// Keep this pass shared by the real fan-out and its offline regression tests.
+fn assign_egresses(
     pool: &EgressPool,
-) -> (String, EngineResult) {
-    let label = engine.clone();
-    pool.pace(&engine, &egress_id).await;
-    let started = Instant::now();
-    let Some(url) = engines::serp_url(&engine, &query) else {
-        return (label, Err(("no-url".into(), egress_id, true)));
-    };
-    let out = match tokio::time::timeout(
-        ENGINE_TIMEOUT,
-        fetcher.fetch_once_via(&url, &[], proxy.as_ref(), false, None),
-    )
-    .await
-    {
-        Err(_) => return (label, Err(("timeout".into(), egress_id, true))),
-        Ok(Err(e)) => {
-            let status = match &e {
-                FetchError::Timeout => "timeout",
-                FetchError::Http(m) if m.contains("CONNECT -> 407") => "auth-fail",
-                FetchError::Http(m) if m.contains("CONNECT") => "dead-proxy",
-                _ => "net",
-            };
-            return (label, Err((status.into(), egress_id, true)));
-        }
-        Ok(Ok(o)) => o,
-    };
-    let ms = started.elapsed().as_millis() as u64;
-    if out.status == 429 || !matches!(out.verdict, Verdict::ContentOk) {
-        return (
-            label,
-            Err((format!("blocked:{}", out.status), egress_id, true)),
-        );
-    }
-    let html = crate::extract::charset::decode(
-        &out.body,
-        out.headers
-            .iter()
-            .find(|(n, _)| n.eq_ignore_ascii_case("content-type"))
-            .map(|(_, v)| v.as_str())
-            .unwrap_or(""),
-    );
-    let hits = engines::parse(&engine, &html);
-    if hits.len() < 3 {
-        // Honest "no results" is NOT an engine failure —
-        // don't burn trust/lanes for a dry query.
-        let lower = html.to_lowercase();
-        let dry = lower.contains("no results")
-            || lower.contains("did not match any")
-            || lower.contains("no good results")
-            || lower.contains("nothing found");
-        let status = if dry { "no-results" } else { "empty-parse" };
-        return (label, Err((status.into(), egress_id, true)));
-    }
-    (label, Ok((hits, ms, egress_id, true)))
-}
-
-async fn vertical_task(
-    vertical: String,
-    query: String,
-    fetcher: &Fetcher,
-    proxy: Option<crate::transport::proxy::Proxy>,
-) -> (String, EngineResult) {
-    let started = Instant::now();
-    match tokio::time::timeout(
-        ENGINE_TIMEOUT,
-        verticals::run(fetcher, &vertical, &query, proxy.as_ref()),
-    )
-    .await
-    {
-        Err(_) => (vertical, Err(("timeout".into(), "direct".into(), false))),
-        Ok(Err(e)) => (vertical, Err((format!("{e}"), "direct".into(), false))),
-        Ok(Ok(hits)) => {
-            let ms = started.elapsed().as_millis() as u64;
-            (vertical, Ok((hits, ms, "direct".into(), false)))
-        }
-    }
-}
-
-/// Disk cache path (ghost-state pattern).
-fn cache_path() -> Option<std::path::PathBuf> {
-    let dir = dirs_cache()?;
-    Some(dir.join("search-cache.json"))
-}
-
-fn dirs_cache() -> Option<std::path::PathBuf> {
-    let dir = crate::paths::cache_dir();
-    std::fs::create_dir_all(&dir).ok()?;
-    Some(dir)
-}
-
-/// On disk: (key, age_secs, results, total) — age lets us
-/// re-base Instant across process restarts.
-fn save_cache_disk(cache: &HashMap<String, (Instant, Vec<Merged>, usize)>) {
-    let Some(path) = cache_path() else { return };
-    let now = Instant::now();
-    let entries: Vec<(String, u64, Vec<Merged>, usize)> = cache
-        .iter()
-        .map(|(k, (at, r, t))| {
-            (
-                k.clone(),
-                now.saturating_duration_since(*at).as_secs(),
-                r.clone(),
-                *t,
-            )
-        })
-        .collect();
-    if let Ok(json) = serde_json::to_string(&entries) {
-        let tmp = path.with_extension("tmp");
-        if std::fs::write(&tmp, json).is_ok() {
-            let _ = std::fs::rename(tmp, path);
-        }
-    }
-}
-
-fn load_cache_disk() -> HashMap<String, (Instant, Vec<Merged>, usize)> {
-    let mut map = HashMap::new();
-    let Some(path) = cache_path() else { return map };
-    let Ok(raw) = std::fs::read_to_string(path) else {
-        return map;
-    };
-    let Ok(entries) = serde_json::from_str::<Vec<(String, u64, Vec<Merged>, usize)>>(&raw) else {
-        return map;
-    };
-    for (key, age, results, total) in entries {
-        // TTL is intent + recency keyed (the query text
-        // is the key's first segment).
-        let (qpart, ipart) = key.rsplit_once('|').unwrap_or((key.as_str(), ""));
-        let intent = match ipart {
-            "News" => Intent::News,
-            "Code" => Intent::Code,
-            "Paper" => Intent::Paper,
-            "Entity" => Intent::Entity,
-            _ => Intent::Web,
+    assignments: Vec<(String, String)>,
+    used: &mut Vec<String>,
+) -> Vec<(String, String, egress::Egress)> {
+    let mut selected = Vec::new();
+    let has_proxies = pool.has_proxies();
+    for (engine, query) in assignments {
+        let Some(egress) = pool.pick(&engine, used, true) else {
+            // Unavailable for this engine does not mean unavailable for peers.
+            continue;
         };
-        let ttl = cache_ttl(intent, qpart);
-        if Duration::from_secs(age) < ttl {
-            map.insert(
-                key,
-                (Instant::now() - Duration::from_secs(age), results, total),
-            );
+        // Spread configured proxies; direct remains shared with pacing.
+        if has_proxies && egress.proxy.is_some() {
+            used.push(egress.id.clone());
         }
+        selected.push((engine, query, egress));
     }
-    map
+    selected
+}
+
+fn engine_name(label: &str) -> &str {
+    label.split('@').next().unwrap_or(label)
+}
+
+fn engine_health_key(engine: &str) -> &str {
+    let engine = engine_name(engine);
+    if engine == "google" {
+        return "google_http_v1";
+    }
+    // Different Google transports can fail independently; only ranking groups
+    // them into one index family. A WML block must not quarantine the browser.
+    if engine == "google_ghost" {
+        engine
+    } else {
+        egress::health_key(engine)
+    }
+}
+
+fn retry_engine_failure(status: &str) -> bool {
+    !matches!(status, "no-results" | "pacing-timeout" | "invalid-config")
+        && !status.starts_with("invalid-config:")
+}
+
+/// Vertical retries retain explicit timeout outcomes; engine tasks own their
+/// deadline internally so diagnostics include the identity actually attempted.
+async fn bounded_retry(
+    task: TaskFut<'_>,
+    engine: String,
+    egress: String,
+    was_engine: bool,
+    budget: Duration,
+) -> (String, EngineResult) {
+    tokio::time::timeout(budget, task)
+        .await
+        .unwrap_or_else(|_| (engine, Err(("retry-timeout".into(), egress, was_engine))))
+}
+
+fn google_ghost_wanted(force: bool, http_ok: bool, engines_ok: usize, hits_ok: usize) -> bool {
+    force || (!http_ok && ghost_lane_wanted(engines_ok, hits_ok))
+}
+
+/// Thinness gate for the ghost cascade lane. A successful HTTP Google
+/// response already supplies that index; the caller skips the browser then.
+fn ghost_lane_wanted(engines_ok: usize, hits_ok: usize) -> bool {
+    engines_ok < 3 || hits_ok < 15
+}
+
+/// Input hygiene for the search surface. Empty queries waste a
+/// fan-out (and cached-homepage SERPs would poison the merge);
+/// oversized queries break every endpoint's URL budget. Returns
+/// the human-readable problem, None = valid.
+pub(crate) fn validate_query(query: &str) -> Option<String> {
+    let t = query.trim();
+    if t.is_empty() {
+        return Some("empty query : pass a non-empty query string".into());
+    }
+    let chars = t.chars().count();
+    if chars > 512 {
+        return Some(format!(
+            "query is {chars} characters : search endpoints cap near 512; trim it or split it into two searches"
+        ));
+    }
+    None
 }
 
 /// Governor: fan-out width under stress. Healthy pool →
@@ -926,14 +1472,18 @@ fn width_for_stress(stress: f64, available: usize) -> usize {
 
 /// Enforce `site:domain.com` operator: extract the target domain
 /// from the query and remove results whose host doesn't match.
-/// Engines (especially Bing/DDG) don't strictly respect `site:` —
+/// Engines (especially Bing/DDG) don't strictly respect `site:` :
 /// they often inject related results from other domains. This
 /// post-merge filter ensures the agent only sees results from the
 /// requested domain.
 ///
 /// Matches `domain.com` and any subdomain `*.domain.com`.
 /// Case-insensitive. Strips `www.` prefix before comparison.
-fn site_filter(query: &str, results: &mut Vec<Merged>) {
+/// (#190) site: filters BYOK results too: the same filtering and count
+/// semantics as the local engine sweeps. Redirect rows whose target
+/// host can not match the scanned domain (google goto proxies) drop;
+/// fail closed.
+pub(crate) fn site_filter(query: &str, results: &mut Vec<Merged>) {
     let q = query.to_lowercase();
     let mut site_domain: Option<String> = None;
     for token in q.split_whitespace() {
@@ -960,254 +1510,6 @@ fn site_filter(query: &str, results: &mut Vec<Merged>) {
     });
 }
 
-/// Snippet budget for the markdown list. 120 cut mid-phrase far
-/// too often — the detail that distinguishes two results sat just
-/// past the cut, and the agent paid a whole fetch to learn what the
-/// snippet nearly said. 200 is where a snippet reliably carries one
-/// complete claim; the 300 the JSON keeps is past diminishing
-/// returns at ~45 tokens per result.
-const SNIPPET_CHARS: usize = 200;
-
-/// Below this fraction (4/5) of the budget, a word-boundary cut
-/// throws away more than it saves — see `clip_snippet`.
-const CLIP_FLOOR_NUM: usize = 4;
-const CLIP_FLOOR_DEN: usize = 5;
-
-/// Trailing marks dropped before the ellipsis: each one JOINS
-/// clauses, so ending on it reads as a typo rather than a cut.
-///
-/// Sentence terminators (. ! ? 。！？) are deliberately KEPT: a cut
-/// that lands after one means the snippet ended at a complete
-/// sentence, and saying so is worth more than tidiness. Stripping
-/// them would make a clean ending look like a severed one.
-/// CJK marks are the same codepoints in Chinese and Japanese, so
-/// one list serves both: 、and ，join clauses, 《》【】「」（ open
-/// spans. 。！？ are absent on purpose — they end sentences.
-const CLIP_TRIM: &[char] = &[
-    ',', ';', ':', '-', '–', '—', '(', '[', '{', '/', '|', '…', '、', '，', '；', '：', '（', '「',
-    '『', '《', '〈', '【', '〔', '［', '｛', '·', '／', '｜', '〜',
-];
-
-/// Truncate to `max` chars on a word boundary, marking the cut with
-/// an ellipsis ONLY when text was actually dropped.
-///
-/// Trims back, never extends: extending to finish the straddling
-/// word would make the output size unbounded by `max` (one long
-/// token and a "200-char snippet" is 280), and the fragment dropped
-/// is a partial word the agent cannot use anyway.
-///
-/// The 4/5 floor bounds the pathological case: a long URL, hash or
-/// compound word straddling the boundary would otherwise back off to
-/// almost nothing, which is worse than a mid-word cut the ellipsis
-/// already flags.
-fn clip_snippet(s: &str, max: usize) -> String {
-    // Materialized rather than iterated because the window is read
-    // three ways: indexed (chars[max]), scanned BACKWARDS for the
-    // last space, and sliced for the head. `Chars` cannot be
-    // rewound, so an iterator version re-decodes UTF-8 from the
-    // start once per pass — and `rposition` is not even available
-    // on it (it needs ExactSizeIterator, which `Chars` is not),
-    // leaving manual position bookkeeping. Decode once, index
-    // freely.
-    //
-    // Char positions, not &str byte offsets, for the same reason:
-    // the budget and the floor are counted in chars, so `rfind`'s
-    // byte index would need converting before every comparison —
-    // and mixing the two on multi-byte text is where UTF-8 bugs
-    // breed.
-    //
-    // max + 1 and no further: the only index past the window we
-    // inspect is chars[max], the "does the next char end a word?"
-    // test. Collecting the whole string would allocate 4 bytes a
-    // char for input we discard — BYOK snippets carry raw page
-    // text and run to thousands of chars.
-    let chars: Vec<char> = s.chars().take(max + 1).collect();
-    if chars.len() <= max {
-        return s.to_string();
-    }
-    // The char PAST the window decides whether the window already
-    // ends cleanly. If it is whitespace, the last word inside is
-    // whole and backing off would drop a complete word for nothing.
-    let cut = if chars[max].is_whitespace() {
-        max
-    } else {
-        match chars[..max].iter().rposition(|c| c.is_whitespace()) {
-            Some(pos) if pos * CLIP_FLOOR_DEN >= max * CLIP_FLOOR_NUM => pos,
-            _ => max,
-        }
-    };
-    let mut head: String = chars[..cut].iter().collect();
-    // trim_end_matches only slices — it is the `.to_string()` that
-    // would copy. Truncating to the trimmed length shortens in
-    // place instead, leaving one allocation for the whole function.
-    let keep = head
-        .trim_end_matches(|c: char| c.is_whitespace() || CLIP_TRIM.contains(&c))
-        .len();
-    head.truncate(keep);
-    // Only whitespace left behind means nothing was really dropped;
-    // an ellipsis there would promise content that does not exist.
-    // Iterates the ORIGINAL string, not the bounded window: a
-    // Vec capped at max + 1 cannot answer "is everything after
-    // the cut whitespace?". `all` short-circuits on the first
-    // non-whitespace, so this is O(1) in practice.
-    if s.chars().skip(cut).all(char::is_whitespace) {
-        return head;
-    }
-    format!("{head}…")
-}
-
-/// Markdown rendering for the MCP/CLI surface.
-pub fn render_markdown(
-    out: &SearchOutcome,
-    query: &str,
-    handles: Option<&[String]>,
-    hints: &[Option<String>],
-) -> String {
-    // Search answers ONE question: "what should I fetch?"
-    // Snippets carry just enough to decide — content is
-    // the fetch tool's job.
-    let mut md = format!("# Search: {query}\n\n");
-    for (i, r) in out.results.iter().enumerate() {
-        let host = rank::host_of(&r.url);
-        md.push_str(&format!("{}. **{}** — {}\n", i + 1, r.title, host));
-        if !r.snippet.is_empty() {
-            let snip = clip_snippet(&r.snippet, SNIPPET_CHARS);
-            md.push_str(&format!("   {snip}\n"));
-        }
-        // v3 handles: a random S-handle replaces the
-        // raw URL, saving 80+ tokens per result.
-        match handles {
-            Some(hs) if let Some(h) = hs.get(i) => {
-                // v3 F2: a known-walled domain carries its route
-                // cost — pick a faster source or budget time
-                // BEFORE spending the fetch.
-                match hints.get(i).and_then(|h| h.as_deref()) {
-                    Some(hint) => md.push_str(&format!("   {h} {hint}\n")),
-                    None => md.push_str(&format!("   {h}\n")),
-                }
-            }
-            _ => {
-                md.push_str(&format!("   {}\n", r.url));
-            }
-        }
-        // Provenance, text-side. Which engines returned a URL is the
-        // signal that separates two equally plausible results: three
-        // independent indexes agreeing usually means canonical, a
-        // lone vertical hit often means tangential. Until now it
-        // existed only in structuredContent, so a client that drops
-        // that field could not tell the two apart.
-        //
-        // NAMES, not a count: `consensus` in the JSON is
-        // sources.len(), which double-counts an engine that returned
-        // the URL at two ranks (live: ddg, yahoo, yahoo, brave = 4
-        // for 3 engines). Ranking counts index FAMILIES instead, so
-        // deduped names are both cheaper to read and more honest
-        // than the number — and they say WHICH source, which a count
-        // never can.
-        let mut engines: Vec<&str> = Vec::new();
-        for (engine, _) in &r.sources {
-            if !engines.contains(&engine.as_str()) {
-                engines.push(engine);
-            }
-        }
-        if !engines.is_empty() {
-            // 2dp, not the JSON's 3: this is a blended heuristic, and
-            // 0.831 reads like a measurement.
-            md.push_str(&format!(
-                "   engines: {} · score: {:.2}\n",
-                engines.join(", "),
-                r.score
-            ));
-        }
-    }
-    if out.weak {
-        md.push_str("\n*weak results: low cross-engine consensus — treat with care*\n");
-    }
-    // Zero hits is a success-shaped answer with nothing in it —
-    // tell the agent which levers exist instead of leaving it
-    // staring at an empty list.
-    if out.results.is_empty() {
-        md.push_str(
-            "\n*0 results — try a simpler query, a different intent (news/code/paper), \
-or add an API-key provider (`donsetch keys add`)*\n",
-        );
-    }
-    let source = out.provider.as_deref().unwrap_or("local engine");
-    md.push_str(&format!(
-        "\n*{} results in {}ms via {}*\n",
-        out.results.len(),
-        out.elapsed.as_millis(),
-        source
-    ));
-    // v3: degraded engines are named, never silently fewer. A merge
-    // built while engines were down must never pass as full-strength.
-    let failed: Vec<String> = out
-        .report
-        .iter()
-        .filter(|r| r.status != "ok")
-        .map(|r| format!("{}: {}", r.engine, r.status))
-        .collect();
-    if !failed.is_empty() {
-        md.push_str(&format!(
-            "*degraded: {}/{} engines ok ({}) — results may skew*\n",
-            out.report.len() - failed.len(),
-            out.report.len(),
-            failed.join(", ")
-        ));
-    }
-    if handles.is_some() && !out.results.is_empty() {
-        md.push_str("*fetch results by their S-handle (raw urls in structuredContent)*\n");
-    }
-    md
-}
-
-/// structuredContent metadata.
-pub fn render_meta(out: &SearchOutcome) -> Value {
-    json!({
-        "intent": format!("{:?}", out.intent),
-        "weak": out.weak,
-        "cached": out.cached,
-        "elapsed_ms": out.elapsed.as_millis() as u64,
-        "provider": out.provider,
-        "rerank": if out.reranked { "on" } else { "off (RRF+BM25 fallback)" },
-        "results": out.results.iter().map(|r| json!({
-            "title": r.title,
-            "url": r.url,
-            "snippet": r.snippet.chars().take(300).collect::<String>(),
-            "score": (r.score * 1000.0).round() / 1000.0,
-            "consensus": r.sources.len(),
-            "engines": r.sources.iter().map(|(e, _)| e.clone()).collect::<Vec<_>>(),
-        })).collect::<Vec<_>>(),
-        "engines": out.report.iter().map(|r| json!({
-            "engine": r.engine, "status": r.status, "hits": r.hits, "ms": r.ms,
-            "egress": if r.egress == "direct" { "direct".to_string() } else if r.egress == "byok" { "byok".to_string() } else { "proxy".to_string() },
-        })).collect::<Vec<_>>(),
-    })
-}
-
-/// Extract <title> from raw HTML.
-fn extract_title(html: &str) -> Option<String> {
-    let doc = scraper::Html::parse_document(html);
-    let sel = Selector::parse("title").ok()?;
-    doc.select(&sel)
-        .next()
-        .map(|e| e.text().collect::<Vec<_>>().join(" ").trim().to_string())
-        .filter(|t| !t.is_empty())
-}
-
-/// Extract <meta name="description"> (or og:description)
-/// from raw HTML.
-fn extract_description(html: &str) -> Option<String> {
-    let doc = scraper::Html::parse_document(html);
-    let sel =
-        Selector::parse(r#"meta[name="description"], meta[property="og:description"]"#).ok()?;
-    doc.select(&sel)
-        .next()
-        .and_then(|e| e.value().attr("content"))
-        .map(|s| s.trim().to_string())
-        .filter(|t| !t.is_empty())
-}
-
 /// Removes the inflight key when the leader finishes
 /// (success or failure) so the set never grows unbounded.
 struct InflightGuard<'a> {
@@ -1217,13 +1519,802 @@ struct InflightGuard<'a> {
 
 impl Drop for InflightGuard<'_> {
     fn drop(&mut self) {
-        self.map.lock().unwrap().remove(&self.key);
+        self.map
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.key);
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::render::clip_snippet;
     use super::*;
+
+    #[derive(Clone, Copy)]
+    enum ProbeCase {
+        Unavailable,
+        PriorBan,
+        Auth,
+        Cancelled,
+        Healthy,
+    }
+
+    async fn preflight_pair(case: ProbeCase) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut config = crate::config::DonsetchConfig::default();
+        config.fetch.allow_private_egress = true;
+        config.proxy.from_environment = false;
+        crate::config::install(config).unwrap();
+        let a = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let b = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxies = [&a, &b].map(|listener| {
+            crate::transport::proxy::Proxy::parse(&format!(
+                "http://{}",
+                listener.local_addr().unwrap()
+            ))
+            .unwrap()
+        });
+        let acceptor = if matches!(case, ProbeCase::Healthy) {
+            use boring::ssl::{SslAcceptor, SslMethod};
+            let cert = rcgen::generate_simple_self_signed(vec!["api.ipify.org".into()]).unwrap();
+            let bundle = crate::paths::cache_dir().join("owned-probe-ca.pem");
+            std::fs::write(&bundle, cert.cert.pem()).unwrap();
+            // Nextest gives this owned trust bundle its own process.
+            unsafe { std::env::set_var("SSL_CERT_FILE", &bundle) };
+            let mut acceptor = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls()).unwrap();
+            acceptor
+                .set_certificate(&boring::x509::X509::from_der(cert.cert.der()).unwrap())
+                .unwrap();
+            acceptor
+                .set_private_key(
+                    &boring::pkey::PKey::private_key_from_der(&cert.signing_key.serialize_der())
+                        .unwrap(),
+                )
+                .unwrap();
+            acceptor.set_alpn_select_callback(|_, peer| {
+                boring::ssl::select_next_proto(b"\x08http/1.1", peer)
+                    .ok_or(boring::ssl::AlpnError::NOACK)
+            });
+            Some(Arc::new(acceptor.build()))
+        } else {
+            None
+        };
+        let pool = Arc::new(EgressPool::new(proxies.to_vec()));
+        if matches!(case, ProbeCase::PriorBan) {
+            pool.report_auth_fail(&proxies[0].id());
+        }
+        let searcher = Arc::new(Searcher::new_shared(
+            Fetcher::new(crate::profile::BrowserProfile::host_default()).unwrap(),
+            Arc::clone(&pool),
+        ));
+        let second_reached = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let mut servers = Vec::new();
+        for (ordinal, listener) in [a, b].into_iter().enumerate() {
+            let second_reached = Arc::clone(&second_reached);
+            let release = Arc::clone(&release);
+            let acceptor = acceptor.clone();
+            servers.push(tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut head = Vec::new();
+                while !head.ends_with(b"\r\n\r\n") {
+                    assert!(head.len() < 16384);
+                    head.push(socket.read_u8().await.unwrap());
+                }
+                assert!(head.starts_with(b"CONNECT api.ipify.org:443 HTTP/1.1\r\n"));
+                if ordinal == 1 {
+                    second_reached.notify_one();
+                    if matches!(case, ProbeCase::Cancelled) {
+                        assert_eq!(socket.read(&mut [0u8; 1]).await.unwrap(), 0,
+                            "aborting preflight must close its pending CONNECT");
+                        return;
+                    }
+                    release.notified().await;
+                    if let Some(acceptor) = acceptor {
+                        socket.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n").await.unwrap();
+                        let mut tls = tokio_boring::accept(&acceptor, socket).await.unwrap();
+                        let mut request = Vec::new();
+                        while !request.ends_with(b"\r\n\r\n") {
+                            assert!(request.len() < 16384);
+                            request.push(tls.read_u8().await.unwrap());
+                        }
+                        assert!(request.starts_with(b"GET / HTTP/1.1\r\n"));
+                        tls.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\nConnection: close\r\n\r\n192.0.2.1").await.unwrap();
+                        return;
+                    }
+                }
+                let status = if ordinal == 0 && matches!(case, ProbeCase::Auth) {407} else {503};
+                socket.write_all(format!("HTTP/1.1 {status} Owned probe\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+                if status == 407 {
+                    assert!(tokio::time::timeout(Duration::from_millis(100), listener.accept()).await.is_err(),
+                        "unchanged credentials must not retry CONNECT407");
+                }
+            }));
+        }
+        let probe = searcher.preflight();
+        tokio::time::timeout(Duration::from_secs(3), second_reached.notified())
+            .await
+            .expect("both real proxy probes must be reached");
+        let ban_before_batch = matches!(case, ProbeCase::PriorBan | ProbeCase::Auth);
+        let first_was_benched = pool.is_dead(&proxies[0].id());
+        let selected = pool.pick_fetch("owned.example", true).unwrap().id;
+        if matches!(case, ProbeCase::Cancelled) {
+            probe.abort();
+            assert!(probe.await.unwrap_err().is_cancelled());
+        } else {
+            release.notify_one();
+            tokio::time::timeout(Duration::from_secs(3), probe)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        for server in servers {
+            tokio::time::timeout(Duration::from_secs(3), server)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        assert_eq!(
+            first_was_benched, ban_before_batch,
+            "generic echo failures cannot alter a lane while the batch is pending"
+        );
+        assert_eq!(
+            selected,
+            proxies[usize::from(ban_before_batch)].id(),
+            "an unresolved echo batch must preserve the selected egress"
+        );
+        assert_eq!(
+            pool.is_dead(&proxies[0].id()),
+            ban_before_batch || matches!(case, ProbeCase::Healthy)
+        );
+        assert!(
+            !pool.is_dead(&proxies[1].id()),
+            "an unavailable echo must not bench B, including after a real A407"
+        );
+        let reloaded = EgressPool::new(proxies.to_vec());
+        assert_eq!(
+            reloaded.is_dead(&proxies[0].id()),
+            pool.is_dead(&proxies[0].id()),
+            "completed health evidence must survive actual persistence"
+        );
+    }
+
+    #[tokio::test]
+    async fn stealth_v3_preflight_does_not_bench_a_lane_before_the_probe_batch_finishes() {
+        preflight_pair(ProbeCase::Unavailable).await;
+    }
+
+    #[tokio::test]
+    async fn stealth_v3_preflight_preserves_prior_bans_when_echo_is_unavailable() {
+        preflight_pair(ProbeCase::PriorBan).await;
+    }
+
+    #[tokio::test]
+    async fn stealth_v3_preflight_applies_auth_failure_without_benching_inconclusive_peer() {
+        preflight_pair(ProbeCase::Auth).await;
+    }
+
+    #[tokio::test]
+    async fn stealth_v3_preflight_cancellation_closes_connect_without_publishing_partial_batch() {
+        preflight_pair(ProbeCase::Cancelled).await;
+    }
+
+    #[tokio::test]
+    async fn stealth_v3_preflight_completed_healthy_tls_echo_benches_failed_peer() {
+        preflight_pair(ProbeCase::Healthy).await;
+    }
+
+    // The batch must obey one global ceiling: a pool of stalled lanes
+    // used to cost N * 6s of startup (8 lanes = 48s serial). With the
+    // ceiling the run stops at ~20s, the partial batch publishes
+    // nothing, and the unprobed lanes stay unbenched.
+    #[tokio::test]
+    async fn stealth_v3_preflight_batch_obeys_a_global_ceiling() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut config = crate::config::DonsetchConfig::default();
+        config.fetch.allow_private_egress = true;
+        config.proxy.from_environment = false;
+        crate::config::install(config).unwrap();
+        let mut listeners = Vec::new();
+        let mut proxies = Vec::new();
+        for _ in 0..8 {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            proxies.push(
+                crate::transport::proxy::Proxy::parse(&format!(
+                    "http://{}",
+                    listener.local_addr().unwrap()
+                ))
+                .unwrap(),
+            );
+            listeners.push(listener);
+        }
+        let pool = Arc::new(EgressPool::new(proxies.clone()));
+        let searcher = Arc::new(Searcher::new_shared(
+            Fetcher::new(crate::profile::BrowserProfile::host_default()).unwrap(),
+            Arc::clone(&pool),
+        ));
+        let mut servers = Vec::new();
+        for listener in listeners {
+            servers.push(tokio::spawn(async move {
+                while let Ok((mut socket, _)) = listener.accept().await {
+                    tokio::spawn(async move {
+                        let mut head = Vec::new();
+                        while !head.ends_with(b"\r\n\r\n") {
+                            assert!(head.len() < 16384);
+                            let mut buf = [0u8; 1024];
+                            let Ok(n) = socket.read(&mut buf).await else {
+                                return;
+                            };
+                            if n == 0 {
+                                return;
+                            }
+                            head.extend_from_slice(&buf[..n]);
+                        }
+                        // Accept the tunnel, then stall the handshake so
+                        // the probe dies on its own timeout.
+                        if socket
+                            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                            .await
+                            .is_ok()
+                        {
+                            tokio::time::sleep(Duration::from_secs(60)).await;
+                        }
+                    });
+                }
+            }));
+        }
+        let started = Instant::now();
+        searcher.preflight().await.unwrap();
+        let elapsed = started.elapsed();
+        for server in servers {
+            server.abort();
+        }
+        assert!(
+            elapsed < Duration::from_secs(30),
+            "preflight must obey the global ceiling; 8 stalled lanes took {elapsed:?} \
+             (serial N * 6s = 48s)"
+        );
+        assert!(
+            proxies.iter().all(|p| !pool.is_dead(&p.id())),
+            "a budget-cut partial batch must publish nothing"
+        );
+    }
+
+    fn test_searcher() -> Searcher {
+        // Hermetic: point disk cache/health at a throwaway dir so the
+        // real user cache is neither read nor polluted, then clear the
+        // in-memory map so the entry set is exactly what the test puts
+        // (robust even if a sibling test changed the env first).
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "donsetch-byok-cache-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        unsafe { std::env::set_var("DONSETCH_CACHE_DIR", &dir) };
+        let fetcher = Fetcher::new(crate::profile::BrowserProfile::host_default()).unwrap();
+        let s = Searcher::new(fetcher, EgressPool::new(Vec::new()));
+        s.cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+        s
+    }
+
+    fn byok_outcome(provider: &str, urls: &[&str]) -> SearchOutcome {
+        let results = urls
+            .iter()
+            .enumerate()
+            .map(|(i, u)| Merged {
+                title: format!("t{i}"),
+                url: (*u).to_string(),
+                snippet: "s".into(),
+                sources: vec![(provider.to_string(), i)],
+                score: 1.0 - i as f64 * 0.1,
+                published: None,
+            })
+            .collect::<Vec<_>>();
+        let report = vec![EngineReport {
+            engine: provider.to_string(),
+            profile: None,
+            status: "ok".into(),
+            hits: results.len(),
+            ms: 12,
+            egress: "byok".into(),
+        }];
+        SearchOutcome {
+            results,
+            weak: false,
+            intent: Intent::Web,
+            report,
+            cached: false,
+            elapsed: Duration::ZERO,
+            provider: Some(provider.to_string()),
+            reranked: false,
+            instant: None,
+            stage_ms: Vec::new(),
+        }
+    }
+
+    // Issue #195: a repeat BYOK query must be served from the cache
+    // (cached: true, provider preserved), never re-billing the
+    // provider. The store/serve roundtrip is the mechanism the wiring
+    // in search_tool relies on.
+    #[tokio::test]
+    async fn wave450_optional_search_stages_preserve_time_for_results() {
+        let cap = Duration::from_secs(30);
+        let reserve = Duration::from_secs(5);
+        assert_eq!(stage_budget(cap, reserve), cap);
+        SEARCH_DEADLINE
+            .scope(
+                Some(tokio::time::Instant::now() + Duration::from_millis(200)),
+                async {
+                    assert_eq!(stage_budget(cap, reserve), Duration::ZERO);
+                },
+            )
+            .await;
+        SEARCH_DEADLINE
+            .scope(
+                Some(tokio::time::Instant::now() + Duration::from_secs(8)),
+                async {
+                    let budget = stage_budget(cap, reserve);
+                    assert!(
+                        budget > Duration::from_secs(2) && budget <= Duration::from_secs(3),
+                        "{budget:?}"
+                    );
+                },
+            )
+            .await;
+        assert_eq!(
+            stage_budget(cap, reserve),
+            cap,
+            "deadline must not escape the call"
+        );
+    }
+
+    #[test]
+    fn byok_results_roundtrip_the_cache_with_provider_and_cached_flag() {
+        let s = test_searcher();
+        // Cold: nothing cached, so a caller must go bill the provider.
+        assert!(s.byok_cache_get("quic test 42", Intent::Web, 3).is_none());
+
+        let mut out = byok_outcome("tinyfish", &["https://a.test/", "https://b.test/"]);
+        out.results[0].title = "QUIC test 42 transport evidence".into();
+        s.byok_cache_put("quic test 42", &out);
+
+        // Warm: served from cache, marked cached, provider intact.
+        let hit = s
+            .byok_cache_get("quic test 42", Intent::Web, 3)
+            .expect("a fresh BYOK entry must hit");
+        assert!(hit.cached, "a served BYOK cache entry must report cached");
+        assert_eq!(hit.provider.as_deref(), Some("tinyfish"));
+        assert!(!hit.weak);
+        assert_eq!(hit.results.len(), 2);
+        assert_eq!(hit.results[0].url, "https://a.test/");
+        s.byok_cache_put("qwertyuiop unrelated gibberish", &out);
+        let unrelated = s
+            .byok_cache_get("qwertyuiop unrelated gibberish", Intent::Web, 3)
+            .unwrap();
+        assert!(
+            unrelated.weak,
+            "cached provider ranking cannot certify query relevance"
+        );
+    }
+
+    // The BYOK namespace must not collide with the local path: a
+    // provider result must never be served for a local-default query
+    // of the same text/intent, nor vice versa.
+    #[test]
+    fn byok_cache_is_isolated_from_the_local_namespace() {
+        let s = test_searcher();
+        let out = byok_outcome("serper", &["https://only-byok.test/"]);
+        s.byok_cache_put("shared query", &out);
+        // The local cache key (query|intent) is a different slot, so a
+        // local read finds nothing the BYOK write left behind.
+        let local_key = format!("{}|{}", norm_query("shared query"), Intent::Web.code());
+        assert!(
+            !s.cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(&local_key),
+            "a BYOK write must not populate the local cache slot"
+        );
+        // And the BYOK read still finds its own entry.
+        assert!(s.byok_cache_get("shared query", Intent::Web, 5).is_some());
+        // A different intent is a different entry (miss).
+        assert!(s.byok_cache_get("shared query", Intent::News, 5).is_none());
+    }
+
+    #[test]
+    fn regression_unavailable_google_does_not_stop_other_assignments() {
+        let proxy = crate::transport::proxy::Proxy::parse("http://127.0.0.1:12345").unwrap();
+        let id = proxy.id();
+        let pool = EgressPool::new(vec![proxy]);
+        pool.report_blocked("google", &id);
+        let assignments = ["google", "bing"]
+            .map(|e| (e.into(), "query".into()))
+            .to_vec();
+        // Explicitly unavailable direct lane; the proxy is still viable for Bing.
+        let selected = assign_egresses(&pool, assignments, &mut vec!["direct".into()]);
+        assert_eq!(
+            selected
+                .iter()
+                .map(|(engine, _, _)| engine.as_str())
+                .collect::<Vec<_>>(),
+            ["bing"]
+        );
+    }
+
+    #[test]
+    fn assignments_preserve_proxy_spreading_and_shared_direct_lane() {
+        let proxies = ["http://127.0.0.1:12345", "http://127.0.0.1:12346"]
+            .map(|url| crate::transport::proxy::Proxy::parse(url).unwrap())
+            .to_vec();
+        let pool = EgressPool::new(proxies);
+        let assignments = ["bing", "yahoo", "brave", "ddg"]
+            .map(|e| (e.into(), "query".into()))
+            .to_vec();
+        let mut used = Vec::new();
+        let selected = assign_egresses(&pool, assignments, &mut used);
+        assert_eq!(selected.len(), 4);
+        assert_eq!(used, ["127.0.0.1:12345", "127.0.0.1:12346"]);
+        assert_eq!(selected[2].2.id, "direct");
+        assert_eq!(selected[3].2.id, "direct");
+    }
+
+    #[test]
+    fn google_transport_health_is_separate_but_index_family_is_shared() {
+        assert_eq!(engine_health_key("google@6230-05.50"), "google_http_v1");
+        assert_ne!(engine_health_key("google"), "google");
+        assert_ne!(
+            engine_health_key("google"),
+            engine_health_key("google_ghost")
+        );
+        assert_eq!(engine_health_key("ddg_html"), "ddg");
+        assert_eq!(
+            rank::engine_family("google"),
+            rank::engine_family("google_ghost")
+        );
+    }
+
+    #[test]
+    fn engine_reports_load_legacy_cache_and_preserve_new_profile() {
+        let mut report: EngineReport = serde_json::from_str(
+            r#"{"engine":"google","status":"ok","hits":10,"ms":700,"egress":"direct"}"#,
+        )
+        .unwrap();
+        assert!(report.profile.is_none());
+        report.profile = Some("6230-04.44".into());
+        let reloaded: EngineReport =
+            serde_json::from_str(&serde_json::to_string(&report).unwrap()).unwrap();
+        assert_eq!(reloaded.profile.as_deref(), Some("6230-04.44"));
+    }
+
+    #[test]
+    fn successful_google_http_skips_browser_unless_explicitly_forced() {
+        assert!(!google_ghost_wanted(false, true, 1, 3));
+        assert!(google_ghost_wanted(false, false, 1, 3));
+        assert!(!google_ghost_wanted(false, false, 4, 20));
+        assert!(google_ghost_wanted(true, true, 4, 20));
+    }
+
+    #[test]
+    fn all_engines_share_retry_eligibility() {
+        for status in [
+            "blocked:captcha",
+            "blocked:429",
+            "blocked:consent",
+            "blocked:http-status",
+            "empty-parse",
+            "net",
+            "timeout",
+            "dead-proxy",
+            "auth-fail",
+        ] {
+            assert!(retry_engine_failure(status));
+            if !matches!(status, "dead-proxy" | "auth-fail") {
+                assert!(is_engine_fault(status));
+            }
+        }
+        for status in [
+            "invalid-config",
+            "invalid-config: proxy: unsupported scheme",
+            "no-results",
+            "pacing-timeout",
+        ] {
+            assert!(!retry_engine_failure(status));
+            assert!(!is_engine_fault(status));
+        }
+    }
+
+    #[tokio::test]
+    async fn slow_retry_does_not_discard_completed_peer() {
+        let fast: TaskFut = Box::pin(async {
+            (
+                "google".into(),
+                Err(("blocked:captcha".into(), "direct".into(), true)),
+            )
+        });
+        let slow: TaskFut = Box::pin(std::future::pending());
+        let outcomes = futures_util::future::join_all(vec![
+            bounded_retry(
+                fast,
+                "google".into(),
+                "direct".into(),
+                true,
+                Duration::from_millis(20),
+            ),
+            bounded_retry(
+                slow,
+                "bing".into(),
+                "direct".into(),
+                true,
+                Duration::from_millis(10),
+            ),
+        ])
+        .await;
+        assert_eq!(outcomes.len(), 2);
+        assert!(matches!(&outcomes[1].1, Err((s, _, _)) if s == "retry-timeout"));
+        assert_eq!(outcomes[0].0, "google");
+        // A second CAPTCHA is reported, not recursively scheduled.
+        assert!(matches!(&outcomes[0].1, Err((s, _, _)) if s == "blocked:captcha"));
+    }
+
+    #[test]
+    fn native_google_is_available_once_in_every_intent_roster() {
+        for intent in [
+            intent::Intent::Web,
+            intent::Intent::Code,
+            intent::Intent::News,
+            intent::Intent::Entity,
+            intent::Intent::Paper,
+        ] {
+            assert_eq!(
+                intent::engines_for(intent)
+                    .iter()
+                    .filter(|e| **e == "google")
+                    .count(),
+                1
+            );
+            assert!(!intent::engines_for(intent).contains(&"google_ghost"));
+        }
+    }
+
+    // Egress/BYOK-auth noise must never look like the engine
+    // misbehaving: record_outcome (quarantine) and bump_trust (the
+    // ranking-weight EWMA) both gate on this predicate, and had
+    // drifted out of sync before (bump_trust used to fire on
+    // "dead-proxy"/"auth-fail" too, eroding trust for infra failures
+    // the engine had nothing to do with).
+    #[test]
+    fn is_engine_fault_excludes_infra_and_no_results() {
+        assert!(!is_engine_fault("dead-proxy"));
+        assert!(!is_engine_fault("auth-fail"));
+        assert!(!is_engine_fault("no-results"));
+        assert!(!is_engine_fault("invalid-config"));
+        assert!(is_engine_fault("blocked:403"));
+        assert!(is_engine_fault("blocked:captcha"));
+        assert!(is_engine_fault("empty-parse"));
+        assert!(is_engine_fault("ghost-timeout"));
+        assert!(is_engine_fault("timeout"));
+        assert!(is_engine_fault("no-url"));
+        assert!(is_engine_fault("net"));
+    }
+
+    #[test]
+    fn mojeek_empty_parse_burns_trust_harder() {
+        assert_eq!(trust_target_for("mojeek", "empty-parse", false), 0.15);
+        assert_eq!(trust_target_for("bing", "empty-parse", false), 0.3);
+        assert_eq!(trust_target_for("mojeek", "blocked:429", false), 0.3);
+        assert_eq!(trust_target_for("mojeek", "ok", true), 1.2);
+    }
+
+    #[test]
+    fn early_consensus_needs_three_families_on_a_shared_top3() {
+        use crate::search::engines::Hit;
+        let hit = |url: &str, rank: usize| Hit {
+            title: "t".into(),
+            url: url.into(),
+            snippet: "s".into(),
+            rank,
+            published: None,
+        };
+        let ok = |engine: &str, urls: &[&str]| {
+            (
+                engine.to_string(),
+                Ok((
+                    urls.iter()
+                        .enumerate()
+                        .map(|(i, u)| hit(u, i + 1))
+                        .collect::<Vec<_>>(),
+                    10u64,
+                    "direct".to_string(),
+                    true,
+                    None,
+                )),
+            )
+        };
+        // Two families only: not enough.
+        let two = vec![
+            ok("brave", &["https://a.com/x", "https://b.com/y"]),
+            ok("bing", &["https://a.com/x", "https://b.com/y"]),
+        ];
+        assert!(!early_consensus_enough(&two));
+        // Three families, shared top URL: enough.
+        let three = vec![
+            ok("brave", &["https://a.com/x", "https://b.com/y"]),
+            ok("bing", &["https://a.com/x", "https://c.com/z"]),
+            ok("mojeek", &["https://a.com/x", "https://d.com/w"]),
+        ];
+        assert!(early_consensus_enough(&three));
+        // Three families but no shared top-3 URL: not enough.
+        let disjoint = vec![
+            ok("brave", &["https://a.com/x"]),
+            ok("bing", &["https://b.com/y"]),
+            ok("mojeek", &["https://c.com/z"]),
+        ];
+        assert!(!early_consensus_enough(&disjoint));
+    }
+
+    #[test]
+    fn google_ghost_is_its_own_family_for_ranking_math() {
+        assert_eq!(rank::engine_family("google_ghost"), "google");
+        assert_eq!(rank::engine_family("google"), "google");
+        // Not a vertical: full RRF mass, no vertical-only penalty.
+        assert!(!rank::is_vertical("google_ghost"));
+    }
+
+    #[test]
+    fn family_count_dedups_shared_indexes() {
+        let mut r = Merged {
+            title: "t".into(),
+            url: "https://a.com/".into(),
+            snippet: "s".into(),
+            sources: Vec::new(),
+            score: 0.0,
+            published: None,
+        };
+        r.sources = vec![
+            ("bing".into(), 0),
+            ("ddg".into(), 3),
+            ("yahoo".into(), 5),
+            ("google_ghost".into(), 2),
+            ("brave".into(), 4),
+        ];
+        // 5 engines, 3 families (bing family dedups to one opinion).
+        assert_eq!(rank::family_count(&r), 3);
+        let markdown = render_compact_markdown(&outcome(vec![r]), "", None, &[]);
+        assert!(markdown.contains("3 index families"), "{markdown}");
+    }
+
+    #[test]
+    fn news_snippet_carries_publisher_not_bare_date() {
+        let body = r#"<rss><item>
+          <title>Power grid restore advances - Wire News</title>
+          <link>https://example.gov/grid</link>
+          <pubDate>Thu, 31 Jul 2026 07:00:00 GMT</pubDate>
+        </item></rss>"#;
+        let hits = verticals::parse("news", body);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].snippet, "Wire News · Thu, 31 Jul 2026 07:00:00 GMT");
+    }
+
+    #[test]
+    fn engine_health_persists_across_restart() {
+        // nextest = one process per test: DONSETCH_CACHE_DIR is
+        // ours to own. Point it at a throwaway dir, write learned
+        // health, and read it back like a fresh daemon would.
+        let dir =
+            std::env::temp_dir().join(format!("donseek-health-{}-{}", std::process::id(), line!()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // 2024 edition marks env mutation unsafe; nextest runs each
+        // test as its own process, so this is race-free here.
+        unsafe { std::env::set_var("DONSETCH_CACHE_DIR", &dir) };
+
+        let mut trust = HashMap::new();
+        trust.insert("brave".to_string(), 1.8);
+        trust.insert("bing".to_string(), 0.42);
+        let trust_intent = HashMap::new();
+        let mut failures = HashMap::new();
+        failures.insert("google".to_string(), (3, Instant::now()));
+        crate::search::persist::save_health_disk(&trust, &trust_intent, &failures);
+
+        let (t, ti, f) = load_health_disk();
+        assert_eq!(t["brave"], 1.8, "high trust survives");
+        assert_eq!(t["bing"], 0.42, "low trust survives");
+        assert_eq!(f.get("google").map(|(n, _)| *n), Some(3));
+        // v1-shaped write (no trust_intent) still loads; migration
+        // seeds every intent from the engine-global EWMA.
+        assert!(
+            ti.contains_key(&super::persist::trust_intent_key("brave", Intent::Web)),
+            "v1 trust must migrate into per-intent keys"
+        );
+
+        unsafe { std::env::remove_var("DONSETCH_CACHE_DIR") };
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// B2 discriminator: a News-intent demotion of an engine must
+    /// not crush the same engine's Web-intent trust (and vice versa).
+    #[test]
+    fn per_intent_trust_is_scoped_not_global() {
+        let dir = std::env::temp_dir().join(format!(
+            "donseek-intent-trust-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        unsafe { std::env::set_var("DONSETCH_CACHE_DIR", &dir) };
+
+        let fetcher = Fetcher::new(crate::profile::BrowserProfile::host_default()).unwrap();
+        let searcher = Searcher::new(fetcher, EgressPool::new(Vec::new()));
+        for _ in 0..8 {
+            searcher.bump_trust("bing", Intent::News, false);
+            searcher.bump_trust("bing", Intent::Web, true);
+        }
+        {
+            let ti = searcher
+                .trust_intent
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let news = ti[&super::persist::trust_intent_key("bing", Intent::News)];
+            let web = ti[&super::persist::trust_intent_key("bing", Intent::Web)];
+            assert!(
+                news < 0.6 && web > 1.0,
+                "news demotion must stay scoped: news={news} web={web}"
+            );
+        }
+        unsafe { std::env::remove_var("DONSETCH_CACHE_DIR") };
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "rerank")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn blocking_ranking_keeps_the_async_executor_responsive() {
+        let (tick_sender, tick_receiver) = std::sync::mpsc::channel();
+
+        let (worker_result, ()) = tokio::join!(
+            run_blocking_ranking(move || tick_receiver.recv_timeout(Duration::from_secs(1))),
+            async {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                tick_sender.send(()).expect("blocking worker should wait");
+            }
+        );
+
+        assert!(
+            worker_result
+                .expect("blocking job should join")
+                .expect("job completed within budget")
+                .is_ok()
+        );
+    }
+
+    #[cfg(feature = "rerank")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn report_audit_semantic_deadline_retains_lexical_evidence() {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(600);
+        let result = SEARCH_DEADLINE
+            .scope(Some(deadline), async {
+                let (ranked, started) = tokio::join!(
+                    run_blocking_ranking(move || {
+                        started_tx.send(()).unwrap();
+                        release_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                        "semantic evidence"
+                    }),
+                    started_rx,
+                );
+                started.unwrap();
+                ranked.unwrap().unwrap_or("retrieved lexical evidence")
+            })
+            .await;
+        release_tx.send(()).unwrap();
+        assert_eq!(result, "retrieved lexical evidence");
+        assert!(tokio::time::Instant::now() < deadline);
+    }
 
     #[test]
     fn governor_shrinks_width_under_stress() {
@@ -1232,6 +2323,30 @@ mod tests {
         assert_eq!(width_for_stress(0.50, 4), 2);
         assert_eq!(width_for_stress(0.90, 4), 1);
         assert_eq!(width_for_stress(0.90, 0), 0);
+    }
+
+    #[test]
+    fn query_validation_holds_the_line() {
+        assert!(validate_query("   ").is_some(), "blank query rejected");
+        assert!(validate_query("").is_some(), "empty query rejected");
+        let long = "rust ".repeat(120); // 612 chars with trailing space
+        assert!(validate_query(&long).is_some(), "oversized query rejected");
+        assert!(validate_query("rust ownership").is_none());
+        assert!(
+            validate_query("glue").is_none(),
+            "punctuation-only-ish query is fine"
+        );
+    }
+
+    #[test]
+    fn ghost_lane_gate_needs_real_thinness_or_force() {
+        // A healthy merge never pays a browser render.
+        assert!(!ghost_lane_wanted(5, 40));
+        assert!(!ghost_lane_wanted(3, 16));
+        // Thin merge on either axis fires the lane.
+        assert!(ghost_lane_wanted(2, 40), "few engines ok");
+        assert!(ghost_lane_wanted(4, 12), "thin hits");
+        assert!(ghost_lane_wanted(0, 0));
     }
 
     #[test]
@@ -1296,7 +2411,7 @@ mod tests {
 
     #[test]
     fn clip_backs_off_to_word_boundary() {
-        // Straddling word, last space at 16 of 20 — exactly the
+        // Straddling word, last space at 16 of 20 : exactly the
         // 4/5 floor, so the partial word goes.
         assert_eq!(
             clip_snippet("aaaaaaaaaaaaaaaa bbbbbbbbbb", 20),
@@ -1347,7 +2462,7 @@ mod tests {
     #[test]
     fn clip_keeps_a_sentence_terminator() {
         // A cut landing after '.' means the snippet ended on a
-        // COMPLETE sentence — stripping it would make a clean
+        // COMPLETE sentence : stripping it would make a clean
         // ending look severed.
         assert_eq!(
             clip_snippet("Tokio is a runtime. Axum builds on it.", 20),
@@ -1355,7 +2470,7 @@ mod tests {
         );
     }
 
-    /// Sōseki's opening line — 3-byte chars, and no spaces at
+    /// Sōseki's opening line : 3-byte chars, and no spaces at
     /// all, which is the real reason Japanese is the right test:
     /// there is no word boundary to back off to, so every cut is
     /// a hard cut and byte slicing would panic outright.
@@ -1371,19 +2486,19 @@ mod tests {
 
     #[test]
     fn clip_keeps_a_cjk_sentence_terminator() {
-        // Cut lands right after 。 (U+3002) — the same codepoint
+        // Cut lands right after 。 (U+3002) : the same codepoint
         // in Chinese and Japanese. It ends a sentence, so it stays.
         assert_eq!(clip_snippet(JA, 17), "「吾輩は猫である。名前はまだ無い。…");
     }
 
     #[test]
     fn clip_keeps_chinese_terminators_and_strips_chinese_separators() {
-        // ！ (U+FF01) ends a sentence — kept.
+        // ！ (U+FF01) ends a sentence : kept.
         assert_eq!(
             clip_snippet("这是一个测试。第二句话！第三句", 12),
             "这是一个测试。第二句话！…"
         );
-        // 、 (U+3001) is the enumeration comma — it joins, so it
+        // 、 (U+3001) is the enumeration comma : it joins, so it
         // goes rather than dangling before the ellipsis.
         assert_eq!(clip_snippet("第一项、第二项、第三项", 8), "第一项、第二项…");
     }
@@ -1398,6 +2513,8 @@ mod tests {
             elapsed: Duration::from_millis(10),
             provider: None,
             reranked: false,
+            instant: None,
+            stage_ms: Vec::new(),
         }
     }
 
@@ -1414,9 +2531,69 @@ mod tests {
     }
 
     #[test]
+    fn compact_markdown_keeps_evidence_and_actionable_state_only() {
+        let mut result = merged("https://tokio.rs/runtime");
+        result.title = "Tokio runtime guide".into();
+        result.snippet = "A focused explanation of the asynchronous runtime.".into();
+        result.sources = vec![("bing".into(), 0), ("ddg".into(), 2)];
+        result.score = 0.8312;
+        let mut search = outcome(vec![result]);
+        search.weak = true;
+        search.report = vec![
+            EngineReport {
+                engine: "bing".into(),
+                profile: None,
+                status: "ok".into(),
+                hits: 10,
+                ms: 12,
+                egress: "direct".into(),
+            },
+            EngineReport {
+                engine: "ddg".into(),
+                profile: None,
+                status: "blocked:403".into(),
+                hits: 0,
+                ms: 20,
+                egress: "proxy".into(),
+            },
+        ];
+
+        let markdown = render_compact_markdown(
+            &search,
+            "# Search results",
+            Some(&["S1".into()]),
+            &[Some("· ⚠ needs browser".into())],
+        );
+        assert!(
+            markdown.contains(
+                "1. S1 · Tokio runtime guide : tokio.rs · ⚠ needs browser · 1 index family"
+            ),
+            "index-family count follows the route hint: {markdown}"
+        );
+        assert!(markdown.contains("A focused explanation"));
+        assert!(markdown.contains("Weak results : low query relevance or cross-index agreement."));
+        assert!(markdown.contains("Degraded retrieval : 1/2 backends available."));
+        for diagnostic in [
+            "engines:",
+            "score:",
+            "results in",
+            "via local",
+            "fetch results by",
+        ] {
+            assert!(!markdown.contains(diagnostic), "{diagnostic}:\n{markdown}");
+        }
+    }
+
+    #[test]
+    fn compact_markdown_gives_zero_result_recovery() {
+        let markdown = render_compact_markdown(&outcome(Vec::new()), "# Search results", None, &[]);
+        assert!(markdown.contains("materially different formulation"));
+    }
+
+    #[test]
     fn markdown_dedupes_repeated_engines() {
         // One engine returning the same URL at two ranks must not
-        // read as extra consensus — the JSON's `consensus` count
+        // read as extra consensus : the JSON's `consensus` count
         // does exactly that.
         let mut r = merged("https://tokio.rs/");
         r.sources = vec![

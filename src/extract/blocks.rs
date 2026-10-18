@@ -10,7 +10,7 @@ const MAX_DEPTH: usize = 300;
 
 /// Inline phrasing elements: consumed by an ancestor's
 /// loose-text paragraph, NEVER walked as standalone blocks
-/// (that duplicates content). They still recurse — a card
+/// (that duplicates content). They still recurse : a card
 /// link <a><h2>…</h2><p>…</p></a> has block children that
 /// must be emitted.
 pub const INLINE_TAGS: &[&str] = &[
@@ -71,9 +71,9 @@ impl Block {
         }
     }
 
-    /// Plain text for BM25 (path included as context).
-    pub fn text(&self) -> String {
-        let body = match self {
+    /// The block's own text, without inherited heading breadcrumbs.
+    pub fn body_text(&self) -> String {
+        match self {
             Block::Heading { text, .. } => text.clone(),
             Block::Para { md, .. } | Block::Quote { md, .. } => md.clone(),
             Block::List { items, .. } => items.join(" "),
@@ -87,7 +87,12 @@ impl Block {
             }
             Block::Code { code, .. } => code.clone(),
             Block::Media { alt, .. } => alt.clone(),
-        };
+        }
+    }
+
+    /// Plain text with heading context for accounting and diagnostics.
+    pub fn text(&self) -> String {
+        let body = self.body_text();
         if self.path().is_empty() {
             body
         } else {
@@ -135,7 +140,7 @@ fn walk<'a>(
     match name {
         "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
             let level = name.as_bytes()[1] - b'0';
-            let text = inline::plain(el);
+            let text = inline::markdown(el, base, opts).0;
             if !text.is_empty() {
                 while headings.last().is_some_and(|(l, _)| *l >= level) {
                     headings.pop();
@@ -180,11 +185,11 @@ fn walk<'a>(
         }
         "table" => {
             // Prose tables (forum threads, HN comment trees, layout
-            // tables) must NOT go through the pipe-table renderer —
+            // tables) must NOT go through the pipe-table renderer :
             // it clamps cells to 120 chars and destroys the text.
             // Data tables keep the pipe rendering.
             if is_prose_table(el) {
-                // Walk children as containers — comment divs inside
+                // Walk children as containers : comment divs inside
                 // the cells become real paragraphs.
                 let loose = loose_text(el, base, opts);
                 if !loose.0.is_empty() {
@@ -206,14 +211,14 @@ fn walk<'a>(
                     }
                     walk(child_el, base, opts, headings, out, depth + 1);
                 }
-            } else if let Some(t) = table_block(el, headings) {
+            } else if let Some(t) = table_block(el, headings, opts.selector.is_some(), base, opts) {
                 push_block(t, out);
             }
         }
         "math" => {
             // Formula as its own block: `$$LaTeX$$`. alttext (the
             // original LaTeX) when present, MathML serialization
-            // otherwise. Math elements must never vanish — that
+            // otherwise. Math elements must never vanish : that
             // guts technical pages.
             let l = super::math::latex(el);
             if !l.is_empty() {
@@ -228,8 +233,10 @@ fn walk<'a>(
             }
         }
         "pre" => {
-            // Raw text, whitespace PRESERVED (code must keep newlines).
-            let code: String = el.text().collect::<Vec<_>>().join("");
+            // Raw text, whitespace PRESERVED (code must keep newlines);
+            // script/style subtrees are never source content, even
+            // inside a pre (#288).
+            let code = inline::visible_text_raw(el);
             let code = code.trim_matches('\n').to_string();
             // Collapse 3+ consecutive newlines to 2: common in
             // source code, each blank line pair wastes tokens.
@@ -283,7 +290,7 @@ fn walk<'a>(
         }
         "dl" => {
             // Definition list: dt (term) + dd (definition) pairs.
-            // Rendered as a list with "**term** — definition".
+            // Rendered as a list with "**term** : definition".
             let items = def_list_items(el, base, opts);
             if !items.is_empty() {
                 push_block(
@@ -297,7 +304,7 @@ fn walk<'a>(
                 );
             }
         }
-        // Media blocks are ALWAYS segmented (cheap) — the render
+        // Media blocks are ALWAYS segmented (cheap) : the render
         // layer drops them unless include_media. On-demand image
         // OCR (v3) needs the image list even when media lines are
         // not part of the output.
@@ -308,7 +315,7 @@ fn walk<'a>(
         _ => {
             // Container or unknown: emit direct loose text as a
             // paragraph (div-soup), then recurse into children.
-            // Inline elements emit nothing themselves — their
+            // Inline elements emit nothing themselves : their
             // text was captured by the nearest block ancestor.
             if !INLINE_TAGS.contains(&name) {
                 let loose = loose_text(el, base, opts);
@@ -335,7 +342,7 @@ fn walk<'a>(
                 // The gate in score.rs handles main-content
                 // detection; applying it again here nukes real
                 // content (Reddit/HN comments have class "comment"
-                // which is in NEGATIVE_SUBSTR — the gate was
+                // which is in NEGATIVE_SUBSTR : the gate was
                 // silently dropping all short comments).
                 walk(child_el, base, opts, headings, out, depth + 1);
             }
@@ -343,7 +350,7 @@ fn walk<'a>(
     }
 }
 
-/// Direct (non-element-wrapped) text of an element — the
+/// Direct (non-element-wrapped) text of an element : the
 /// div-soup paragraph case.
 fn loose_text(el: ElementRef<'_>, base: &str, opts: &super::ExtractOptions) -> (String, f32) {
     let mut buf = String::new();
@@ -354,7 +361,10 @@ fn loose_text(el: ElementRef<'_>, base: &str, opts: &super::ExtractOptions) -> (
             Node::Text(t) => {
                 let s = t.text.trim();
                 if !s.is_empty() {
-                    if !buf.is_empty() {
+                    // After a br the buffer ends with a newline: that
+                    // IS the separator. A space here would give every
+                    // paragraph after a br run a leading space.
+                    if !buf.is_empty() && !buf.ends_with('\u{0}') {
                         buf.push(' ');
                     }
                     buf.push_str(s);
@@ -366,16 +376,37 @@ fn loose_text(el: ElementRef<'_>, base: &str, opts: &super::ExtractOptions) -> (
                     continue;
                 };
                 let n = c.value().name();
-                // Inline phrasing content belongs to the loose paragraph —
+                // Inline phrasing content belongs to the loose paragraph :
                 // but an inline element wrapping BLOCK children (card
                 // links: <a><h2>…</h2><p>…</p></a>) must not be
                 // swallowed here; the walk emits those blocks itself.
+                if n == "br" {
+                    // A <br> is a line break, not empty content. The
+                    // inline renderer only walks CHILDREN, so a br
+                    // passed as the root renders empty and its break
+                    // is lost (issue #227: "text<br />\r<br />\r\ntext"
+                    // collapsed to one space). Emit the same NUL
+                    // sentinel the inline renderer uses so the collapse
+                    // turns it into a newline. This is the shared
+                    // conversion site for every DOM-to-markdown path
+                    // (tier 1, tier-2 ghost, adapters, fallback).
+                    buf.push('\u{0}');
+                    continue;
+                }
                 if INLINE_TAGS.contains(&n) && !crate::extract::junk::skip(c) && !contains_block(c)
                 {
-                    let (md, _) = inline::markdown(c, base, opts);
-                    let t = md.trim();
+                    let (md, _) = inline::element_markdown(c, base, opts);
+                    // Newlines inside inline content are real line breaks
+                    // (the br sentinel survives the inline render). Trim
+                    // horizontal whitespace but keep the newlines: a
+                    // br-only inline run ("text<br />\r<br />\r\ntext")
+                    // must yield paragraph breaks, not collapse to one
+                    // space (issue #227, live-confirmed on the tier-2
+                    // ghost path; this is the shared conversion site
+                    // every DOM-to-markdown path funnels through).
+                    let t = md.trim_matches(|ch: char| ch != '\n' && ch.is_whitespace());
                     if !t.is_empty() {
-                        if !buf.is_empty() {
+                        if !buf.is_empty() && !buf.ends_with('\u{0}') {
                             buf.push(' ');
                         }
                         buf.push_str(t);
@@ -394,7 +425,11 @@ fn loose_text(el: ElementRef<'_>, base: &str, opts: &super::ExtractOptions) -> (
     } else {
         0.0
     };
-    (buf, ld)
+    // The buffer is raw inline rendering: it may carry the br NUL
+    // sentinel, so collapse it exactly like inline::markdown does
+    // (whitespace fold, then sentinel to newline). Without this the
+    // sentinels survive into the block markdown raw (issue #227).
+    (inline::collapse_to_markdown(&buf), ld)
 }
 
 /// True when an element has block-level descendants.
@@ -428,7 +463,11 @@ fn contains_block(el: ElementRef<'_>) -> bool {
     false
 }
 
-fn list_items(
+/// Items of a `<ul>`/`<ol>`, nested lists flattened to indented
+/// entries ("  " per level, up to 4 deep). Shared with the docs
+/// and Wikipedia adapters so nested lists render the same way
+/// everywhere.
+pub(crate) fn list_items(
     list: ElementRef<'_>,
     base: &str,
     opts: &super::ExtractOptions,
@@ -444,7 +483,15 @@ fn list_items(
         if li.value().name() != "li" || crate::extract::junk::skip(li) {
             continue;
         }
-        let (md, ld) = inline::markdown(li, base, opts);
+        // Below the cap the nested lists are rendered as indented
+        // items (so the item's own line must not include them); at
+        // the cap they are flattened into the line instead, never
+        // dropped.
+        let (md, ld) = if depth < 4 {
+            inline::item_markdown(li, base, opts)
+        } else {
+            inline::markdown(li, base, opts)
+        };
         let md = md.trim().to_string();
         if !md.is_empty() {
             items.push(format!("{}{}", "  ".repeat(depth as usize), md));
@@ -470,8 +517,8 @@ fn list_items(
     (items, ld)
 }
 
-/// Definition list (dl/dt/dd) — render as
-/// "**term** — definition" list items.
+/// Definition list (dl/dt/dd) : render as
+/// "**term** : definition" list items.
 fn def_list_items(dl: ElementRef<'_>, base: &str, opts: &super::ExtractOptions) -> Vec<String> {
     let mut items = Vec::new();
     let mut current_term: Option<String> = None;
@@ -496,7 +543,7 @@ fn def_list_items(dl: ElementRef<'_>, base: &str, opts: &super::ExtractOptions) 
                     continue;
                 }
                 if let Some(term) = &current_term {
-                    items.push(format!("**{term}** — {def}"));
+                    items.push(format!("**{term}** : {def}"));
                 } else {
                     items.push(def);
                 }
@@ -509,13 +556,51 @@ fn def_list_items(dl: ElementRef<'_>, base: &str, opts: &super::ExtractOptions) 
 
 /// Layout/prose table detection. Forums (HN, phpBB), old CMSes,
 /// and email-style pages lay CONTENT out in tables; rendering those
-/// as pipe tables truncates every cell to 120 chars and flattens
-/// paragraphs. A table is prose/layout when:
+/// as pipe tables flattens their paragraph structure. A table is
+/// prose/layout when:
 /// - it declares `role="presentation"`, or
-/// - any cell holds real paragraph-length text (300+ chars), or
-/// - it is effectively single-column.
+/// - without explicit headers, any cell holds paragraph-length text
+///   (300+ chars), or it is effectively single-column.
 ///
 /// Data tables (specs, pricing, comparisons) stay pipe tables.
+/// A table's own rows: `tr` children, directly or through its
+/// `thead`/`tbody`/`tfoot`. The descendant select used before
+/// (`el.select("tr")`) also returned every row of every table nested
+/// in a cell, so a nested table's rows were merged into the outer
+/// one, and on a page of tables nested d deep the outer row "held"
+/// all d nested cells, each scanned down to the bottom: quadratic
+/// per level, and the walk then recursed a level and did it again.
+/// 18 KB of `<table><tr><td>` × 1000 took minutes.
+fn own_rows<'a>(table: ElementRef<'a>) -> Vec<ElementRef<'a>> {
+    let mut rows = Vec::new();
+    for child in table.children() {
+        let Some(c) = ElementRef::wrap(child) else {
+            continue;
+        };
+        match c.value().name() {
+            "tr" => rows.push(c),
+            "thead" | "tbody" | "tfoot" => {
+                for gc in c.children() {
+                    if let Some(g) = ElementRef::wrap(gc)
+                        && g.value().name() == "tr"
+                    {
+                        rows.push(g);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    rows
+}
+
+/// A row's own cells, in document order.
+fn own_cells<'a>(tr: ElementRef<'a>) -> impl Iterator<Item = ElementRef<'a>> {
+    tr.children()
+        .filter_map(ElementRef::wrap)
+        .filter(|c| matches!(c.value().name(), "td" | "th"))
+}
+
 fn is_prose_table(el: ElementRef<'_>) -> bool {
     if el.value().attr("role") == Some("presentation") {
         return true;
@@ -523,10 +608,12 @@ fn is_prose_table(el: ElementRef<'_>) -> bool {
     let mut max_cell = 0usize;
     let mut rows = 0usize;
     let mut max_cols = 0usize;
-    for tr in el.select(&scraper::Selector::parse("tr").unwrap()).take(40) {
+    let mut has_headers = false;
+    for tr in own_rows(el).into_iter().take(40) {
         rows += 1;
         let mut cols = 0usize;
-        for cell in tr.select(&scraper::Selector::parse("td,th").unwrap()) {
+        for cell in own_cells(tr) {
+            has_headers |= cell.value().name() == "th";
             cols += 1;
             let t = crate::extract::junk::text_size(cell, 400);
             max_cell = max_cell.max(t);
@@ -536,50 +623,54 @@ fn is_prose_table(el: ElementRef<'_>) -> bool {
     if rows == 0 {
         return false;
     }
+    // Explicit headers identify a data table even when a cell is long.
+    if has_headers {
+        return false;
+    }
     // Paragraph-length text in a cell = the table holds prose.
     if max_cell >= 300 {
         return true;
     }
     // Single-column table of short cells is still layout (indent
-    // spacers, vertical stacks) — but only when it has several rows
+    // spacers, vertical stacks) : but only when it has several rows
     // (a 1×1 data table is degenerate either way).
     max_cols <= 1 && rows >= 2
 }
 
-fn table_block(el: ElementRef<'_>, headings: &[(u8, String)]) -> Option<Block> {
+fn table_block(
+    el: ElementRef<'_>,
+    headings: &[(u8, String)],
+    explicit_scope: bool,
+    base: &str,
+    opts: &super::ExtractOptions,
+) -> Option<Block> {
     let mut headers = Vec::new();
     let mut rows = Vec::new();
-    let mut truncated = false;
-    for (i, tr) in el
-        .select(&scraper::Selector::parse("tr").unwrap())
-        .enumerate()
-    {
-        if i >= 40 {
-            truncated = true;
-            break;
-        }
-        let cells: Vec<String> = tr
-            .select(&scraper::Selector::parse("th").unwrap())
-            .map(|c| inline::plain(c).replace('|', "\\|"))
-            .collect();
-        if !cells.is_empty() && headers.is_empty() && rows.is_empty() {
-            headers = cells;
-            continue;
-        }
-        let row: Vec<String> = tr
-            .select(&scraper::Selector::parse("td").unwrap())
+    // Output pagination is the budget. Cutting source rows or cells here
+    // makes later focus/probe/offset reads unable to recover the evidence.
+    for tr in own_rows(el) {
+        // One select over both cell kinds, in document order: a
+        // row's <th scope="row"> label has to stay in its column.
+        // Selecting <th> and <td> separately (the old shape) only
+        // ever used <th> for the header row, so every data row's
+        // label vanished and its remaining cells shifted left.
+        let cells: Vec<(bool, String)> = own_cells(tr)
             .map(|c| {
-                let t = inline::plain(c).replace('|', "\\|"); // unescaped pipes break md tables
-                // Char-based truncation: byte-based cuts CJK at ~40
-                // chars (3 bytes/char). 120 chars is the real limit.
-                if t.chars().count() > 120 {
-                    let truncated: String = t.chars().take(120).collect();
-                    format!("{truncated}…")
-                } else {
-                    t
-                }
+                let is_th = c.value().name() == "th";
+                let t = inline::markdown(c, base, opts).0.replace('|', "\\|"); // unescaped pipes break md tables
+                (is_th, t)
             })
             .collect();
+        // The header row is the first row made only of <th>.
+        if headers.is_empty()
+            && rows.is_empty()
+            && !cells.is_empty()
+            && cells.iter().all(|(is_th, _)| *is_th)
+        {
+            headers = cells.into_iter().map(|(_, t)| t).collect();
+            continue;
+        }
+        let row: Vec<String> = cells.into_iter().map(|(_, text)| text).collect();
         if row.iter().any(|c| !c.is_empty()) {
             rows.push(row);
         }
@@ -597,13 +688,13 @@ fn table_block(el: ElementRef<'_>, headings: &[(u8, String)]) -> Option<Block> {
     let total_text: usize = headers.iter().map(|h| h.len()).sum::<usize>()
         + rows.iter().flatten().map(|c| c.len()).sum::<usize>();
     let cells = headers.len() + rows.iter().map(|r| r.len()).sum::<usize>();
-    if cells <= 3 && total_text < 60 {
+    if !explicit_scope && cells <= 3 && total_text < 60 {
         return None;
     }
     Some(Block::Table {
         headers,
         rows,
-        truncated,
+        truncated: false,
         path: current_path(headings),
     })
 }
@@ -669,7 +760,7 @@ pub fn floor_boundary(s: &str, mut i: usize) -> usize {
 }
 
 /// Collapse 3+ consecutive newlines to 2. Source code often
-/// has runs of blank lines between functions — each extra
+/// has runs of blank lines between functions : each extra
 /// blank line wastes a token for zero content value.
 fn collapse_blank_lines(code: &str) -> String {
     let mut out = String::with_capacity(code.len());

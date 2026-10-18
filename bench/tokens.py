@@ -45,7 +45,7 @@ def main():
         if code not in (0,):
             print(f"{name:<20} FAILED (exit {code})")
             sys.exit(1)
-        # strip the [meta] first line — count content payload
+        # strip the [meta] first line : count content payload
         lines = out.split("\n")
         body = "\n".join(lines[1:]) if lines and lines[0].startswith("[meta]") else out
         chars = len(body)
@@ -68,7 +68,7 @@ def main():
     if probe_miss > 400:
         fails.append(f"probe-miss output {probe_miss} > 400 chars")
 
-    # handles: every markdown link should be [x](Lnn) — assert no raw URLs remain
+    # handles: every markdown link should be [x](Lnn) : assert no raw URLs remain
     body = results["hn-links-handles"][1]
     raw_urls = sum(1 for l in body.split("(") if l.startswith("http"))
     handles = body.count("](L")
@@ -83,7 +83,7 @@ def main():
         for f in fails:
             print(f"  - {f}")
         sys.exit(1)
-    print("PASS — token-efficiency invariants hold")
+    print("PASS : token-efficiency invariants hold")
 
 if __name__ == "__main__":
     main()

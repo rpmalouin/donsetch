@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""battle.py — DonSheet battle harness.
+"""battle.py : DonSheet battle harness.
 
 Runs every PDF in bench/battle-corpus/ (and tests/pdf-corpus/) through:
   1. donsetch extract (the pipeline under test)

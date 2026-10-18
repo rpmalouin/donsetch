@@ -1,6 +1,6 @@
-//! Pixel engine — rendered-page ground truth.
+//! Pixel engine : rendered-page ground truth.
 //!
-//! DonSheet's core thesis: PDFium renders both modalities of a document —
+//! DonSheet's core thesis: PDFium renders both modalities of a document :
 //! the glyph stream and the exact pixels a human sees. Heuristic extractors
 //! guess structure from glyphs; ML extractors guess structure (and text!)
 //! from pixels. We FUSE both, deterministically.
@@ -22,7 +22,7 @@ pub struct PageBitmap {
 
 impl PageBitmap {
     /// Convert to a binary ink mask. Ink = rendered darkness above a
-    /// threshold — catches hairline anti-aliased strokes (a 0.5pt rule at
+    /// threshold : catches hairline anti-aliased strokes (a 0.5pt rule at
     /// 96dpi covers ~0.66px and lands as mid-gray).
     pub fn ink_mask(&self) -> InkMask {
         let mut buf = vec![0u8; self.w * self.h];

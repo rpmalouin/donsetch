@@ -9,7 +9,7 @@
 //! - **Compound terms**: "B-tree" becomes `b` + `tree`. A result
 //!   about "binary tree" matches `tree` and gets BM25 credit for
 //!   a compound it doesn't contain. The cross-encoder might even
-//!   agree — they're both tree data structures — but "binary tree"
+//!   agree : they're both tree data structures : but "binary tree"
 //!   is not "B-tree".
 //!
 //! - **Version numbers**: "5.2" becomes `5` + `2`. A result about
@@ -29,7 +29,7 @@
 //!   *different* version with the same major number, that's a
 //!   version drift → 0.3× penalty. If no query version appears
 //!   at all and a different version is present, same penalty.
-//!   If ANY query version appears in the result, no penalty —
+//!   If ANY query version appears in the result, no penalty :
 //!   handles "python 3.12 vs 3.11" comparison queries.
 //!
 //! The penalty is a multiplier on the existing score, so it
@@ -45,13 +45,13 @@ const ANCHOR_MISS_PENALTY: f64 = 0.3;
 
 /// Penalty for version/year mismatch (different value, same
 /// category). 0.3 = 70% score reduction. A wrong version is
-/// a different entity — "GLM 5.5" is not "GLM 5.2", just as
+/// a different entity : "GLM 5.5" is not "GLM 5.2", just as
 /// "binary tree" is not "B-tree". Same severity as anchor miss.
 const SPECIFIER_MISMATCH_PENALTY: f64 = 0.3;
 
 #[derive(Debug, Clone)]
 struct Entity {
-    /// Lowercased match forms — any of these in the result text
+    /// Lowercased match forms : any of these in the result text
     /// counts as a match.
     variants: Vec<String>,
 }
@@ -147,6 +147,29 @@ fn entity_covered(entity: &Entity, text_lower: &str) -> bool {
 
 /// Find all version numbers (d{1,3}.d{1,3}) in text.
 /// Used to detect version mismatches.
+/// Boundary-aware version match (#164): `5.2` matches `5.2`, `5.2.1`
+/// and `v5.2`, but not `15.2` (longer major continuing from the
+/// left) or `5.20` (longer minor continuing to the right). A trailing
+/// dot starts a patch segment of the same minor line and still counts.
+/// Plain substring matching let wrong-version docs skip the
+/// specifier-mismatch penalty entirely.
+fn version_at_boundary(text: &str, version: &str) -> bool {
+    text.match_indices(version).any(|(start, matched)| {
+        let left_ok = start == 0
+            || text[..start]
+                .chars()
+                .next_back()
+                .is_some_and(|c| !c.is_ascii_digit() && c != '.');
+        let end = start + matched.len();
+        let right_ok = end >= text.len()
+            || text[end..]
+                .chars()
+                .next()
+                .is_some_and(|c| !c.is_ascii_digit());
+        left_ok && right_ok
+    })
+}
+
 fn find_versions(text: &str) -> Vec<String> {
     let bytes = text.as_bytes();
     let mut versions = Vec::new();
@@ -241,8 +264,10 @@ pub fn penalize(query: &str, results: &mut [Merged]) {
 
         // Version specifier: only penalize if NO query version
         // appears in the result. Handles "python 3.12 vs 3.11"
-        // — a result mentioning 3.11 matches one query version.
-        let any_version_matches = query_versions.iter().any(|v| text_lower.contains(v));
+        // : a result mentioning 3.11 matches one query version.
+        let any_version_matches = query_versions
+            .iter()
+            .any(|v| version_at_boundary(&text_lower, v));
         if !any_version_matches {
             for qv in &query_versions {
                 let query_major = qv.split('.').next().unwrap_or("");
@@ -481,7 +506,7 @@ mod tests {
 
     #[test]
     fn version_vs_query_no_penalty_for_either() {
-        // "python 3.12 vs 3.11" — result about 3.11 should NOT be
+        // "python 3.12 vs 3.11" : result about 3.11 should NOT be
         // penalized because 3.11 is also a query version.
         let mut results = vec![merged(
             "Python 3.11 release",
@@ -498,7 +523,7 @@ mod tests {
 
     #[test]
     fn version_different_major_no_mismatch() {
-        // "5.2" in query, "3.8" in result — different major,
+        // "5.2" in query, "3.8" in result : different major,
         // "3.8" is probably a statistic, not a version mismatch
         let mut results = vec![merged(
             "GLM model",
@@ -583,7 +608,7 @@ mod tests {
         ];
         penalize("GLM-5.2 benchmarks", &mut results);
         // Result 0: has "glm-5.2" (anchor match) → no anchor penalty
-        // But wait — "GLM-5.2" is an anchor, and the query is "GLM-5.2 benchmarks"
+        // But wait : "GLM-5.2" is an anchor, and the query is "GLM-5.2 benchmarks"
         // The anchor is "glm-5.2" with variants ["glm-5.2", "glm 5.2", "glm5.2"]
         // Result 0 title has "GLM-5.2" → matches "glm-5.2" → no penalty
         assert!((results[0].score - 1.0).abs() < 1e-9);
@@ -664,6 +689,72 @@ mod tests {
         assert!(
             (results[0].score - 1.0).abs() < 1e-9,
             "case-insensitive match in snippet"
+        );
+    }
+
+    #[test]
+    fn version_match_is_boundary_anchored() {
+        // #164: "5.2" inside "5.20" is NOT a version match: a 5.20
+        // page must take the same-major mismatch penalty, not a free
+        // pass from substring containment.
+        let mut results = vec![
+            merged(
+                "glorax 5.20 release notes",
+                "what changed in 5.20",
+                "https://ex.com/520",
+                1.0,
+            ),
+            merged(
+                "glorax 5.2 release notes",
+                "what changed in 5.2",
+                "https://ex.com/52",
+                1.0,
+            ),
+        ];
+        penalize("glorax 5.2", &mut results);
+        assert!(
+            results[0].score < results[1].score,
+            "5.20 docs must rank below an exact 5.2 match"
+        );
+        assert!(
+            results[0].score < 1.0,
+            "5.20 page must take the mismatch penalty"
+        );
+    }
+
+    #[test]
+    fn version_boundary_allows_patch_and_prefix_forms() {
+        // "5.2.1" and "v5.2" both satisfy a "5.2" request: no
+        // penalty, no mismatch flag.
+        let mut results = vec![
+            merged(
+                "glorax 5.2.1 changelog",
+                "patch notes",
+                "https://ex.com/a",
+                1.0,
+            ),
+            merged("glorax v5.2 guide", "docs", "https://ex.com/b", 1.0),
+        ];
+        penalize("glorax 5.2", &mut results);
+        assert!((results[0].score - 1.0).abs() < 1e-9, "5.2.1 satisfies 5.2");
+        assert!((results[1].score - 1.0).abs() < 1e-9, "v5.2 satisfies 5.2");
+    }
+
+    #[test]
+    fn version_boundary_longer_major_stays_neutral() {
+        // "15.2" against a "5.2" request: no longer a false match,
+        // but a different major is not a same-line mismatch either:
+        // neutral, per the same-major-only penalty policy.
+        let mut results = vec![merged(
+            "glorax 15.2 release notes",
+            "what changed in 15.2",
+            "https://ex.com/152",
+            1.0,
+        )];
+        penalize("glorax 5.2", &mut results);
+        assert!(
+            (results[0].score - 1.0).abs() < 1e-9,
+            "different major: no penalty"
         );
     }
 }

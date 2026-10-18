@@ -1,6 +1,6 @@
 //! Memory-discipline soak (v3 foundation #4): the hot paths
 //! (extraction, handle table, page history) churned hard, RSS
-//! growth asserted bounded. A creeping daemon is a dying daemon —
+//! growth asserted bounded. A creeping daemon is a dying daemon :
 //! this gate makes the ceiling a build failure, not a surprise.
 
 #[cfg(target_os = "linux")]
@@ -17,6 +17,10 @@ fn rss_kb() -> u64 {
 #[test]
 #[cfg(target_os = "linux")]
 fn soak_rss_stays_bounded() {
+    // First: the handle table and page history load from the cache
+    // root after the baseline is taken, so the developer's real
+    // page-history.json would count toward the growth bound.
+    crate::sandbox();
     let corpus = std::fs::read(format!(
         "{}/tests/fixtures/corpus/wiki-rust.html",
         env!("CARGO_MANIFEST_DIR")
@@ -55,7 +59,7 @@ fn soak_rss_stays_bounded() {
     }
 
     // Handle table churn: 10k links through the 2048-slot LRU.
-    let mut ht = donsetch::handles::HandleTable::load(); // no flush — never persists
+    let mut ht = donsetch::handles::HandleTable::load(); // no flush : never persists
     for i in 0..10_000 {
         ht.intern_link(&format!("https://example.com/page/{i}"));
     }
@@ -78,9 +82,9 @@ fn soak_rss_stays_bounded() {
 
     let after = rss_kb();
     let growth_mb = (after.saturating_sub(baseline)) as f64 / 1024.0;
-    eprintln!("soak: baseline {baseline} kB → {after} kB (growth {growth_mb:.1} MB)");
+    donsetch::diag!("soak: baseline {baseline} kB → {after} kB (growth {growth_mb:.1} MB)");
     assert!(
         growth_mb < 100.0,
-        "RSS grew {growth_mb:.1} MB over the soak — a store is leaking"
+        "RSS grew {growth_mb:.1} MB over the soak : a store is leaking"
     );
 }

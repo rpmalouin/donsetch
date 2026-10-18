@@ -47,6 +47,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libssl-dev \
         make \
         nasm \
+        lld \
         curl \
         tar \
         git \
@@ -102,7 +103,10 @@ RUN set -eu; \
 
 # Build all features (OCR + semantic reranking), locked to Cargo.lock
 ENV CARGO_TERM_COLOR=always
-RUN cargo build --release --features ocr,rerank --locked
+# All three features: ocr + rerank (ONNX) and http (axum/tower-http
+# streamable-HTTP transport, same set as the linux-x64/macOS-arm64/
+# Windows-x64 release binaries).
+RUN cargo build --release --features ocr,rerank,http --locked
 
 # Stage the ONNX Runtime shared library for the runtime image. Since
 # 3.2.5, ort loads ONNX Runtime dynamically: when ocr/rerank are
@@ -186,5 +190,11 @@ RUN if [ "$INSTALL_CHROME" = "true" ]; then \
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
     CMD donsetch --version || exit 1
 
+# Port for the HTTP transport (compose activates it via
+# DONSETCH_TRANSPORT=http in the http profile).
+EXPOSE 8765
+
 # Run the MCP server on stdio with crash-only supervisor.
+# HTTP mode: docker run -d -p 127.0.0.1:8765:8765 \
+#   -e DONSETCH_TRANSPORT=http -e DONSETCH_HTTP_HOST=0.0.0.0 donsetch-mcp
 CMD ["donsetch", "mcp", "--supervised"]

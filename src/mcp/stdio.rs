@@ -4,17 +4,109 @@
 
 use std::sync::{Arc, Mutex};
 
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+// AsyncBufReadExt carries fill_buf/consume (tokio keeps them on
+// the Ext trait, unlike std); the plain trait bounds the generic.
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 
 use serde_json::Value;
 
-use crate::mcp::server::{CancelMap, Daemon, handle};
+use crate::mcp::compat::ModeCell;
+use crate::mcp::server::{CancelMap, Daemon, cancel_key, handle};
+
+/// One stdin line, classified.
+enum Incoming {
+    /// A line to hand to the JSON-RPC dispatcher.
+    Request(String),
+    /// A line that is not UTF-8: the client is still there, so
+    /// this is not EOF. Reason text for the error response.
+    Malformed(String),
+    /// stdin closed, or a real read error.
+    Eof,
+}
+
+/// One stdin line may not exceed this. A legitimate JSON-RPC
+/// request (tools/call arguments) is orders of magnitude below it;
+/// the cap exists so a hostile local client cannot grow the reader
+/// buffer without bound with one endless newline-free write.
+const MAX_LINE_BYTES: usize = 16 << 20;
+
+/// One bounded line. `Lines::next_line` grew its buffer without
+/// bound and reported a non-UTF-8 line as `Err(InvalidData)` after
+/// consuming it, so the reader is positioned at the next line.
+/// Treating that Err as EOF (the old `while let Ok(Some(..))`)
+/// shut the whole daemon down on one bad byte from the client,
+/// mid-session, with every in-flight tool call orphaned. Only a
+/// real read error or EOF ends the loop; an oversized line is
+/// discarded in full and answered with a parse error.
+async fn next_incoming<R: AsyncBufRead + Unpin>(reader: &mut R) -> Incoming {
+    let mut buf: Vec<u8> = Vec::with_capacity(8192);
+    let mut oversized = false;
+    loop {
+        let chunk = match reader.fill_buf().await {
+            Ok(c) => c,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => {
+                // Byte-level read failures are unrecoverable (no
+                // line framing survives to resync on): shut down
+                // like the old loop did. Non-UTF-8 lines are NOT
+                // this path; they arrive as bytes and fail the
+                // from_utf8 conversion below.
+                crate::diag!("[mcp] stdin read failed, shutting down: {e}");
+                return Incoming::Eof;
+            }
+        };
+        match chunk.iter().position(|b| *b == b'\n') {
+            Some(pos) => {
+                buf.extend_from_slice(&chunk[..pos]);
+                reader.consume(pos + 1);
+                if oversized || buf.len() > MAX_LINE_BYTES {
+                    return Incoming::Malformed("request line exceeds the size cap".into());
+                }
+                return match String::from_utf8(buf) {
+                    Ok(l) => Incoming::Request(l),
+                    Err(e) => Incoming::Malformed(e.to_string()),
+                };
+            }
+            None => {
+                if buf.len() + chunk.len() <= MAX_LINE_BYTES {
+                    buf.extend_from_slice(chunk);
+                } else {
+                    oversized = true;
+                }
+                let len = chunk.len();
+                reader.consume(len);
+                if len == 0 {
+                    // EOF. A trailing line without its newline still
+                    // counts (Lines::next_line returned it too).
+                    if oversized {
+                        return Incoming::Malformed("request line exceeds the size cap".into());
+                    }
+                    return match String::from_utf8(buf) {
+                        Ok(l) if !l.is_empty() => Incoming::Request(l),
+                        _ => Incoming::Eof,
+                    };
+                }
+            }
+        }
+    }
+}
+
+/// JSON-RPC parse error for a line the dispatcher never saw
+/// (same shape `handle` emits for unparseable JSON).
+fn parse_error(reason: &str) -> String {
+    serde_json::json!({
+        "jsonrpc": "2.0", "id": null,
+        "error": { "code": -32700, "message": format!("parse error: {reason}") }
+    })
+    .to_string()
+}
 
 /// Run the stdio MCP daemon until stdin closes.
-/// Never returns Err on client garbage — only on fatal IO.
+/// Never returns Err on client garbage : only on fatal IO.
 pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let daemon = Arc::new(Daemon::new().await?);
+    daemon.start_prober();
     let (tx, mut rx) = mpsc::channel::<String>(256);
 
     // Single writer: response lines can never interleave.
@@ -24,17 +116,17 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
             // A broken stdout (client died, pipe closed) must not be
             // swallowed: every later response would be silently
             // dropped while the daemon pretends to serve. Log the
-            // real cause and stop — the client is gone.
+            // real cause and stop : the client is gone.
             if let Err(e) = out.write_all(line.as_bytes()).await {
-                eprintln!("[mcp] stdout write failed, shutting down: {e}");
+                crate::diag!("[mcp] stdout write failed, shutting down: {e}");
                 std::process::exit(1);
             }
             if let Err(e) = out.write_all(b"\n").await {
-                eprintln!("[mcp] stdout write failed, shutting down: {e}");
+                crate::diag!("[mcp] stdout write failed, shutting down: {e}");
                 std::process::exit(1);
             }
             if let Err(e) = out.flush().await {
-                eprintln!("[mcp] stdout flush failed, shutting down: {e}");
+                crate::diag!("[mcp] stdout flush failed, shutting down: {e}");
                 std::process::exit(1);
             }
         }
@@ -46,20 +138,41 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // crawl stops its workers gracefully and persists its resume
     // token before returning).
     let cancels: CancelMap = Arc::new(Mutex::new(std::collections::HashMap::new()));
+    // Issue #27 compat mode: one session per process; the initialize
+    // handshake records what the client renders.
+    let mode = Arc::new(ModeCell::new());
+    if let Some(seeded) = seeded_mode(
+        std::env::var(crate::mcp::supervisor::CLIENT_NAME_ENV)
+            .ok()
+            .as_deref(),
+    ) {
+        mode.set(seeded);
+    }
 
-    let mut lines = BufReader::new(tokio::io::stdin()).lines();
-    while let Ok(Some(line)) = lines.next_line().await {
+    let mut stdin = BufReader::new(tokio::io::stdin());
+    loop {
+        let line = match next_incoming(&mut stdin).await {
+            Incoming::Request(l) => l,
+            Incoming::Malformed(reason) => {
+                let _ = tx.send(parse_error(&reason)).await;
+                continue;
+            }
+            Incoming::Eof => break,
+        };
         let line = line.trim().to_string();
         if line.is_empty() {
             continue;
         }
-        // Cancellation notifications are handled inline — they must
+        // Cancellation notifications are handled inline : they must
         // reach the running tool NOW, not after a spawn.
         if let Ok(v) = serde_json::from_str::<Value>(&line)
             && v.get("id").is_none()
             && v.get("method").and_then(Value::as_str) == Some("notifications/cancelled")
-            && let Some(rid) = v.pointer("/params/requestId").and_then(Value::as_i64)
-            && let Some(sender) = cancels.lock().unwrap().remove(&rid)
+            && let Some(rid) = v.pointer("/params/requestId").and_then(cancel_key)
+            && let Some(sender) = cancels
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&rid)
         {
             let _ = sender.send(true);
             continue;
@@ -67,8 +180,9 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         let daemon = Arc::clone(&daemon);
         let tx = tx.clone();
         let cancels = Arc::clone(&cancels);
+        let mode = Arc::clone(&mode);
         tokio::spawn(async move {
-            if let Some(resp) = handle(&daemon, &line, &cancels, &tx).await {
+            if let Some(resp) = handle(&daemon, &line, &cancels, &tx, &mode).await {
                 let _ = tx.send(resp).await;
             }
         });
@@ -79,4 +193,71 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     daemon.shutdown().await;
     let _ = writer.await;
     Ok(())
+}
+
+/// The mode a child spawned by the supervisor starts in: the one the
+/// client's `initialize` would have chosen, from the name the
+/// supervisor passed along. `None` when there is no name, so a
+/// process that will see the handshake itself starts at Default.
+fn seeded_mode(client_name: Option<&str>) -> Option<crate::mcp::compat::ClientMode> {
+    let name = client_name?.trim();
+    if name.is_empty() {
+        return None;
+    }
+    Some(crate::mcp::compat::mode_from_params(&serde_json::json!({
+        "clientInfo": { "name": name }
+    })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // What a supervisor-spawned child starts with: the client's
+    // handshake choice, or nothing when no name was passed.
+    #[test]
+    fn a_passed_client_name_seeds_the_handshake_mode() {
+        use crate::mcp::compat::ClientMode;
+        assert_eq!(seeded_mode(Some("claude-code")), Some(ClientMode::TextOnly));
+        assert_eq!(
+            seeded_mode(Some(" pi-donsetch ")),
+            Some(ClientMode::TextOnly)
+        );
+        assert_eq!(seeded_mode(Some("cursor")), Some(ClientMode::Default));
+        assert_eq!(seeded_mode(Some("")), None);
+        assert_eq!(seeded_mode(None), None);
+    }
+
+    // `Lines::next_line` yields Err(InvalidData) for a line that
+    // isn't UTF-8. The loop used to treat any Err as EOF, so one
+    // stray byte from the client (a pasted path in a legacy
+    // codepage, a truncated multibyte char) shut the daemon down
+    // mid-session. The bad line must be answered and skipped;
+    // the request after it must still be served.
+    #[tokio::test]
+    async fn invalid_utf8_line_is_skipped_not_eof() {
+        let input: &[u8] = b"{\"a\":1}\n\xff\xfe garbage\n{\"b\":2}\n";
+        let mut lines = BufReader::new(input);
+        assert!(
+            matches!(next_incoming(&mut lines).await, Incoming::Request(l) if l == "{\"a\":1}")
+        );
+        assert!(matches!(
+            next_incoming(&mut lines).await,
+            Incoming::Malformed(_)
+        ));
+        assert!(
+            matches!(next_incoming(&mut lines).await, Incoming::Request(l) if l == "{\"b\":2}")
+        );
+        assert!(matches!(next_incoming(&mut lines).await, Incoming::Eof));
+    }
+
+    #[test]
+    fn malformed_line_gets_a_jsonrpc_parse_error() {
+        let v: Value = serde_json::from_str(&parse_error("stream did not contain valid UTF-8"))
+            .expect("valid json");
+        assert_eq!(v["jsonrpc"], "2.0");
+        assert!(v["id"].is_null());
+        assert_eq!(v["error"]["code"], -32700);
+        assert!(v["error"]["message"].as_str().unwrap().contains("UTF-8"));
+    }
 }

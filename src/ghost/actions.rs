@@ -1,19 +1,19 @@
-//! actions.rs — the fetch-actions executor (v2).
+//! actions.rs : the fetch-actions executor (v2).
 //!
 //! `web_fetch(actions=[...])` gives the agent browser control
-//! INSIDE fetch: wait, click, type, press, scroll, hover — then
+//! INSIDE fetch: wait, click, type, press, scroll, hover : then
 //! the normal DonSift extraction runs on the final DOM, so
 //! focus/section/toc all keep working on an interacted-with
 //! page. This is hound's browser-tool surface, but composable
-//! with fetch instead of a separate tool — one call replaces
+//! with fetch instead of a separate tool : one call replaces
 //! navigate→act→act→read round-trips.
 //!
 //! Design rules:
 //! - Validate ALL steps up front (parse_errors before any
-//!   browser time is spent — a typo in step 5 must not burn a
+//!   browser time is spent : a typo in step 5 must not burn a
 //!   launch on step 1).
 //! - Execute in order; first failure aborts with the step
-//!   index, reason, and everything that succeeded — the agent
+//!   index, reason, and everything that succeeded : the agent
 //!   retries with corrected steps, not blind.
 //! - Deterministic waits over blind sleeps where possible
 //!   (wait_selector / wait_text poll the live DOM).
@@ -24,7 +24,7 @@ use serde_json::Value;
 use super::Ghost;
 use crate::error::FetchError;
 
-/// Maximum steps per fetch call — an action script, not a
+/// Maximum steps per fetch call : an action script, not a
 /// browsing session (Bladebro exists for sessions).
 pub const MAX_STEPS: usize = 16;
 
@@ -33,7 +33,7 @@ const DEFAULT_WAIT_MS: u64 = 8_000;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Action {
-    /// Fixed pause. Prefer wait_selector/wait_text — but some
+    /// Fixed pause. Prefer wait_selector/wait_text : but some
     /// SPAs animate with no DOM signal, so blind waits stay.
     Wait { ms: u64 },
     /// Poll until the CSS selector matches (element may be
@@ -43,7 +43,7 @@ pub enum Action {
     WaitText { text: String, timeout_ms: u64 },
     /// Click an element by CSS selector, or by (visible) text
     /// when no selector is given. Text match targets the
-    /// smallest element whose OWN text contains it — the
+    /// smallest element whose OWN text contains it : the
     /// button/link itself, not its container.
     Click {
         selector: Option<String>,
@@ -184,7 +184,7 @@ pub fn parse(v: &Value) -> Result<Vec<Action>, String> {
             }
             other => {
                 return Err(format!(
-                    "actions[{i}] unknown do={other:?} — supported: wait, wait_selector, wait_text, click, hover, type, press, scroll"
+                    "actions[{i}] unknown do={other:?} : supported: wait, wait_selector, wait_text, click, hover, type, press, scroll"
                 ));
             }
         };
@@ -268,8 +268,22 @@ async fn resolve_point(
 /// Execute steps in order. Ok(outcomes) on full success;
 /// Err((failed_step_index, reason, outcomes_so_far)) on the
 /// first failure. Navigation caused by a click (href link,
-/// form submit) is fine — subsequent steps act on the new page.
+/// form submit) is fine : subsequent steps act on the new page.
 pub async fn run(
+    g: &mut Ghost,
+    actions: &[Action],
+) -> Result<Vec<ActionOutcome>, (usize, String, Vec<ActionOutcome>)> {
+    let mut operation = g.operation();
+    let restore = g.unminimize_for_capture().await;
+    let result = run_inner(g, actions).await;
+    if restore.needs_surface_wait() {
+        g.reminimize_after_capture().await;
+    }
+    operation.finish();
+    result
+}
+
+async fn run_inner(
     g: &mut Ghost,
     actions: &[Action],
 ) -> Result<Vec<ActionOutcome>, (usize, String, Vec<ActionOutcome>)> {

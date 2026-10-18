@@ -1,14 +1,14 @@
 //! Reference handles: short session-scoped IDs that stand in for
-//! URLs. The URL-noise tax is real — a link-heavy page bleeds
+//! URLs. The URL-noise tax is real : a link-heavy page bleeds
 //! hundreds of tokens on raw URLs the daemon can remember instead.
 //!
 //! Two namespaces:
 //!
-//! - **`L{id}`** — link handles, interned from fetched-page markdown
+//! - **`L{id}`** : link handles, interned from fetched-page markdown
 //!   (`[text](LxK7mP2q)` instead of `[text](https://very-long-url…) `).
 //!   Stable: the same URL always maps to the same handle while the
 //!   entry lives. LRU-evicted, persisted with 24h TTL, cap 2048.
-//! - **`S{id}`** — search handles, one per result. In-memory only:
+//! - **`S{id}`** : search handles, one per result. In-memory only:
 //!   never persisted, die with the process. A new search mints new
 //!   handles, so earlier ones keep resolving to what they always
 //!   meant (no silent rebind).
@@ -16,7 +16,7 @@
 //! **Security (GHSA-g279-2v66-j8g2):** handle IDs are random
 //! 8-char base62 tokens generated from SHA-256 of (nanosecond
 //! timestamp + PID + atomic counter + ASLR stack address). The
-//! output space is 62^8 ≈ 2.18×10^14 — enumeration is infeasible.
+//! output space is 62^8 ≈ 2.18×10^14 : enumeration is infeasible.
 //! A page that was never given a handle cannot name one. Search
 //! handles are not persisted, so they cannot leak across sessions
 //! through the on-disk table. `DONSETCH_URL_HANDLES=off` disables
@@ -35,8 +35,15 @@ use serde::{Deserialize, Serialize};
 /// Handle lifetime. A handle that outlives a research session by a
 /// day is a handle nobody remembers producing.
 const TTL_SECS: u64 = 24 * 60 * 60;
-/// L-entry cap — bounded memory, oldest-eviction.
+/// L-entry cap : bounded memory, oldest-eviction.
 const MAX_L_ENTRIES: usize = 2048;
+/// S-entry cap. The MCP daemon is a long-lived process: a search
+/// handle-table that only ever inserts grows without bound for the
+/// daemon’s whole life (every tool search call mints up to 12).
+/// FIFO eviction of the oldest-minted handles keeps memory bounded;
+/// agents address recent results, exactly like the L-table’s LRU
+/// bound trades unbounded stability for bounded memory.
+const MAX_S_ENTRIES: usize = 2048;
 /// Random ID length (base62 chars after the prefix).
 const ID_LEN: usize = 8;
 /// Persistence format version. Old format (no version field) will
@@ -49,7 +56,7 @@ const BASE62: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRST
 struct LEntry {
     url: String,
     at: u64,
-    /// LRU eviction order (monotonic counter, not wall clock —
+    /// LRU eviction order (monotonic counter, not wall clock :
     /// seconds-granularity `at` can collide for rapid inserts).
     seq: u64,
 }
@@ -71,6 +78,8 @@ pub struct HandleTable {
     rev: HashMap<String, String>,
     /// Search handle-id → URL (in-memory only, never persisted).
     s: HashMap<String, String>,
+    /// Mint order of S-handles (oldest first). FIFO eviction base.
+    s_order: std::collections::VecDeque<String>,
     /// Monotonic counter for LRU eviction ordering.
     next_seq: u64,
 }
@@ -91,7 +100,7 @@ fn path() -> PathBuf {
 /// resolution (is_handle returns false, so resolve_fetch_url
 /// refuses handles). Default: on.
 pub fn handles_enabled() -> bool {
-    !matches!(std::env::var("DONSETCH_URL_HANDLES").as_deref(), Ok("off"))
+    crate::config::cfg().mcp.url_handles
 }
 
 /// Generate a random, unguessable handle ID: prefix + 8 base62 chars
@@ -144,11 +153,11 @@ impl HandleTable {
         let Ok(p) = serde_json::from_slice::<Persisted>(&bytes) else {
             // Corrupt table or old format (no version field): treat
             // as empty. Handles are a cache, never a source of
-            // truth — losing them costs nothing.
+            // truth : losing them costs nothing.
             return t;
         };
-        // Reject old format (version 1 had no version field — it
-        // failed to deserialize above — but be explicit).
+        // Reject old format (version 1 had no version field : it
+        // failed to deserialize above : but be explicit).
         if p.version != PERSIST_VERSION {
             return t;
         }
@@ -182,9 +191,12 @@ impl HandleTable {
         let dir = crate::paths::cache_dir();
         let _ = std::fs::create_dir_all(&dir);
         let tmp = dir.join(".handles.json.tmp");
+        // Owner-only from the first byte: interned link URLs can
+        // carry query-string credentials (?api_key=...), so a
+        // umask-default 0644 staging window is a leak.
         if serde_json::to_vec(&p)
             .map_err(|e| e.to_string())
-            .and_then(|b| std::fs::write(&tmp, b).map_err(|e| e.to_string()))
+            .and_then(|b| crate::config::write_private(&tmp, &b).map_err(|e| e.to_string()))
             .is_ok()
         {
             let _ = std::fs::rename(&tmp, path());
@@ -250,7 +262,19 @@ impl HandleTable {
                 }
             };
             self.s.insert(id.clone(), url.clone());
+            self.s_order.push_back(id.clone());
             handles.push(id);
+            // Bounded memory: the daemon is long-lived, so the
+            // in-memory S-table must not grow without bound. Oldest-
+            // minted handles evict FIFO, matching how agents actually
+            // reference search results (the results they act on are
+            // the recent ones).
+            while self.s.len() > MAX_S_ENTRIES {
+                let Some(oldest) = self.s_order.pop_front() else {
+                    break;
+                };
+                self.s.remove(&oldest);
+            }
         }
         handles
     }
@@ -286,12 +310,18 @@ impl HandleTable {
         let mut count = 0usize;
         while let Some(rel) = md[pos..].find("](http") {
             let url_start = pos + rel + 2;
-            let Some(close_rel) = md[url_start..].find(')') else {
+            // The link closes at the first ')' that is not matched
+            // by a '(' inside the URL. Url::join leaves parens
+            // literal in paths, so `Mercury_(planet)` and
+            // `Array/map()` are common; cutting at the first ')'
+            // interned a truncated URL (a 404) and left a stray ')'
+            // in the markdown. An unbalanced ')' still closes.
+            let Some(close_rel) = balanced_close(&md[url_start..]) else {
                 break;
             };
             let url = &md[url_start..url_start + close_rel];
             // Sanity: spaces or control chars mean this isn't a
-            // clean generated link — leave it untouched.
+            // clean generated link : leave it untouched.
             if url.chars().any(|c| c.is_whitespace()) {
                 let skip = pos + rel + 6;
                 out.push_str(&md[pos..skip]);
@@ -310,9 +340,27 @@ impl HandleTable {
     }
 }
 
+/// Byte offset of the ')' that closes a markdown link URL starting
+/// at `s[0]`: the first ')' at paren depth 0. A URL with an unclosed
+/// '(' has no such ')': fall back to the first ')' at all (the old
+/// behaviour) so one odd link never stops the rewrite of the rest
+/// of the document. None only if there is no ')' anywhere.
+fn balanced_close(s: &str) -> Option<usize> {
+    let mut depth = 0usize;
+    for (i, b) in s.bytes().enumerate() {
+        match b {
+            b'(' => depth += 1,
+            b')' if depth == 0 => return Some(i),
+            b')' => depth -= 1,
+            _ => {}
+        }
+    }
+    s.find(')')
+}
+
 /// Check if a string matches the current handle format: prefix
 /// (S or L) + exactly ID_LEN alphanumeric chars. Does NOT match
-/// old sequential format (S1, L12 — too short).
+/// old sequential format (S1, L12 : too short).
 fn is_valid_handle_id(s: &str) -> bool {
     if s.len() != ID_LEN + 1 {
         return false;
@@ -342,6 +390,7 @@ mod tests {
             l: HashMap::new(),
             rev: HashMap::new(),
             s: HashMap::new(),
+            s_order: std::collections::VecDeque::new(),
             next_seq: 0,
         }
     }
@@ -397,17 +446,32 @@ mod tests {
     }
 
     #[test]
-    fn is_handle_recognizes_and_rejects() {
-        assert!(is_handle("SxK7mP2qa"));
-        assert!(is_handle("Lb9R4nW3p"));
-        assert!(is_handle("saB3cD4eF")); // lowercase prefix
+    fn is_valid_handle_id_recognizes_and_rejects() {
+        assert!(is_valid_handle_id("SxK7mP2qa"));
+        assert!(is_valid_handle_id("Lb9R4nW3p"));
+        assert!(is_valid_handle_id("saB3cD4eF")); // lowercase prefix
+        assert!(!is_valid_handle_id("https://example.com"));
+        assert!(!is_valid_handle_id("S1")); // old format : too short
+        assert!(!is_valid_handle_id("L12")); // old format : too short
+        assert!(!is_valid_handle_id("S")); // no suffix
+        assert!(!is_valid_handle_id("Sx")); // too short
+        assert!(!is_valid_handle_id("SxK7mP2qExtra")); // too long
+        assert!(!is_valid_handle_id("")); // empty
+    }
+
+    /// The gate, not the shape. `is_handle` must follow
+    /// `mcp.url_handles`; it must not be asserted to a fixed value,
+    /// because the process-wide config is the real one under
+    /// `cargo nextest run` and a machine with handles disabled turned
+    /// the old assertion red for a reason that had nothing to do with
+    /// the code (Mart-Bogdan, #263).
+    #[test]
+    fn is_handle_follows_the_url_handles_knob() {
+        let on = crate::config::cfg().mcp.url_handles;
+        assert_eq!(is_handle("SxK7mP2qa"), on);
+        assert_eq!(is_handle("Lb9R4nW3p"), on);
+        // A URL is never a handle, knob or no knob.
         assert!(!is_handle("https://example.com"));
-        assert!(!is_handle("S1")); // old format — too short
-        assert!(!is_handle("L12")); // old format — too short
-        assert!(!is_handle("S")); // no suffix
-        assert!(!is_handle("Sx")); // too short
-        assert!(!is_handle("SxK7mP2qExtra")); // too long
-        assert!(!is_handle("")); // empty
     }
 
     #[test]
@@ -436,6 +500,60 @@ mod tests {
         let (out, n) = t.replace_link_urls(md);
         assert_eq!(n, 0);
         assert_eq!(out, md);
+    }
+
+    // Url::join leaves '(' and ')' literal in paths, so every
+    // disambiguated Wikipedia title, MDN `Array.prototype.map()`
+    // and friends arrive as `[t](https://…/X_(y))`. Cutting at the
+    // FIRST ')' interned `…/X_(y` (a 404) and left a stray ')' in
+    // the markdown after every such link.
+    #[test]
+    fn replace_keeps_balanced_parens_inside_the_url() {
+        let mut t = table();
+        let md = "see [Mercury](https://en.wikipedia.org/wiki/Mercury_(planet)) and [map](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Array/map()) then";
+        let (out, n) = t.replace_link_urls(md);
+        assert_eq!(n, 2);
+        let planet = out.find("](L").unwrap();
+        let handle = &out[planet + 2..planet + 2 + 1 + ID_LEN];
+        assert_eq!(
+            t.resolve(handle).as_deref(),
+            Some("https://en.wikipedia.org/wiki/Mercury_(planet)"),
+            "url interned truncated"
+        );
+        assert!(
+            out.contains(") and [map](L"),
+            "stray ')' after the first link:\n{out}"
+        );
+        assert!(out.ends_with(") then"), "{out}");
+        assert!(!out.contains("))"), "doubled close paren:\n{out}");
+        // Nested parens too.
+        let (out2, n2) = t.replace_link_urls("[x](https://h/a_((b))_c) tail");
+        assert_eq!(n2, 1);
+        assert!(out2.ends_with(") tail"), "{out2}");
+        let h2 = &out2[out2.find("](L").unwrap() + 2..][..1 + ID_LEN];
+        assert_eq!(t.resolve(h2).as_deref(), Some("https://h/a_((b))_c"));
+    }
+
+    // An unbalanced ')' inside the URL still closes the link at the
+    // first depth-0 ')', exactly as before.
+    #[test]
+    fn replace_unbalanced_close_paren_closes_the_link() {
+        let mut t = table();
+        let (out, n) = t.replace_link_urls("[m](https://x/a)b) tail");
+        assert_eq!(n, 1);
+        assert!(out.ends_with(")b) tail"), "{out}");
+        let h = &out[out.find("](L").unwrap() + 2..][..1 + ID_LEN];
+        assert_eq!(t.resolve(h).as_deref(), Some("https://x/a"));
+    }
+
+    // An unclosed '(' in one URL falls back to the first ')' and
+    // must not stop the rewrite of later links.
+    #[test]
+    fn replace_unclosed_open_paren_does_not_stall_the_rest() {
+        let mut t = table();
+        let (out, n) = t.replace_link_urls("[a](https://x/q(1) mid [b](https://y/) end");
+        assert_eq!(n, 2, "{out}");
+        assert!(out.ends_with(") end"), "{out}");
     }
 
     #[test]
@@ -486,6 +604,33 @@ mod tests {
         assert_eq!(t.resolve("S12"), None);
         assert_eq!(t.resolve("L1"), None);
         assert_eq!(t.resolve("L2048"), None);
+    }
+
+    #[test]
+    fn search_handles_stay_bounded_fifo() {
+        // A long-lived daemon mints S-handles on every search forever;
+        // without a cap the in-memory table grows without bound.
+        let mut t = table();
+        let oldest = t.set_search_results(&["https://old.example/1".into()])[0].clone();
+        for i in 0..MAX_S_ENTRIES {
+            t.set_search_results(&[format!("https://fill.example/{i}")]);
+        }
+        assert_eq!(t.s.len(), MAX_S_ENTRIES, "table must stay capped");
+        // The oldest-minted entry was evicted first (FIFO).
+        assert_eq!(t.resolve(&oldest), None);
+        // The newest mint still resolves.
+        let last = t
+            .set_search_results(&["https://fresh.example/latest".into()])
+            .pop()
+            .unwrap();
+        assert_eq!(
+            t.s.len(),
+            MAX_S_ENTRIES,
+            "mint past the cap evicts, never grows"
+        );
+        assert_eq!(t.resolve(&last).unwrap(), "https://fresh.example/latest");
+        // The previously newest fill entry also still resolves.
+        assert_eq!(t.s_order.len(), t.s.len(), "queue and map agree");
     }
 
     #[test]

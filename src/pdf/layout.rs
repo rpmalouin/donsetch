@@ -101,7 +101,7 @@ pub fn assemble(page: PageChars) -> PageLines {
             let a = c.angle.abs();
             // Clean horizontal text only. Drop dummy glyphs (CR/LF,
             // size-1 decorations) and dingbat-font glyphs (checkboxes,
-            // seals — pictures, not text). Real space glyphs kept at
+            // seals : pictures, not text). Real space glyphs kept at
             // any size.
             a < 30.0 && c.cp != '\0' && (c.cp == ' ' || c.size >= 2.0) && !c.dingbat
         })
@@ -124,7 +124,7 @@ pub fn assemble(page: PageChars) -> PageLines {
     // the orchestrator flags it when /.-ratio is significant.
 
     // Baseline clustering: the glyph-box BOTTOM is the invariant anchor
-    // across tight/full charbox metrics — centers drift 1–3pt between
+    // across tight/full charbox metrics : centers drift 1-3pt between
     // kerned fragments and punctuation descenders on the same physical
     // line, which scrambled reading order when clustering on centers.
     chars.sort_by(|a, b| {
@@ -138,12 +138,16 @@ pub fn assemble(page: PageChars) -> PageLines {
     let mut cur_bl = f32::NAN;
     let mut cur_size = 0f32;
     // Tolerance: half the smaller font size, at least 1.5pt.
-    let peek = std::env::var("DONSHEET_DEBUG_CHARS").is_ok();
+    let peek = crate::config::cfg().debug.pdf_chars;
     for c in chars {
         if peek {
-            eprintln!(
+            crate::diag!(
                 "stream y1={:6.1} cp={:?} s={:4.1} x0={:6.1} x1={:6.1}",
-                c.y1, c.cp, c.size, c.x0, c.x1
+                c.y1,
+                c.cp,
+                c.size,
+                c.x0,
+                c.x1
             );
         }
         if cur.is_empty() {
@@ -161,9 +165,10 @@ pub fn assemble(page: PageChars) -> PageLines {
             cur_bl = (cur_bl * (cur.len() as f32 - 1.0) + c.y1) / cur.len() as f32;
         } else {
             if peek {
-                eprintln!(
+                crate::diag!(
                     "--- split at y1={:6.1} cp={:?} (tol {tol:.1}) ---",
-                    c.y1, c.cp
+                    c.y1,
+                    c.cp
                 );
             }
             lines.push(std::mem::take(&mut cur));
@@ -267,7 +272,7 @@ fn build_line(cluster: &[&PdfChar], page_index: usize) -> Line {
     let mut g: Vec<f32> = Vec::new();
     // Real glyphs only. Space glyphs are SPLIT INTO TWO KINDS:
     //  - "real spaces": an actual drawn space claiming advance width
-    //    (word boundary — Korean, Devanagari, CJK↔Latin junctions)
+    //    (word boundary : Korean, Devanagari, CJK↔Latin junctions)
     //  - decorations: near-zero-width run markers, invisible.
     // Distinguisher is measured WIDTH, not presence.
     let space_width_real = |c: &&PdfChar| (c.x1 - c.x0) > 0.18 * c.size.max(2.0);
@@ -311,7 +316,7 @@ fn build_line(cluster: &[&PdfChar], page_index: usize) -> Line {
         ly1 = ly1.max(c.y1);
 
         // Space insertion: script-aware + statistics-aware (real glyph
-        // gaps only — decorations are out of `reals`).
+        // gaps only : decorations are out of `reals`).
         if i > 0 {
             let gap = c.x0 - prev_x1;
             let widen = 0.16 * prev_size;
@@ -367,7 +372,7 @@ fn build_line(cluster: &[&PdfChar], page_index: usize) -> Line {
             Some(e) => e.1 += 1,
             None => font_votes.push((c.font, 1)),
         }
-        if c.flags & (super::sys::FONT_FIXED_PITCH | super::engine::DONSHEET_MONO_HINT) != 0 {
+        if c.flags & (super::sys::FONT_FIXED_PITCH | super::engine::DONSETCH_MONO_HINT) != 0 {
             mono_glyphs += 1;
         }
         if c.flags & super::sys::FONT_ITALIC != 0 {
@@ -394,8 +399,8 @@ fn build_line(cluster: &[&PdfChar], page_index: usize) -> Line {
 
     // Collapse runs of spaces and trim.
     let text = collapse_spaces(&text);
-    if std::env::var("DONSHEET_DEBUG_WORDS").is_ok() {
-        eprintln!(
+    if crate::config::cfg().debug.pdf_words {
+        crate::diag!(
             "[words] {:?} -> {:?}",
             text,
             words.iter().map(|w| &w.text).collect::<Vec<_>>()

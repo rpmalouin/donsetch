@@ -153,7 +153,7 @@ pub const FPDF_FORMFIELD_SIGNATURE: c_int = 7;
 /// FPDF_FORMFILLINFO is a long struct of function pointers ending in
 /// `m_pJsPlatform` (v2). Read-only form-field getters never invoke the
 /// callbacks, so a generously sized zeroed allocation with version=2 set
-/// is sufficient — same approach pdfium-render uses.
+/// is sufficient : same approach pdfium-render uses.
 #[repr(C)]
 pub struct FpdfFormfillInfo {
     pub version: c_int,

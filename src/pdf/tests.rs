@@ -1,6 +1,6 @@
 //! DonSheet corpus battery. Real-world PDFs in `tests/pdf-corpus/`
 //! (not committed). Every assertion is an invariant proven during
-//! the debugging campaign — they are regression gates, not hopes.
+//! the debugging campaign : they are regression gates, not hopes.
 
 use std::path::PathBuf;
 
@@ -18,7 +18,7 @@ fn read(name: &str) -> Option<Vec<u8>> {
     match std::fs::read(&p) {
         Ok(b) => Some(b),
         Err(_) => {
-            eprintln!("SKIP: {} missing (scripts/download-corpus.sh)", p.display());
+            crate::diag!("SKIP: {} missing (scripts/download-corpus.sh)", p.display());
             None
         }
     }
@@ -254,7 +254,7 @@ fn w9_form_content() {
         !text.contains("ppy"),
         "dingbat checkbox glyphs leaked into text"
     );
-    // The IRS body font reports size 1.0 via GetFontSize — our matrix
+    // The IRS body font reports size 1.0 via GetFontSize : our matrix
     // fallback must give real sizes so paragraphs/grouping work.
     assert!(
         parsed.blocks.len() > 10,
@@ -366,6 +366,74 @@ fn swin_structure() {
     assert!(parsed.page_count >= 6)
 }
 
+// ---------- page cap ----------
+
+/// A minimal, well-formed PDF with `n` empty Letter pages and a
+/// correct xref table.
+fn empty_pages_pdf(n: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut offsets = Vec::new();
+    out.extend_from_slice(b"%PDF-1.4\n");
+    let obj = |out: &mut Vec<u8>, offsets: &mut Vec<usize>, body: &str| {
+        offsets.push(out.len());
+        out.extend_from_slice(format!("{} 0 obj\n{}\nendobj\n", offsets.len(), body).as_bytes());
+    };
+    obj(&mut out, &mut offsets, "<< /Type /Catalog /Pages 2 0 R >>");
+    let kids: Vec<String> = (0..n).map(|i| format!("{} 0 R", i + 3)).collect();
+    obj(
+        &mut out,
+        &mut offsets,
+        &format!("<< /Type /Pages /Count {n} /Kids [ {} ] >>", kids.join(" ")),
+    );
+    for _ in 0..n {
+        obj(
+            &mut out,
+            &mut offsets,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>",
+        );
+    }
+    let xref = out.len();
+    out.extend_from_slice(
+        format!("xref\n0 {}\n0000000000 65535 f \n", offsets.len() + 1).as_bytes(),
+    );
+    for o in &offsets {
+        out.extend_from_slice(format!("{o:010} 00000 n \n").as_bytes());
+    }
+    out.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+            offsets.len() + 1
+        )
+        .as_bytes(),
+    );
+    out
+}
+
+// The size gate admits a document of hundreds of thousands of
+// near-empty pages; each was rasterized and laid out. Pages past the
+// cap are counted and reported, not read.
+#[test]
+fn pages_past_the_cap_are_reported_not_read() {
+    // An empty page still costs a rasterization (~100-300 ms), so the
+    // cap is exercised at 5 rather than at MAX_PAGES.
+    let bytes = empty_pages_pdf(8);
+    let doc = crate::pdf::parse_with(&bytes, 5).expect("parse");
+    assert_eq!(doc.page_count, 8, "the true page count is reported");
+    assert!(
+        doc.notes
+            .iter()
+            .any(|x| x.contains("8 pages") && x.contains("first 5 were read")),
+        "notes={:?}",
+        doc.notes
+    );
+    // Under the cap nothing changes and nothing is noted.
+    let small = crate::pdf::parse_with(&empty_pages_pdf(3), 5).expect("parse");
+    assert_eq!(small.page_count, 3);
+    assert!(!small.notes.iter().any(|x| x.contains("page cap")));
+    // The production cap is what `parse` uses.
+    assert_eq!(crate::pdf::engine::MAX_PAGES, 500);
+}
+
 // ---------- integration: extract() treats PDF bytes natively ----------
 
 #[test]
@@ -427,4 +495,23 @@ fn pdf_date_normalized() {
             "date not normalized: {p}"
         );
     }
+}
+
+// pdf_date sliced `d[..8]` on the raw Info-dict string. A producer
+// writing a localized date (Japanese/Chinese-locale tools do) puts a
+// multibyte char inside the first 8 bytes -- a str-slice panic on a
+// producer-controlled field, which under panic = "abort" takes the
+// daemon down on a plain PDF fetch. No corpus file needed.
+#[test]
+fn pdf_date_non_ascii_does_not_panic() {
+    let raw = Some("D:202605年25日".to_string());
+    assert_eq!(
+        crate::pdf::pdf_date(&raw),
+        Some("D:202605年25日".to_string()),
+        "unparseable dates pass through verbatim"
+    );
+    assert_eq!(
+        crate::pdf::pdf_date(&Some("D:20260525080808+00'00'".to_string())),
+        Some("2026-05-25".to_string())
+    );
 }

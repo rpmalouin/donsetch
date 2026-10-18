@@ -1,7 +1,7 @@
 //! Stage 2: furniture suppression + reading-order reconstruction.
 //!
 //! Furniture: lines in the top/bottom page bands recurring across many
-//! pages (running heads, footers, page numbers) are dropped — they add
+//! pages (running heads, footers, page numbers) are dropped : they add
 //! noise for downstream LLM consumption.
 //!
 //! Reading order: recursive XY-cut over line bounding boxes. Vertical
@@ -290,7 +290,7 @@ fn split_recurse(
         acc.extend(v);
         return;
     }
-    // Order: x-cuts read left→right, y-cuts read top→bottom — the (a < mid)
+    // Order: x-cuts read left→right, y-cuts read top→bottom : the (a < mid)
     // partition already holds left/top in `a`.
     cut(a, depth + 1, acc, body);
     cut(b, depth + 1, acc, body);

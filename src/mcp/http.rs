@@ -9,7 +9,7 @@
 //! GET /mcp opens the server-initiated SSE stream that streamable-HTTP
 //! clients expect after initialize (OpenCode among them fails the whole
 //! connection on a bare 405 here). DonSeTch never pushes unsolicited
-//! messages — no server tools, no sampling requests — so the stream
+//! messages : no server tools, no sampling requests : so the stream
 //! carries keep-alive comments only. It self-terminates just inside
 //! SESSION_TTL: graceful shutdown is never blocked by an idle stream,
 //! clients simply reconnect per SSE convention, and each reconnect
@@ -20,7 +20,7 @@
 //! `initialize`. Clients that echo it back get a dedicated cancellation
 //! registry, so a `notifications/cancelled` posted while a tool call is
 //! in flight reaches it (mirroring stdio's shared registry). Clients
-//! that ignore sessions — curl, simple integrators — share one default
+//! that ignore sessions : curl, simple integrators : share one default
 //! registry; cancellation still works, they just share a request-id
 //! namespace with other session-less clients. Unknown or expired
 //! session ids get a 404, per the MCP streamable-HTTP convention.
@@ -55,7 +55,7 @@ use tower_http::{
     trace::TraceLayer,
 };
 
-use crate::mcp::server::{CancelMap, Daemon, handle};
+use crate::mcp::server::{CancelMap, Daemon, cancel_key, handle};
 
 /// Idle sessions are dropped after this long, so cancelled-tool
 /// registries cannot leak forever for clients that vanish mid-call.
@@ -63,15 +63,21 @@ const SESSION_TTL: Duration = Duration::from_secs(30 * 60);
 /// Upper bound on tracked sessions; the oldest are evicted beyond it.
 const MAX_SESSIONS: usize = 1024;
 /// Default per-request timeout when DONSETCH_HTTP_TIMEOUT_SECS is unset.
+/// Historical default; the live default lives in config ([transport]
+/// timeout_secs).
+#[allow(dead_code)]
 const DEFAULT_TIMEOUT_SECS: u64 = 300;
 /// The GET /mcp SSE stream closes itself after this long (just inside
 /// SESSION_TTL): an unbounded idle stream would hold graceful shutdown
 /// open forever, and a closed stream is a routine reconnect for SSE
-/// clients — one that usefully refreshes the session idle timer.
+/// clients : one that usefully refreshes the session idle timer.
 const SSE_MAX_LIFETIME: Duration = Duration::from_secs(25 * 60);
 
 struct Session {
     cancels: CancelMap,
+    /// Issue #27 compat mode for this session: set by the session's
+    /// `initialize` handshake, read by every tool call it makes.
+    mode: Arc<crate::mcp::compat::ModeCell>,
     last_seen: Instant,
 }
 
@@ -90,21 +96,29 @@ struct HttpState {
     /// When set, requests must carry `Authorization: Bearer <token>`.
     auth_token: Option<String>,
     timeout: Duration,
+    cors_enabled: bool,
+    bound: Bound,
 }
 
 /// Run the HTTP MCP server until SIGTERM/SIGINT.
 pub async fn run(host: String, port: u16) -> Result<(), Box<dyn std::error::Error>> {
-    let daemon = Arc::new(Daemon::new().await.map_err(|e| e.to_string())?);
-    let auth_token = std::env::var("DONSETCH_HTTP_TOKEN")
-        .ok()
-        .filter(|t| !t.is_empty());
+    let t = crate::config::cfg().transport.clone();
+    let auth_token = crate::config::configured_http_token(&t.token).map(str::to_owned);
     let auth_enabled = auth_token.is_some();
-    let timeout = Duration::from_secs(
-        std::env::var("DONSETCH_HTTP_TIMEOUT_SECS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(DEFAULT_TIMEOUT_SECS),
-    );
+    let timeout = Duration::from_secs(t.timeout_secs);
+
+    // CORS is off by default: MCP clients are processes, not browsers,
+    // and a permissive layer would let any webpage open in a local
+    // browser POST to a localhost instance and read the responses.
+    // Browser-based clients can opt in with [transport] cors = true.
+    let cors_enabled = t.cors;
+    validate_http_config(cors_enabled, auth_enabled)?;
+
+    // Configuration must fail before daemon construction starts background
+    // work or touches persistent state.
+    let daemon = Arc::new(Daemon::new().await.map_err(|e| e.to_string())?);
+    daemon.start_prober();
+
     let state = HttpState {
         daemon: Arc::clone(&daemon),
         sessions: Arc::new(SessionTable {
@@ -112,16 +126,9 @@ pub async fn run(host: String, port: u16) -> Result<(), Box<dyn std::error::Erro
         }),
         auth_token,
         timeout,
+        cors_enabled,
+        bound: Bound::new(&host, port),
     };
-
-    // CORS is off by default: MCP clients are processes, not browsers,
-    // and a permissive layer would let any webpage open in a local
-    // browser POST to a localhost instance and read the responses.
-    // Browser-based clients can opt in with DONSETCH_HTTP_CORS.
-    let cors_enabled = matches!(
-        std::env::var("DONSETCH_HTTP_CORS").as_deref(),
-        Ok("1" | "true" | "on")
-    );
 
     let app = Router::new()
         .route("/health", get(health_handler))
@@ -144,9 +151,9 @@ pub async fn run(host: String, port: u16) -> Result<(), Box<dyn std::error::Erro
 
     let listener = tokio::net::TcpListener::bind((host.as_str(), port)).await?;
     if auth_enabled {
-        eprintln!("[mcp] HTTP server listening on http://{host}:{port} (bearer auth enabled)");
+        crate::diag!("[mcp] HTTP server listening on http://{host}:{port} (bearer auth enabled)");
     } else {
-        eprintln!("[mcp] HTTP server listening on http://{host}:{port}");
+        crate::diag!("[mcp] HTTP server listening on http://{host}:{port}");
     }
 
     axum::serve(listener, app)
@@ -154,7 +161,7 @@ pub async fn run(host: String, port: u16) -> Result<(), Box<dyn std::error::Erro
         .await?;
 
     // Drain done; stop the daemon so no orphan browsers survive.
-    eprintln!("[mcp] draining complete, shutting daemon down");
+    crate::diag!("[mcp] draining complete, shutting daemon down");
     daemon.shutdown().await;
     Ok(())
 }
@@ -180,12 +187,141 @@ async fn shutdown_signal() {
         _ = ctrl_c => {},
         _ = terminate => {},
     }
-    eprintln!("[mcp] shutdown signal received; draining in-flight requests");
+    crate::diag!("[mcp] shutdown signal received; draining in-flight requests");
 }
 
 /// Liveness probe for orchestrators and load balancers.
 async fn health_handler() -> impl IntoResponse {
     Json(json!({ "status": "ok", "transport": "http" }))
+}
+
+/// Refuse the classic "localhost server + permissive CORS = drive-by"
+/// footgun: `DONSETCH_HTTP_CORS` and `DONSETCH_HTTP_TOKEN` are
+/// independently optional, so nothing stopped a user from enabling
+/// permissive CORS (any origin) while leaving auth off. With that
+/// combination, any webpage open in the same local browser could
+/// POST arbitrary MCP tool calls (fetch/crawl/search, including the
+/// `actions` browser-automation surface) to this server with no
+/// authentication. Fail closed instead of just warning: a startup
+/// error is impossible to miss, unlike an crate::diag! in a background
+/// daemon's log.
+fn validate_http_config(cors_enabled: bool, auth_enabled: bool) -> Result<(), String> {
+    if cors_enabled && !auth_enabled {
+        return Err(
+            "DONSETCH_HTTP_CORS is enabled without DONSETCH_HTTP_TOKEN: any \
+             webpage open in a local browser could drive this MCP server \
+             with no authentication. Set DONSETCH_HTTP_TOKEN to a random \
+             secret before enabling CORS, or leave DONSETCH_HTTP_CORS unset \
+             if you don't need browser-based clients."
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+/// Where the server listens, as the request checks need it.
+#[derive(Clone, Debug)]
+struct Bound {
+    loopback: bool,
+    port: u16,
+}
+
+impl Bound {
+    fn new(host: &str, port: u16) -> Self {
+        Self {
+            loopback: is_loopback_name(host),
+            port,
+        }
+    }
+}
+
+/// True for the names a loopback server answers to: `localhost`,
+/// `127.0.0.1` (any 127/8 literal), `::1`, with or without brackets.
+fn is_loopback_name(host: &str) -> bool {
+    let h = host.trim().trim_start_matches('[').trim_end_matches(']');
+    if h.eq_ignore_ascii_case("localhost") || h == "::1" {
+        return true;
+    }
+    h.parse::<std::net::Ipv4Addr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false)
+        || h.parse::<std::net::Ipv6Addr>()
+            .map(|ip| ip.is_loopback())
+            .unwrap_or(false)
+}
+
+/// Splits `host[:port]` as it appears in a Host header or an Origin
+/// authority, bracketed IPv6 included. `None` when the port is not a
+/// number.
+fn split_host_port(authority: &str) -> Option<(&str, Option<u16>)> {
+    let a = authority.trim();
+    if let Some(rest) = a.strip_prefix('[') {
+        let end = rest.find(']')?;
+        let host = &rest[..end];
+        return match &rest[end + 1..] {
+            "" => Some((host, None)),
+            p => Some((host, Some(p.strip_prefix(':')?.parse().ok()?))),
+        };
+    }
+    match a.rsplit_once(':') {
+        Some((host, port)) if !host.contains(':') => Some((host, Some(port.parse().ok()?))),
+        _ => Some((a, None)),
+    }
+}
+
+/// The request checks that run before auth on every /mcp route.
+///
+/// - `Origin`: a browser sets it on every cross-site request, a
+///   native MCP client never does. With CORS off (auth may be off
+///   too) only a loopback page is admitted; CORS mode, which
+///   `validate_http_config` allows only with auth, admits any.
+/// - `Host`: a server bound to loopback answers only to loopback
+///   names on its own port, so a page whose name resolves to
+///   127.0.0.1 (DNS rebinding) is refused; a request without a Host
+///   header is not a browser's; a server the operator bound to a
+///   reachable address answers to any name.
+///
+/// `Err` carries the word for the refusal.
+fn request_allowed(
+    headers: &HeaderMap,
+    cors_enabled: bool,
+    bound: &Bound,
+) -> Result<(), &'static str> {
+    if let Some(origin) = headers.get("origin") {
+        let origin = origin.to_str().unwrap_or("");
+        let loopback_origin = origin
+            .split_once("://")
+            .and_then(|(_, rest)| split_host_port(rest))
+            .is_some_and(|(host, _)| is_loopback_name(host));
+        if !cors_enabled && !loopback_origin {
+            return Err("origin not allowed");
+        }
+    }
+    // A browser always sends Host and a rebound name needs one, so
+    // only a Host that is present and foreign is refused.
+    if bound.loopback
+        && let Some(raw) = headers.get("host")
+    {
+        let Some((host, port)) = raw.to_str().ok().and_then(split_host_port) else {
+            return Err("host not allowed");
+        };
+        if !is_loopback_name(host) || port.is_some_and(|p| p != bound.port) {
+            return Err("host not allowed");
+        }
+    }
+    Ok(())
+}
+
+/// Consumes a tool call's progress lines for the life of the call.
+///
+/// The HTTP transport has nowhere to deliver progress (a POST gets
+/// one response), but the tool's forwarder still sends every line
+/// into the bounded channel and `handle` awaits that forwarder after
+/// the tool returns. Without a reader, the 257th line blocked the
+/// forwarder, the await never finished, and a call that had
+/// completed timed out. Drained here from the start instead.
+fn spawn_progress_sink(mut rx: mpsc::Receiver<String>) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move { while rx.recv().await.is_some() {} })
 }
 
 /// Bearer-auth check shared by every /mcp method (health stays open).
@@ -233,10 +369,13 @@ fn silent_stream(max: Duration) -> impl Stream<Item = Result<Event, Infallible>>
 ///
 /// DonSeTch has nothing server-initiated to say, so this exists purely
 /// so clients that open the stream after initialize (per spec they MAY)
-/// get a live SSE connection instead of a 405 that some clients —
-/// OpenCode notably — treat as fatal. See the module docs for the
+/// get a live SSE connection instead of a 405 that some clients :
+/// OpenCode notably : treat as fatal. See the module docs for the
 /// lifetime/reconnect reasoning.
 async fn sse_handler(State(state): State<HttpState>, headers: HeaderMap) -> Response {
+    if request_allowed(&headers, state.cors_enabled, &state.bound).is_err() {
+        return StatusCode::FORBIDDEN.into_response();
+    }
     if !authorized(&state, &headers) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
@@ -260,6 +399,9 @@ async fn sse_handler(State(state): State<HttpState>, headers: HeaderMap) -> Resp
 /// Session termination: drop the cancellation registry so a vanished
 /// client's entry cannot linger until the idle TTL collects it.
 async fn delete_handler(State(state): State<HttpState>, headers: HeaderMap) -> Response {
+    if request_allowed(&headers, state.cors_enabled, &state.bound).is_err() {
+        return StatusCode::FORBIDDEN.into_response();
+    }
     if !authorized(&state, &headers) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
@@ -305,22 +447,33 @@ fn new_session_id() -> String {
 impl SessionTable {
     /// Registry for an existing session id, or None if unknown.
     fn registry(&self, id: &str) -> Option<CancelMap> {
-        let mut sessions = self.sessions.lock().unwrap();
+        self.session_handles(id).map(|(c, _)| c)
+    }
+
+    /// Cancels + mode cell for an existing session, refreshing idle.
+    fn session_handles(&self, id: &str) -> Option<(CancelMap, Arc<crate::mcp::compat::ModeCell>)> {
+        let mut sessions = self
+            .sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.gc_locked(&mut sessions);
         let s = sessions.get_mut(id)?;
         s.last_seen = Instant::now();
-        Some(Arc::clone(&s.cancels))
+        Some((Arc::clone(&s.cancels), Arc::clone(&s.mode)))
     }
 
-    /// Registry for `id`, creating it on first use. The empty id is
-    /// the shared default registry for session-less clients; it is
-    /// never a candidate for MAX_SESSIONS eviction.
-    fn registry_or_create(&self, id: &str) -> CancelMap {
-        let mut sessions = self.sessions.lock().unwrap();
+    /// Registry + mode cell for `id`, creating it on first use. The
+    /// empty id is the shared default registry for session-less
+    /// clients; it is never a candidate for MAX_SESSIONS eviction.
+    fn registry_or_create(&self, id: &str) -> (CancelMap, Arc<crate::mcp::compat::ModeCell>) {
+        let mut sessions = self
+            .sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.gc_locked(&mut sessions);
         if let Some(s) = sessions.get_mut(id) {
             s.last_seen = Instant::now();
-            return Arc::clone(&s.cancels);
+            return (Arc::clone(&s.cancels), Arc::clone(&s.mode));
         }
         if sessions.len() >= MAX_SESSIONS && !id.is_empty() {
             // Evict the oldest session to bound memory.
@@ -334,19 +487,25 @@ impl SessionTable {
             }
         }
         let cancels: CancelMap = Arc::new(Mutex::new(HashMap::new()));
+        let mode = Arc::new(crate::mcp::compat::ModeCell::new());
         sessions.insert(
             id.to_string(),
             Session {
                 cancels: Arc::clone(&cancels),
+                mode: Arc::clone(&mode),
                 last_seen: Instant::now(),
             },
         );
-        cancels
+        (cancels, mode)
     }
 
     /// Remove a session; true if it existed.
     fn remove(&self, id: &str) -> bool {
-        self.sessions.lock().unwrap().remove(id).is_some()
+        self.sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(id)
+            .is_some()
     }
 
     /// Drop sessions idle beyond TTL. Called with the lock held.
@@ -363,8 +522,8 @@ impl SessionTable {
 }
 
 impl HttpState {
-    /// Registry for session-less clients; created on first use.
-    fn default_cancels(&self) -> CancelMap {
+    /// Registry + mode for session-less clients; created on first use.
+    fn default_handles(&self) -> (CancelMap, Arc<crate::mcp::compat::ModeCell>) {
         self.sessions.registry_or_create("")
     }
 }
@@ -377,7 +536,12 @@ impl HttpState {
 /// all work identically on both transports. See the module docs for
 /// the session and cancellation model.
 async fn mcp_handler(State(state): State<HttpState>, headers: HeaderMap, body: Bytes) -> Response {
-    // Auth gate: applies to /mcp only; /health stays open for probes.
+    // Origin and Host first: a browser page or a rebound name gets a
+    // 403 before anything is parsed. Then the auth gate: applies to
+    // /mcp only; /health stays open for probes.
+    if let Err(why) = request_allowed(&headers, state.cors_enabled, &state.bound) {
+        return rpc_error(StatusCode::FORBIDDEN, -32000, why);
+    }
     if !authorized(&state, &headers) {
         return rpc_error(StatusCode::UNAUTHORIZED, -32000, "unauthorized");
     }
@@ -396,13 +560,16 @@ async fn mcp_handler(State(state): State<HttpState>, headers: HeaderMap, body: B
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
 
-    // Cancellation notifications are handled inline — they must reach
+    // Cancellation notifications are handled inline : they must reach
     // the running tool NOW, not after a full dispatch round-trip.
     // Mirrors the stdio transport's inline handling.
     if is_notification && method == "notifications/cancelled" {
         let cancels = resolve_cancels(&state, sid_header.as_deref());
-        if let Some(rid) = req.pointer("/params/requestId").and_then(Value::as_i64)
-            && let Some(sender) = cancels.lock().unwrap().remove(&rid)
+        if let Some(rid) = req.pointer("/params/requestId").and_then(cancel_key)
+            && let Some(sender) = cancels
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&rid)
         {
             let _ = sender.send(true);
         }
@@ -413,11 +580,13 @@ async fn mcp_handler(State(state): State<HttpState>, headers: HeaderMap, body: B
 
     // Session resolution: header wins; unknown ids are expired per
     // streamable-HTTP convention. initialize without a header mints a
-    // new session echoed back on the response.
+    // new session echoed back on the response. Each session carries
+    // its own issue-#27 compat mode; session-less clients share the
+    // default (env override still applies per call).
     let mut new_session: Option<String> = None;
-    let cancels = match sid_header.as_deref() {
-        Some(sid) if !sid.is_empty() => match state.sessions.registry(sid) {
-            Some(c) => c,
+    let (cancels, mode_cell) = match sid_header.as_deref() {
+        Some(sid) if !sid.is_empty() => match state.sessions.session_handles(sid) {
+            Some(h) => h,
             None => return rpc_error(StatusCode::NOT_FOUND, -32001, "session expired or unknown"),
         },
         _ => {
@@ -426,19 +595,20 @@ async fn mcp_handler(State(state): State<HttpState>, headers: HeaderMap, body: B
                 new_session = Some(sid.clone());
                 state.sessions.registry_or_create(&sid)
             } else {
-                state.default_cancels()
+                state.default_handles()
             }
         }
     };
 
-    // Writer sink for in-flight progress notifications. Each request
-    // gets a fresh channel; nothing else consumes it.
-    let (progress_tx, mut progress_rx) = mpsc::channel::<String>(256);
-    let request_id = req.get("id").and_then(Value::as_i64);
+    // Progress notifications have no reader on a POST: a sink drains
+    // them for the life of the call so the forwarder never blocks.
+    let (progress_tx, progress_rx) = mpsc::channel::<String>(256);
+    let _sink = spawn_progress_sink(progress_rx);
+    let request_id = req.get("id").and_then(cancel_key);
 
     let outcome = tokio::time::timeout(
         state.timeout,
-        handle(&state.daemon, &line, &cancels, &progress_tx),
+        handle(&state.daemon, &line, &cancels, &progress_tx, &mode_cell),
     )
     .await;
 
@@ -447,7 +617,10 @@ async fn mcp_handler(State(state): State<HttpState>, headers: HeaderMap, body: B
             // Timed out: drop any registry entry so the id can be
             // reused without leaking a dead watch sender.
             if let Some(rid) = request_id
-                && let Some(sender) = cancels.lock().unwrap().remove(&rid)
+                && let Some(sender) = cancels
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(&rid)
             {
                 drop(sender);
             }
@@ -469,15 +642,8 @@ async fn mcp_handler(State(state): State<HttpState>, headers: HeaderMap, body: B
         Ok(None) => {
             // Notification: no body, 202 Accepted per the streamable-HTTP
             // spec (204 would also be "no content", but the spec names
-            // 202 for notification-only POSTs). The sender MUST be
-            // dropped before draining — recv() only returns None once
-            // every sender is gone, and progress_tx is still in scope
-            // here, so draining first would wait forever. (This exact
-            // deadlock hung the notifications/initialized POST and with
-            // it every streamable-HTTP client's connect; it also would
-            // have hung POSTs for cancelled tools/call requests.)
-            drop(progress_tx);
-            while progress_rx.recv().await.is_some() {}
+            // 202 for notification-only POSTs). The progress sink has
+            // been reading since before the call, so nothing waits here.
             StatusCode::ACCEPTED.into_response()
         }
     };
@@ -498,8 +664,8 @@ fn resolve_cancels(state: &HttpState, sid: Option<&str>) -> CancelMap {
         Some(s) if !s.is_empty() => state
             .sessions
             .registry(s)
-            .unwrap_or_else(|| state.default_cancels()),
-        _ => state.default_cancels(),
+            .unwrap_or_else(|| state.default_handles().0),
+        _ => state.default_handles().0,
     }
 }
 
@@ -520,12 +686,159 @@ mod tests {
     }
 
     #[test]
+    fn cors_without_auth_is_refused() {
+        assert!(validate_http_config(true, false).is_err());
+    }
+
+    #[test]
+    fn cors_with_auth_is_allowed() {
+        assert!(validate_http_config(true, true).is_ok());
+    }
+
+    #[test]
+    fn no_cors_is_always_allowed_regardless_of_auth() {
+        assert!(validate_http_config(false, false).is_ok());
+        assert!(validate_http_config(false, true).is_ok());
+    }
+
+    // Browser pages are the one client class the server never asked
+    // for: with auth off (the default) a page in a local browser can
+    // POST a JSON-RPC body as a "simple request" that no CORS
+    // preflight stops, and with DNS rebinding it reads the answer.
+    // Native clients send no Origin and pass; a loopback page passes;
+    // CORS mode (auth required) admits any origin on purpose.
+    #[test]
+    fn a_browser_origin_is_refused_unless_loopback_or_cors_mode() {
+        let bound = Bound::new("127.0.0.1", 8765);
+        let with = |name: &'static str, v: &str| {
+            let mut h = HeaderMap::new();
+            h.insert(name, HeaderValue::from_str(v).unwrap());
+            h
+        };
+        let none = HeaderMap::new();
+        assert!(
+            request_allowed(&none, false, &bound).is_ok(),
+            "no Origin: a native client"
+        );
+        for origin in [
+            "https://evil.example",
+            "http://evil.example:8765",
+            "null",
+            "http://127.0.0.1.evil.example",
+            "http://localhost.evil.example:8765",
+        ] {
+            assert!(
+                request_allowed(&with("origin", origin), false, &bound).is_err(),
+                "{origin} must be refused"
+            );
+            assert!(
+                request_allowed(&with("origin", origin), true, &bound).is_ok(),
+                "{origin} is admitted in CORS mode, which requires auth"
+            );
+        }
+        for origin in [
+            "http://localhost",
+            "http://localhost:3000",
+            "http://127.0.0.1:8765",
+            "https://127.0.0.1",
+            "http://[::1]:8765",
+            "HTTP://LOCALHOST:8765",
+        ] {
+            assert!(
+                request_allowed(&with("origin", origin), false, &bound).is_ok(),
+                "{origin} is a loopback page"
+            );
+        }
+    }
+
+    // The Host header is what DNS rebinding forges: a page at
+    // attacker.example resolving to 127.0.0.1 reaches the server
+    // with `Host: attacker.example`. A server bound to loopback only
+    // answers to loopback names on its own port.
+    #[test]
+    fn a_loopback_server_refuses_a_foreign_host_header() {
+        let bound = Bound::new("127.0.0.1", 8765);
+        let host = |v: &str| {
+            let mut h = HeaderMap::new();
+            h.insert("host", HeaderValue::from_str(v).unwrap());
+            h
+        };
+        for ok in [
+            "127.0.0.1:8765",
+            "localhost:8765",
+            "[::1]:8765",
+            "LOCALHOST:8765",
+            "127.0.0.1",
+            "localhost",
+        ] {
+            assert!(request_allowed(&host(ok), false, &bound).is_ok(), "{ok}");
+        }
+        for bad in [
+            "attacker.example",
+            "attacker.example:8765",
+            "127.0.0.1:9999",
+            "127.0.0.1.attacker.example:8765",
+            "",
+        ] {
+            assert!(
+                request_allowed(&host(bad), false, &bound).is_err(),
+                "{bad:?}"
+            );
+        }
+        // Bound to every interface on purpose: the operator chose a
+        // reachable server, and no single name is the right one.
+        let wide = Bound::new("0.0.0.0", 8765);
+        assert!(request_allowed(&host("attacker.example:8765"), false, &wide).is_ok());
+        // A loopback Origin still cannot come with a foreign Host.
+        let mut both = host("attacker.example:8765");
+        both.insert("origin", HeaderValue::from_static("http://localhost:8765"));
+        assert!(request_allowed(&both, false, &bound).is_err());
+    }
+
+    // A crawl with a progress token beats once every 2 s for up to
+    // 600 s: past the channel's 256 slots the forwarder used to block
+    // and the finished call timed out.
+    #[tokio::test]
+    async fn progress_is_drained_while_a_tool_runs() {
+        let (tx, rx) = mpsc::channel::<String>(256);
+        let sink = spawn_progress_sink(rx);
+        let pushed = tokio::time::timeout(Duration::from_secs(2), async {
+            for i in 0..1_000 {
+                tx.send(format!("progress {i}")).await.unwrap();
+            }
+        })
+        .await;
+        assert!(
+            pushed.is_ok(),
+            "1 000 progress lines must not block the tool"
+        );
+        drop(tx);
+        tokio::time::timeout(Duration::from_secs(2), sink)
+            .await
+            .expect("the sink ends with its sender")
+            .unwrap();
+    }
+
+    #[test]
     fn token_ok_no_token_configured_allows_all() {
         assert!(token_ok(None, &HeaderMap::new()));
         assert!(token_ok(None, &headers_with_bearer(Some("anything"))));
-        // run() filters empty env tokens, but the pure function still
-        // treats a configured (even empty) token as auth-on.
+        // The pure matcher treats Some as auth-on; configured_http_token is
+        // the single boundary that maps an exact empty value to None.
         assert!(!token_ok(Some(""), &HeaderMap::new()));
+    }
+
+    #[test]
+    fn legacy_token_is_compared_without_trimming() {
+        let expected = crate::config::configured_http_token(" padded token ");
+        assert!(token_ok(
+            expected,
+            &headers_with_bearer(Some(" padded token "))
+        ));
+        assert!(!token_ok(
+            expected,
+            &headers_with_bearer(Some("padded token"))
+        ));
     }
 
     #[test]
@@ -621,7 +934,10 @@ mod tests {
         if !backdate(&table, "old", Duration::from_secs(2)) {
             return; // host booted <2s ago; underflow, skip
         }
-        let mut sessions = table.sessions.lock().unwrap();
+        let mut sessions = table
+            .sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         table.gc_locked_with(&mut sessions, Duration::from_secs(1));
         drop(sessions);
         assert!(table.registry("old").is_none(), "idle session must be GC'd");
@@ -637,7 +953,10 @@ mod tests {
             table.registry_or_create(&format!("s{i:04}"));
         }
         // The oldest named entries were evicted as the table filled.
-        let live = table.sessions.lock().unwrap();
+        let live = table
+            .sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         assert!(
             live.len() <= MAX_SESSIONS,
             "table must stay bounded, has {}",

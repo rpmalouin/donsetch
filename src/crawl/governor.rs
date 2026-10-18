@@ -1,6 +1,6 @@
-//! The Crawl Governor — rate-limit immune system.
+//! The Crawl Governor : rate-limit immune system.
 //!
-//! The failure mode of crawlers is not "can't fetch" — it's
+//! The failure mode of crawlers is not "can't fetch" : it's
 //! "fetched 40 pages fine, then the host put the IP in a
 //! penalty box for 30 minutes." Every crawler eventually
 //! discovers its pace; smart ones discover it on page 5,
@@ -18,27 +18,38 @@
 
 use std::collections::HashMap;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
+
+/// Persist learned host ladders across restarts (v4 B6). Cap + TTL
+/// bound the file; Instant never serializes (remaining secs only).
+const GOVERNOR_DISK_VERSION: u32 = 1;
+const GOVERNOR_HOST_CAP: usize = 2_000;
+const GOVERNOR_TTL: Duration = Duration::from_secs(7 * 86_400);
 
 /// Base inter-request delay per lane when healthy.
 ///
-/// v2 elastic pacing: 300ms+jitter (~225-375ms gaps) is the
-/// pace of a human skimming docs — clicking through interesting
-/// links fast. A normal browser page load fires 20-80 requests
-/// to one host in parallel, so single-document fetches at this
-/// pace sit far below any per-IP threshold that allows normal
-/// browsing. The governor's job is the ESCALATION ladder, not
-/// presumptive slowness: any throttle signal (429/503), latency
-/// stress (EWMA > 3× baseline), or robots crawl-delay raises
-/// the pace reactively — we discover the host's real limit from
-/// its own signals instead of taxing every crawl with a 700ms+
-/// theater of politeness. Measured effect: small-crawl median
-/// 6.29s → ~2.5s with zero observed throttling on test hosts.
+/// Elastic pacing: 200ms+jitter (~150-250ms gaps). A normal
+/// browser page load fires 20-80 requests to one host in
+/// parallel, so single-document fetches at this pace sit far
+/// below any per-IP threshold that allows normal browsing. The
+/// governor's job is the ESCALATION ladder, not presumptive
+/// slowness: any throttle signal (429/503), latency stress
+/// (EWMA > 3× baseline), or robots crawl-delay raises the pace
+/// reactively : we discover the host's real limit from its own
+/// signals instead of taxing every crawl with a theater of
+/// politeness. Measured effect: small-crawl median 6.29s →
+/// ~2.5s with zero observed throttling on test hosts.
 const BASE_DELAY: Duration = Duration::from_millis(200);
 
 /// Hard ceiling on adaptive delay growth (rung = BASE * 2^k,
-/// capped at 6 rungs ≈ 45s).
+/// capped at 6 rungs). Every ladder delay is additionally capped
+/// at MAX_LADDER_WAIT: self-inferred waits never exceed ~7s
+/// (v4 law 11: stealth through truth, never time). Host-declared
+/// waits (the 429/503 penalty box, robots crawl-delay) bypass the
+/// cap and are honored in full.
 const MAX_BACKOFF_RUNG: u32 = 6;
+const MAX_LADDER_WAIT: Duration = Duration::from_secs(7);
 
 /// Latency EWMA window: new samples weigh 25%.
 const EWMA_ALPHA: f64 = 0.25;
@@ -89,6 +100,14 @@ struct HostPenalty {
     rung: u32,
     /// Host is in a penalty box until this instant (429/storm).
     boxed_until: Option<Instant>,
+    /// Last activity on this host (any lane). Drives pruning so
+    /// a long-lived daemon does not grow one struct per host it
+    /// ever touched.
+    last_seen: Option<Instant>,
+    /// Host-DECLARED pace (robots Crawl-delay), honored in full.
+    /// Per host: a process-global value let two concurrent crawls
+    /// of different hosts cross-pollute each other's pacing.
+    crawl_delay_secs: Option<f64>,
 }
 
 pub struct Governor {
@@ -98,31 +117,191 @@ pub struct Governor {
     hosts: Mutex<HashMap<String, HostPenalty>>,
     /// All lanes in the pool.
     pub lanes_all: Vec<Lane>,
-    /// Honors robots.txt crawl-delay when set (minimum pace).
-    crawl_delay: Mutex<Option<f64>>,
+    /// Set on host-ladder mutation; save swaps it off.
+    dirty: AtomicBool,
+}
+
+/// On-disk host row: (host, rung, boxed_remaining_secs,
+/// crawl_delay_secs, age_secs). `next_allowed` is process-local.
+type DiskHost = (String, u32, u64, Option<f64>, u64);
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct GovernorDisk {
+    #[serde(default = "governor_disk_version")]
+    version: u32,
+    #[serde(default)]
+    hosts: Vec<DiskHost>,
+}
+
+fn governor_disk_version() -> u32 {
+    1
+}
+
+fn governor_path() -> Option<std::path::PathBuf> {
+    Some(crate::paths::cache_dir().join("crawl-governor.json"))
+}
+
+fn persist_enabled() -> bool {
+    !crate::config::cfg().state.no_disk_state
+}
+
+fn remaining_secs(until: Option<Instant>) -> u64 {
+    match until {
+        None => 0,
+        Some(t) => {
+            let now = Instant::now();
+            if t <= now {
+                0
+            } else {
+                t.saturating_duration_since(now).as_secs()
+            }
+        }
+    }
 }
 
 impl Governor {
     pub fn new(lanes_all: Vec<Lane>) -> Self {
-        Self {
+        let g = Self {
             lanes: Mutex::new(HashMap::new()),
             hosts: Mutex::new(HashMap::new()),
             lanes_all,
-            crawl_delay: Mutex::new(None),
+            dirty: AtomicBool::new(false),
+        };
+        g.load_disk();
+        g
+    }
+
+    fn mark_dirty(&self) {
+        self.dirty.store(true, Ordering::Relaxed);
+    }
+
+    /// Load host ladders so a restart never re-learns a 429 storm
+    /// from zero. Corrupt/missing files are ignored (never block).
+    fn load_disk(&self) {
+        if !persist_enabled() {
+            return;
+        }
+        let Some(path) = governor_path() else { return };
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            return;
+        };
+        let Ok(disk) = serde_json::from_str::<GovernorDisk>(&raw) else {
+            return;
+        };
+        if disk.version != GOVERNOR_DISK_VERSION {
+            return;
+        }
+        let now = Instant::now();
+        let mut hosts = self
+            .hosts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut n = 0usize;
+        for (host, rung, boxed_rem, delay, age) in disk.hosts {
+            if n >= GOVERNOR_HOST_CAP {
+                break;
+            }
+            if age > GOVERNOR_TTL.as_secs() {
+                continue;
+            }
+            hosts.insert(
+                host,
+                HostPenalty {
+                    rung,
+                    boxed_until: if boxed_rem > 0 {
+                        Some(now + Duration::from_secs(boxed_rem.min(86_400)))
+                    } else {
+                        None
+                    },
+                    last_seen: None,
+                    crawl_delay_secs: delay.filter(|d| d.is_finite() && *d > 0.0),
+                },
+            );
+            n += 1;
         }
     }
 
-    pub fn set_crawl_delay(&self, d: Option<f64>) {
-        *self.crawl_delay.lock().unwrap() = d;
+    fn save_disk_if_dirty(&self) {
+        if !self.dirty.swap(false, Ordering::Relaxed) {
+            return;
+        }
+        if !persist_enabled() {
+            return;
+        }
+        let Some(path) = governor_path() else { return };
+        let hosts = self
+            .hosts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut rows: Vec<DiskHost> = hosts
+            .iter()
+            .map(|(host, h)| {
+                (
+                    host.clone(),
+                    h.rung,
+                    remaining_secs(h.boxed_until),
+                    h.crawl_delay_secs,
+                    0,
+                )
+            })
+            .collect();
+        // Newest lessons first when over cap: keep the highest rungs
+        // (the expensive discoveries) and drop quiet hosts.
+        if rows.len() > GOVERNOR_HOST_CAP {
+            rows.sort_by_key(|a| std::cmp::Reverse(a.1));
+            rows.truncate(GOVERNOR_HOST_CAP);
+        }
+        drop(hosts);
+        let disk = GovernorDisk {
+            version: GOVERNOR_DISK_VERSION,
+            hosts: rows,
+        };
+        let Ok(json) = serde_json::to_string(&disk) else {
+            return;
+        };
+        if std::fs::create_dir_all(crate::paths::cache_dir()).is_err() {
+            return;
+        }
+        let tmp = path.with_extension("json.tmp");
+        if crate::config::write_private(&tmp, json.as_bytes()).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+        }
     }
 
-    /// Base delay honoring host-declared crawl-delay.
+    /// Record a host's robots Crawl-delay as the minimum pace for
+    /// THAT host. Per-host on purpose: the governor is shared by
+    /// every crawl in the process, and a global value let a
+    /// Crawl-delay: 60 crawl slow down an unrelated host's crawl
+    /// (and vice versa: the next crawl reset the first one's pace).
+    pub fn set_host_crawl_delay(&self, host: &str, d: Option<f64>) {
+        let mut hosts = self
+            .hosts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // The value comes from robots parsing: re-clamp here so no
+        // caller can hand `from_secs_f64` a value it panics on.
+        let clamped = d.filter(|s| s.is_finite() && *s > 0.0);
+        hosts.entry(host.to_string()).or_default().crawl_delay_secs = clamped;
+    }
+
+    /// The host-declared pace floor for `host`, honored in full
+    /// (the only cap is the robots parser's 60s clamp). Hosts with
+    /// no declared delay pace at the ladder, not at this floor.
+    fn crawl_delay_floor(&self, host: &str) -> Duration {
+        let hosts = self
+            .hosts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        hosts
+            .get(host)
+            .and_then(|h| h.crawl_delay_secs)
+            .map(|s| Duration::from_secs_f64(s.min(super::sitemap::MAX_CRAWL_DELAY_SECS)))
+            .unwrap_or(Duration::ZERO)
+    }
+
+    /// Base delay for the adaptive ladder (self-inferred only).
     fn base(&self) -> Duration {
-        let cd = self.crawl_delay.lock().unwrap();
-        match *cd {
-            Some(s) if s > 0.0 => Duration::from_secs_f64(s.max(BASE_DELAY.as_secs_f64())),
-            _ => BASE_DELAY,
-        }
+        BASE_DELAY
     }
 
     /// Deterministic jitter: remaps a counter into [0.75, 1.25].
@@ -145,10 +324,14 @@ impl Governor {
     /// for the shared host penalty box. Caller `tokio::time::sleep`s.
     pub fn wait_for(&self, host: &str, lane: &str, seq: u64) -> Duration {
         let host_boxed = {
-            let hosts = self.hosts.lock().unwrap();
-            hosts
-                .get(host)
-                .and_then(|h| h.boxed_until)
+            let mut hosts = self
+                .hosts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            prune_hosts(&mut hosts);
+            let h = hosts.entry(host.to_string()).or_default();
+            h.last_seen = Some(Instant::now());
+            h.boxed_until
                 .map(|u| u.saturating_duration_since(Instant::now()))
                 .unwrap_or(Duration::ZERO)
         };
@@ -168,7 +351,11 @@ impl Governor {
             LaneKind::Direct => self.base(),
             LaneKind::Proxy => self.base().mul_f64(1.5),
         };
-        let mut lanes = self.lanes.lock().unwrap();
+        let mut lanes = self
+            .lanes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        prune_lanes(&mut lanes);
         let key = (host.to_string(), lane.to_string());
         let hl = lanes.entry(key).or_default();
         let now = Instant::now();
@@ -177,21 +364,32 @@ impl Governor {
             return wait;
         }
 
-        // Compute the new next_allowed: base * 2^rung, jittered.
+        // Compute the new next_allowed: base * 2^rung, jittered,
+        // capped at MAX_LADDER_WAIT (law 11 : stealth through truth,
+        // never time). The cap bounds only the SELF-INFERRED ladder;
+        // the host-DECLARED crawl-delay floor is honored in full
+        // above it, so a host declaring Crawl-delay: 30 actually
+        // sees 30s pacing instead of the 7s ladder cap.
         let rung_mult = (1u64 << hl.rung.min(MAX_BACKOFF_RUNG)) as f64;
-        let delay = base.mul_f64(rung_mult * self.jitter(seq));
+        let ladder = base
+            .mul_f64(rung_mult * self.jitter(seq))
+            .min(MAX_LADDER_WAIT);
+        let delay = ladder.max(self.crawl_delay_floor(host));
         hl.next_allowed = now + delay;
         Duration::ZERO
     }
 
     /// Record a healthy response: decay the rung (recovery),
     /// fold latency into EWMA, flag pre-wall stress. Also pull
-    /// the pending next_allowed FORWARD when the rung decays —
+    /// the pending next_allowed FORWARD when the rung decays :
     /// a host answering fine again shouldn't serve an old
     /// penalty window computed while it was upset.
-    pub fn on_success(&self, host: &str, lane: &str, latency: Duration, dwell_ms: u64) {
+    pub fn on_success(&self, host: &str, lane: &str, latency: Duration) {
         let ms = latency.as_secs_f64() * 1000.0;
-        let mut lanes = self.lanes.lock().unwrap();
+        let mut lanes = self
+            .lanes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let key = (host.to_string(), lane.to_string());
         let hl = lanes.entry(key).or_default();
         let old_rung = hl.rung;
@@ -220,25 +418,24 @@ impl Governor {
                     .min(hl.next_allowed.saturating_duration_since(Instant::now()))
                     .mul_f64(new_mult);
         }
-        // Dwell time: a human reads the page before navigating
-        // to the next one. Proportional to page size (bytes/4),
-        // capped at 2s. Added AFTER rung adjustments so it
-        // extends — not replaces — the paced window. This breaks
-        // the metronome fingerprint: a 50KB page gets a longer
-        // gap than a 2KB page, just like real reading.
-        if dwell_ms > 0 {
-            let dwell = Duration::from_millis(dwell_ms);
-            let now = Instant::now();
-            hl.next_allowed = hl.next_allowed.max(now) + dwell;
-        }
         drop(lanes);
 
         // Success decays the shared host penalty too.
-        let mut hosts = self.hosts.lock().unwrap();
+        let mut hosts = self
+            .hosts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(h) = hosts.get_mut(host) {
+            h.last_seen = Some(Instant::now());
+            let before = h.rung;
             h.rung = h.rung.saturating_sub(1);
             if h.rung == 0 {
                 h.boxed_until = None;
+            }
+            if h.rung != before {
+                drop(hosts);
+                self.mark_dirty();
+                self.save_disk_if_dirty();
             }
         }
     }
@@ -247,41 +444,71 @@ impl Governor {
     /// whole host into the shared penalty box.
     pub fn on_throttled(&self, host: &str, lane: &str) {
         {
-            let mut lanes = self.lanes.lock().unwrap();
+            let mut lanes = self
+                .lanes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let key = (host.to_string(), lane.to_string());
             let hl = lanes.entry(key).or_default();
             hl.rung = (hl.rung + 2).min(MAX_BACKOFF_RUNG);
             let rung_mult = (1u64 << hl.rung) as f64;
-            hl.next_allowed = Instant::now() + self.base().mul_f64(rung_mult * self.jitter(0xbeef));
+            hl.next_allowed = Instant::now()
+                + self
+                    .base()
+                    .mul_f64(rung_mult * self.jitter(0xbeef))
+                    .min(MAX_LADDER_WAIT);
         }
         // Shared host penalty box: everyone backs off together.
-        let mut hosts = self.hosts.lock().unwrap();
+        let mut hosts = self
+            .hosts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let h = hosts.entry(host.to_string()).or_default();
+        h.last_seen = Some(Instant::now());
         h.rung = (h.rung + 1).min(MAX_BACKOFF_RUNG);
         let host_rung_mult = (1u64 << h.rung) as f64;
         h.boxed_until =
             Some(Instant::now() + self.base().mul_f64(host_rung_mult * self.jitter(0xdead)));
+        drop(hosts);
+        // The expensive lesson: persist so a restart does not re-pay
+        // the same 429 storm (v4 B6).
+        self.mark_dirty();
+        self.save_disk_if_dirty();
     }
 
     /// Record a network error (timeout, reset): gentler than
-    /// throttled — one lane rung, no host box.
+    /// throttled : one lane rung, no host box.
     pub fn on_error(&self, host: &str, lane: &str) {
-        let mut lanes = self.lanes.lock().unwrap();
+        let mut lanes = self
+            .lanes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let key = (host.to_string(), lane.to_string());
         let hl = lanes.entry(key).or_default();
         hl.rung = (hl.rung + 1).min(MAX_BACKOFF_RUNG);
         hl.next_allowed = Instant::now()
             + self
                 .base()
-                .mul_f64((1u64 << hl.rung) as f64 * self.jitter(7));
+                .mul_f64((1u64 << hl.rung) as f64 * self.jitter(7))
+                .min(MAX_LADDER_WAIT);
     }
 
     /// Pick the least-blocked lane for the host, respecting the
     /// shared penalty box. Returns None when the whole host is
     /// boxed (caller waits for the box to lift).
+    ///
+    /// The direct lane is first in the list on purpose: a host starts on it
+    /// and escalates to a pool lane only once that host blocks, throttles or
+    /// errors on direct (`on_throttled`/`on_error` push direct's pace clock
+    /// out, so the next pick lands on a lane). The owned crawl fixtures pin
+    /// it ("the unused lane must receive no request"), so do not "fix" the
+    /// tie-break to prefer a pool lane: that is a policy change, not a repair.
     pub fn best_lane(&self, host: &str) -> Option<&Lane> {
         let host_boxed = {
-            let hosts = self.hosts.lock().unwrap();
+            let hosts = self
+                .hosts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             hosts
                 .get(host)
                 .and_then(|h| h.boxed_until)
@@ -291,7 +518,10 @@ impl Governor {
         if host_boxed {
             return None;
         }
-        let lanes = self.lanes.lock().unwrap();
+        let lanes = self
+            .lanes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let now = Instant::now();
         self.lanes_all.iter().min_by_key(|l| {
             let key = (host.to_string(), l.id.clone());
@@ -303,9 +533,199 @@ impl Governor {
     }
 }
 
+/// Prune per-(host, lane) pacing clocks the same way prune_hosts
+/// prunes host state: a long-lived daemon crawling many hosts grew
+/// one entry per (host, lane) forever (the "*" boxed-host lane
+/// included). Idle signal = next_allowed in the past by more than
+/// the idle window (no request waited on that clock recently).
+fn prune_lanes(lanes: &mut HashMap<(String, String), HostLane>) {
+    const CAP: usize = 4096;
+    const MAX_IDLE: Duration = Duration::from_secs(3600);
+    if lanes.len() <= CAP {
+        return;
+    }
+    let now = Instant::now();
+    lanes.retain(|_, hl| now.saturating_duration_since(hl.next_allowed) < MAX_IDLE);
+}
+
+/// Prune hosts untouched for over an hour once the map passes
+/// 1024 entries: a penalty box's maximum horizon is minutes, so
+/// dropping hour-old state loses nothing but memory. Also drops
+/// idle map growth from one large breadth crawl per daemon life.
+fn prune_hosts(hosts: &mut HashMap<String, HostPenalty>) {
+    const CAP: usize = 1024;
+    const MAX_IDLE: Duration = Duration::from_secs(3600);
+    if hosts.len() <= CAP {
+        return;
+    }
+    let now = Instant::now();
+    hosts.retain(|_, h| {
+        h.last_seen
+            .map(|t| now.saturating_duration_since(t) < MAX_IDLE)
+            .unwrap_or(false)
+    });
+    // Belt and suspenders: if the crawl storm touched over a
+    // thousand hosts in the last hour (mega-breadth), keep only
+    // the most recently active.
+    if hosts.len() > CAP {
+        let mut sorted: Vec<(Instant, String)> = hosts
+            .iter()
+            .filter_map(|(k, h)| h.last_seen.map(|t| (t, k.clone())))
+            .collect();
+        sorted.sort_by_key(|(t, _)| std::cmp::Reverse(*t));
+        let keep: std::collections::HashSet<String> =
+            sorted.into_iter().take(CAP).map(|(_, k)| k).collect();
+        hosts.retain(|k, _| keep.contains(k));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fetch::client::Fetcher;
+    use crate::search::egress::EgressPool;
+    use crate::transport::proxy::Proxy;
+    use std::sync::Arc;
+
+    async fn owned_status_crawl(
+        status: u16,
+        auth_wall: bool,
+    ) -> (Arc<Governor>, Arc<EgressPool>, String) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut config = crate::config::DonsetchConfig::default();
+        config.proxy.from_environment = false;
+        config.fetch.allow_private_egress = true;
+        crate::config::install(config).unwrap();
+        let origin = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let unused_proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/owned-status", origin.local_addr().unwrap());
+        let proxy =
+            Proxy::parse(&format!("http://{}", unused_proxy.local_addr().unwrap())).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = origin.accept().await.unwrap();
+            let mut head = Vec::new();
+            while !head.ends_with(b"\r\n\r\n") {
+                assert!(head.len() < 16384);
+                head.push(socket.read_u8().await.unwrap());
+            }
+            assert!(head.starts_with(b"GET /owned-status HTTP/1.1\r\n"));
+            let body = if auth_wall {
+                "<html><title>Sign in</title><form><input type='password'></form></html>"
+                    .to_string()
+            } else if status == 403 {
+                "<html><h1>Access denied</h1></html>".to_string()
+            } else {
+                format!(
+                    "<article><h1>Owned status {status}</h1><p>{}</p></article>",
+                    "Useful content from a successful response must not penalize its lane. "
+                        .repeat(50)
+                )
+            };
+            socket.write_all(format!("HTTP/1.1 {status} Owned\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+        });
+        let pool = Arc::new(EgressPool::new(vec![proxy.clone()]));
+        let (crawler, governor) = super::super::real::build(
+            Arc::new(Fetcher::new(crate::profile::BrowserProfile::host_default()).unwrap()),
+            Arc::clone(&pool),
+            None,
+        );
+        let result = crawler
+            .crawl(
+                &url,
+                super::super::CrawlOptions {
+                    mode: super::super::CrawlMode::Content,
+                    respect_robots: false,
+                    max_pages: 1,
+                    max_depth: 0,
+                    deadline: std::time::Duration::from_secs(2),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        server.await.unwrap();
+        assert_eq!(result.pages.len(), usize::from(status != 403 && !auth_wall));
+        if status != 403 && !auth_wall {
+            assert!(
+                result.pages[0]
+                    .markdown
+                    .contains(&format!("Owned status {status}"))
+            );
+            assert!(result.pages[0].markdown.contains("Useful content"));
+        }
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), unused_proxy.accept())
+                .await
+                .is_err(),
+            "the unused lane must receive no request"
+        );
+        (governor, pool, proxy.id())
+    }
+
+    #[tokio::test]
+    async fn stealth_v3_success_status_201_keeps_crawl_governor_lane_healthy() {
+        let (governor, _, _) = owned_status_crawl(201, false).await;
+        let lanes = governor.lanes.lock().unwrap();
+        let lane = lanes.get(&("127.0.0.1".into(), "direct".into())).unwrap();
+        assert_eq!(lane.rung, 0, "a useful HTTP201 must not add a failure rung");
+        assert!(
+            lane.baseline_ms.is_some(),
+            "the actual response must reach success feedback"
+        );
+    }
+
+    #[tokio::test]
+    async fn stealth_v3_success_status_201_updates_crawl_pool_health() {
+        let (_, pool, _) = owned_status_crawl(201, false).await;
+        assert!(
+            pool.rtt_ms("direct").is_some(),
+            "a real HTTP201 must teach the lane RTT"
+        );
+    }
+
+    #[tokio::test]
+    async fn stealth_v3_success_status_200_retains_crawl_health_feedback() {
+        let (governor, pool, _) = owned_status_crawl(200, false).await;
+        let lanes = governor.lanes.lock().unwrap();
+        let lane = lanes.get(&("127.0.0.1".into(), "direct".into())).unwrap();
+        assert_eq!(lane.rung, 0);
+        assert!(lane.baseline_ms.is_some());
+        assert!(pool.rtt_ms("direct").is_some());
+    }
+
+    #[tokio::test]
+    async fn stealth_v3_success_status_403_still_penalizes_crawl_lane() {
+        let (governor, pool, unused_proxy) = owned_status_crawl(403, false).await;
+        assert_eq!(governor.best_lane("127.0.0.1").unwrap().id, unused_proxy);
+        assert!(pool.rtt_ms("direct").is_none());
+    }
+
+    #[tokio::test]
+    async fn stealth_v3_success_status_299_updates_crawl_health() {
+        let (governor, pool, _) = owned_status_crawl(299, false).await;
+        let lanes = governor.lanes.lock().unwrap();
+        let lane = lanes.get(&("127.0.0.1".into(), "direct".into())).unwrap();
+        assert_eq!(lane.rung, 0);
+        assert!(lane.baseline_ms.is_some());
+        assert!(pool.rtt_ms("direct").is_some());
+    }
+
+    #[tokio::test]
+    async fn stealth_v3_success_status_201_auth_wall_still_penalizes_crawl_content() {
+        let (governor, pool, _) = owned_status_crawl(201, true).await;
+        let lanes = governor.lanes.lock().unwrap();
+        let lane = lanes.get(&("127.0.0.1".into(), "direct".into())).unwrap();
+        assert_eq!(
+            lane.rung, 1,
+            "HTTP success cannot make a login page useful content"
+        );
+        assert!(lane.baseline_ms.is_none());
+        assert!(
+            pool.rtt_ms("direct").is_some(),
+            "the transport still reached its peer"
+        );
+    }
 
     fn gov(kinds: &[LaneKind]) -> Governor {
         let lanes = kinds
@@ -334,6 +754,41 @@ mod tests {
         assert!(w < Duration::from_secs(3));
     }
 
+    // `Duration::from_secs_f64` panics on non-finite or > u64::MAX
+    // seconds; the governor must never trust the value it is
+    // handed that far.
+    #[test]
+    fn absurd_crawl_delay_never_panics_and_is_capped() {
+        for d in [f64::INFINITY, f64::NAN, 1e300, -1.0, 86400.0] {
+            let g = gov(&[LaneKind::Direct]);
+            g.set_host_crawl_delay("ex.com", Some(d));
+            g.wait_for("ex.com", "lane0", 0);
+            let w = g.wait_for("ex.com", "lane0", 1);
+            assert!(w <= Duration::from_secs(90), "{d}: {w:?}");
+        }
+    }
+
+    // v4 law 11: a HOST-DECLARED Crawl-delay is honored in full,
+    // above the 7s self-inferred ladder cap. A host declaring
+    // Crawl-delay: 30 must actually see 30s pacing.
+    #[test]
+    fn declared_crawl_delay_is_honored_above_the_ladder_cap() {
+        let g = gov(&[LaneKind::Direct]);
+        g.set_host_crawl_delay("ex.com", Some(30.0));
+        g.wait_for("ex.com", "lane0", 0);
+        let w = g.wait_for("ex.com", "lane0", 1);
+        assert!(
+            w >= Duration::from_secs(22),
+            "Crawl-delay: 30 must pace at 30s (minus jitter floor), got {w:?}"
+        );
+        // A different host is NOT slowed by this one's declared pace.
+        let g2 = gov(&[LaneKind::Direct]);
+        g2.set_host_crawl_delay("slow.com", Some(30.0));
+        g2.wait_for("fast.com", "lane0", 0);
+        let w2 = g2.wait_for("fast.com", "lane0", 1);
+        assert!(w2 < Duration::from_secs(1), "per-host isolation: {w2:?}");
+    }
+
     #[test]
     fn two_lanes_are_independent() {
         let g = gov(&[LaneKind::Direct, LaneKind::Proxy]);
@@ -358,14 +813,17 @@ mod tests {
         let before = g.wait_for("ex.com", "lane0", 1);
         // Simulate the box expiring, then successes.
         {
-            let mut hosts = g.hosts.lock().unwrap();
+            let mut hosts = g
+                .hosts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             hosts.get_mut("ex.com").unwrap().boxed_until =
                 Some(Instant::now() - Duration::from_secs(1));
             hosts.get_mut("ex.com").unwrap().rung = 2;
         }
-        g.on_success("ex.com", "lane0", Duration::from_millis(50), 0);
-        g.on_success("ex.com", "lane0", Duration::from_millis(50), 0);
-        g.on_success("ex.com", "lane0", Duration::from_millis(50), 0);
+        g.on_success("ex.com", "lane0", Duration::from_millis(50));
+        g.on_success("ex.com", "lane0", Duration::from_millis(50));
+        g.on_success("ex.com", "lane0", Duration::from_millis(50));
         let after = g.wait_for("ex.com", "lane0", 2);
         let _ = before;
         assert!(after < Duration::from_secs(2));
@@ -374,15 +832,43 @@ mod tests {
     #[test]
     fn rising_latency_adds_rung() {
         let g = gov(&[LaneKind::Direct]);
-        g.on_success("ex.com", "lane0", Duration::from_millis(100), 0);
+        g.on_success("ex.com", "lane0", Duration::from_millis(100));
         // Feed rising latencies.
         for _ in 0..6 {
-            g.on_success("ex.com", "lane0", Duration::from_millis(500), 0);
+            g.on_success("ex.com", "lane0", Duration::from_millis(500));
         }
         {
-            let lanes = g.lanes.lock().unwrap();
+            let lanes = g
+                .lanes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let hl = lanes.get(&("ex.com".into(), "lane0".into())).unwrap();
             assert!(hl.rung >= 1);
+        }
+    }
+
+    // v4 phase 3 (law 11): the adaptive ladder is capped. At the
+    // top rung the wait must never exceed MAX_LADDER_WAIT, whatever
+    // the jitter draws. Pre-cap, rung 6 reached ~16s.
+    #[test]
+    fn ladder_capped_at_seven_seconds() {
+        for seed in 0..32u64 {
+            let g = gov(&[LaneKind::Direct]);
+            {
+                let mut lanes = g
+                    .lanes
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                lanes
+                    .entry(("ex.com".into(), "lane0".into()))
+                    .or_default()
+                    .rung = MAX_BACKOFF_RUNG;
+            }
+            let w = g.wait_for("ex.com", "lane0", seed);
+            assert!(
+                w <= MAX_LADDER_WAIT,
+                "seed {seed}: wait {w:?} exceeds the 7s cap"
+            );
         }
     }
 
@@ -393,5 +879,89 @@ mod tests {
         g.wait_for("ex.com", "lane0", 1);
         let pick = g.best_lane("ex.com").unwrap();
         assert_eq!(pick.id, "lane1");
+    }
+
+    #[test]
+    fn best_lane_keeps_a_fresh_host_on_the_direct_lane() {
+        // The shipped contract, pinned by the owned crawl fixtures ("the
+        // unused lane must receive no request"): a host starts on direct and
+        // moves to a pool lane once direct takes the block. Equally-due lanes
+        // resolve by list order, and direct is first.
+        let g = gov(&[LaneKind::Direct, LaneKind::Proxy, LaneKind::Proxy]);
+        assert_eq!(g.best_lane("fresh.example").unwrap().id, "lane0");
+        for _ in 0..8 {
+            g.on_error("fresh.example", "lane0");
+        }
+        assert_eq!(g.best_lane("fresh.example").unwrap().id, "lane1");
+    }
+
+    #[test]
+    fn host_map_prunes_stale_entries() {
+        let g = gov(&[LaneKind::Direct]);
+        for i in 0..1100 {
+            g.wait_for(&format!("h{i}.com"), "lane0", i);
+        }
+        // Age every entry past the idle window.
+        {
+            let mut hosts = g
+                .hosts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for h in hosts.values_mut() {
+                h.last_seen = Some(Instant::now() - Duration::from_secs(7200));
+            }
+        }
+        // One more touch triggers the prune pass.
+        g.wait_for("fresh.com", "lane0", 1200);
+        let hosts = g
+            .hosts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            hosts.len() <= 2,
+            "stale hosts must be pruned, kept {}",
+            hosts.len()
+        );
+    }
+
+    /// B6: a throttled host ladder must survive process restart.
+    #[test]
+    fn throttled_host_ladder_survives_restart() {
+        let dir = std::env::temp_dir().join(format!(
+            "donsetch-gov-persist-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        unsafe {
+            std::env::set_var("DONSETCH_CACHE_DIR", &dir);
+        }
+        {
+            let g = gov(&[LaneKind::Direct]);
+            g.on_throttled("storm.example", "direct");
+            g.on_throttled("storm.example", "direct");
+        }
+        assert!(
+            dir.join("crawl-governor.json").exists(),
+            "on_throttled must persist the host ladder"
+        );
+        let g2 = gov(&[LaneKind::Direct]);
+        {
+            let hosts = g2
+                .hosts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let h = hosts
+                .get("storm.example")
+                .expect("throttled host must survive restart");
+            assert!(h.rung >= 1, "rung must survive, got {}", h.rung);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        unsafe {
+            std::env::remove_var("DONSETCH_CACHE_DIR");
+        }
     }
 }

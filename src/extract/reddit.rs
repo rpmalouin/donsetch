@@ -1,12 +1,12 @@
 //! Reddit dedicated extractor for old.reddit.com.
 //!
-//! Bypasses DonSift entirely — selects and formats reddit-
+//! Bypasses DonSift entirely : selects and formats reddit-
 //! specific elements (posts, comments, vote buttons, tags)
 //! into compact, token-efficient markdown. Handles subreddit
 //! listings and comment threads with proper nesting.
 //!
 //! Returns `None` for non-reddit or unrecognized reddit pages
-//! (search, user pages without .thing elements) — the caller
+//! (search, user pages without .thing elements) : the caller
 //! falls back to generic DonSift.
 
 use scraper::{ElementRef, Html, Node, Selector};
@@ -14,16 +14,26 @@ use scraper::{ElementRef, Html, Node, Selector};
 use super::{ContentKind, ExtractOptions, Extracted, inline};
 
 /// Entry point. Tries the reddit extractor; returns `None`
-/// to signal "not reddit, or unrecognized — use generic".
+/// to signal "not reddit, or unrecognized : use generic".
+/// Nesting the renderers follow before stopping. blocks.rs and
+/// math.rs cap theirs; these recursed unbounded, and a deep enough
+/// `<div>`/`<ul>` nest under a comment overflowed the stack (abort).
+const MAX_DEPTH: usize = 100;
+
 pub fn extract(html: &str, url: &str, opts: &ExtractOptions) -> Option<Extracted> {
-    // Respect explicit selectors and TOC — let DonSift handle.
-    if opts.selector.is_some() || opts.toc {
+    // Respect explicit selectors and TOC : let DonSift handle.
+    if opts.selector.is_some()
+        || opts.toc
+        || opts.focus.is_some()
+        || opts.section.is_some()
+        || opts.must_contain.is_some()
+    {
         return None;
     }
 
     let parsed = url::Url::parse(url).ok()?;
     let host = parsed.host_str()?.to_string();
-    if !host.ends_with("reddit.com") {
+    if !crate::adapters::is_reddit_host(&host) {
         return None;
     }
 
@@ -134,7 +144,7 @@ fn extract_listing(doc: &Html, url: &str, opts: &ExtractOptions) -> Option<Extra
             "{rank}. {prefix}**{title}** ({domain}) · {score_n} pts · u/{author} · {time_abbr} · {comments} comments\n\n"
         ));
 
-        // Self-post body preview (if expanded in listing —
+        // Self-post body preview (if expanded in listing :
         // stickied/announcement posts often are).
         if let Some(body) = link.select(&body_sel).next() {
             let body_text = inline::plain(body);
@@ -150,6 +160,7 @@ fn extract_listing(doc: &Html, url: &str, opts: &ExtractOptions) -> Option<Extra
     let total = md.len();
     let (slice, next) = paginate(&md, opts);
     Some(Extracted {
+        tokens_est: slice.len() / 4,
         markdown: slice,
         title: Some(format!("r/{subreddit}")),
         byline: None,
@@ -159,7 +170,7 @@ fn extract_listing(doc: &Html, url: &str, opts: &ExtractOptions) -> Option<Extra
         next_offset: next,
         blocks_total: count,
         blocks_shown: count,
-        tokens_est: total / 4,
+        focus_omitted: false,
         thin: false,
         content_kind: ContentKind::Listing,
         lang: "en".to_string(),
@@ -168,6 +179,7 @@ fn extract_listing(doc: &Html, url: &str, opts: &ExtractOptions) -> Option<Extra
         images: Vec::new(),
         fingerprint: None,
         via: None,
+        partial: None,
     })
 }
 
@@ -217,7 +229,7 @@ fn extract_thread(doc: &Html, url: &str, opts: &ExtractOptions) -> Option<Extrac
         }
     }
 
-    // Comments — walk the nested tree.
+    // Comments : walk the nested tree.
     let comment_sel = Selector::parse("div.thing.comment").ok()?;
     let sitetable_sel = Selector::parse("div.sitetable").ok()?;
 
@@ -238,6 +250,7 @@ fn extract_thread(doc: &Html, url: &str, opts: &ExtractOptions) -> Option<Extrac
     let total = md.len();
     let (slice, next) = paginate(&md, opts);
     Some(Extracted {
+        tokens_est: slice.len() / 4,
         markdown: slice,
         title: Some(title),
         byline: Some(format!("u/{author}")),
@@ -247,7 +260,7 @@ fn extract_thread(doc: &Html, url: &str, opts: &ExtractOptions) -> Option<Extrac
         next_offset: next,
         blocks_total: comment_count,
         blocks_shown: comment_count,
-        tokens_est: total / 4,
+        focus_omitted: false,
         thin: false,
         content_kind: ContentKind::Forum,
         lang: "en".to_string(),
@@ -256,13 +269,14 @@ fn extract_thread(doc: &Html, url: &str, opts: &ExtractOptions) -> Option<Extrac
         images: Vec::new(),
         fingerprint: None,
         via: None,
+        partial: None,
     })
 }
 
 // ── Comment tree ──────────────────────────────────────────────
 
 /// Direct child `div.thing` elements of a sitetable (not
-/// descendants — old.reddit nests comments inside
+/// descendants : old.reddit nests comments inside
 /// `.child > .sitetable`, and scraper's `select` returns
 /// all descendants, which would double-count).
 fn get_direct_things(sitetable: ElementRef) -> Vec<ElementRef> {
@@ -286,6 +300,9 @@ fn render_comment(
     opts: &ExtractOptions,
     count: &mut usize,
 ) {
+    if depth > MAX_DEPTH {
+        return;
+    }
     let indent = "  ".repeat(depth.min(6));
 
     let author = el.value().attr("data-author").unwrap_or("[deleted]");
@@ -348,7 +365,14 @@ fn render_comment(
 // ── Reddit .md content → markdown ──────────────────────────────
 
 fn render_md(el: ElementRef, url: &str, opts: &ExtractOptions) -> String {
-    // Reddit comments always need links — links to playgrounds,
+    render_md_at(el, url, opts, 0)
+}
+
+fn render_md_at(el: ElementRef, url: &str, opts: &ExtractOptions, depth: usize) -> String {
+    if depth > MAX_DEPTH {
+        return String::new();
+    }
+    // Reddit comments always need links : links to playgrounds,
     // docs, code are content, not navigation.
     let md_opts = ExtractOptions {
         include_links: true,
@@ -379,14 +403,17 @@ fn render_md(el: ElementRef, url: &str, opts: &ExtractOptions) -> String {
                         }
                     }
                     "pre" => {
-                        let code: String = c.text().collect::<Vec<_>>().join("");
+                        // Script/style subtrees are never source
+                        // content, even inside a pre (#288).
+                        let code = inline::visible_text_raw(c);
                         let code = code.trim_matches('\n');
                         if !code.is_empty() {
-                            out.push_str(&format!("```\n{code}\n```\n\n"));
+                            let fence = super::render::code_fence(code);
+                            out.push_str(&format!("{fence}\n{code}\n{fence}\n\n"));
                         }
                     }
                     "blockquote" => {
-                        let inner = render_md(c, url, opts);
+                        let inner = render_md_at(c, url, opts, depth + 1);
                         for line in inner.lines() {
                             if line.is_empty() {
                                 out.push_str(">\n");
@@ -397,11 +424,11 @@ fn render_md(el: ElementRef, url: &str, opts: &ExtractOptions) -> String {
                         out.push('\n');
                     }
                     "ul" => {
-                        render_list(c, url, false, 0, &mut out, &md_opts);
+                        render_list(c, url, false, depth + 1, &mut out, &md_opts);
                         out.push('\n');
                     }
                     "ol" => {
-                        render_list(c, url, true, 0, &mut out, &md_opts);
+                        render_list(c, url, true, depth + 1, &mut out, &md_opts);
                         out.push('\n');
                     }
                     "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
@@ -416,7 +443,7 @@ fn render_md(el: ElementRef, url: &str, opts: &ExtractOptions) -> String {
                     }
                     // Unknown block: recurse for nested content.
                     "div" => {
-                        let inner = render_md(c, url, opts);
+                        let inner = render_md_at(c, url, opts, depth + 1);
                         if !inner.is_empty() {
                             out.push_str(&inner);
                         }
@@ -445,8 +472,17 @@ fn render_list(
     out: &mut String,
     opts: &ExtractOptions,
 ) {
-    let li_sel = Selector::parse("li").unwrap();
-    for (i, li) in el.select(&li_sel).enumerate() {
+    if depth > MAX_DEPTH {
+        return;
+    }
+    // The list's own items: a descendant select also returned every
+    // item of every nested list, rendering each of them once per
+    // ancestor and making a deep nest quadratic.
+    let items = el
+        .children()
+        .filter_map(ElementRef::wrap)
+        .filter(|c| c.value().name() == "li");
+    for (i, li) in items.enumerate() {
         let prefix = if ordered {
             format!("{}. ", i + 1)
         } else {
@@ -457,9 +493,12 @@ fn render_list(
         if !m.is_empty() {
             out.push_str(&format!("{indent}{prefix}{m}\n"));
         }
-        // Nested lists.
-        let nested_sel = Selector::parse("ul, ol").unwrap();
-        for nested in li.select(&nested_sel) {
+        // Nested lists: the item's own.
+        let nested = li
+            .children()
+            .filter_map(ElementRef::wrap)
+            .filter(|c| matches!(c.value().name(), "ul" | "ol"));
+        for nested in nested {
             render_list(
                 nested,
                 url,
@@ -517,4 +556,68 @@ fn paginate(full: &str, opts: &ExtractOptions) -> (String, Option<usize>) {
     let slice: String = chars[offset..end].iter().collect();
     let next = if end < chars.len() { Some(end) } else { None };
     (slice, next)
+}
+
+#[cfg(test)]
+mod depth_tests {
+    use super::*;
+
+    // The #231 shape: a bounded 1 MiB thread plus a deep nest. The
+    // renderers recursed without a cap, so this overflowed the stack
+    // (abort) instead of returning. 3 000 levels is under the
+    // pre-parse gate in extract::nesting, so a page like this does
+    // reach the adapter.
+    #[test]
+    fn deep_nesting_in_a_post_body_is_capped_not_a_stack_overflow() {
+        let n = 3_000;
+        let html = format!(
+            "<html><body><div class=\"thing link\" data-author=\"a\"><a class=\"title\">T</a>\
+             <time class=\"live-timestamp\">1h</time>\
+             <div class=\"usertext-body\"><div class=\"md\">{}<ul><li>x{}</li></ul>{}</div></div></div></body></html>",
+            "<div>".repeat(n),
+            "<ul><li>y".repeat(n),
+            "</div>".repeat(n)
+        );
+        let done = std::thread::Builder::new()
+            .stack_size(1 << 20)
+            .spawn(move || {
+                let opts = ExtractOptions::default();
+                let out = extract(
+                    &html,
+                    "https://www.reddit.com/r/rust/comments/abc/t/",
+                    &opts,
+                );
+                out.is_some()
+            })
+            .unwrap()
+            .join()
+            .expect("the renderer must return, not overflow");
+        assert!(done, "the reddit adapter still claims the page");
+    }
+}
+
+#[cfg(test)]
+mod host_tests {
+    use super::*;
+
+    // A bare `ends_with("reddit.com")` claimed look-alike domains.
+    #[test]
+    fn look_alike_domains_are_not_reddit() {
+        let opts = ExtractOptions::default();
+        let html = r#"<html><body><div class="thing link" data-author="a">
+          <a class="title">T</a><time class="live-timestamp">1h</time>
+          <div class="usertext-body"><div class="md"><p>body</p></div></div>
+        </div></body></html>"#;
+        // Positive control: the same page on a real reddit host.
+        assert!(extract(html, "https://www.reddit.com/r/rust/comments/abc/t/", &opts).is_some());
+        assert!(extract(html, "https://notreddit.com/r/rust/comments/abc/t/", &opts).is_none());
+        assert!(
+            extract(
+                html,
+                "https://reddit.com.evil.io/r/rust/comments/abc/t/",
+                &opts
+            )
+            .is_none()
+        );
+    }
 }

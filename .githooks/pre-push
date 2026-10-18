@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# Pre-push net: the cheap checks that catch the expensive sins.
+# Runs in seconds. If any check fails the push is refused.
+#   - formatted code (the #1 CI-kill: hand-formatted hunks)
+#   - no debug probes left in the tree (the [xprobe] class)
+#   - compiles on BOTH feature sets (the cfg-twin class: a binding
+#     gated behind a feature and consumed unconditionally only
+#     breaks the no-features build, exactly what killed two CI runs)
+#   - no internal docs staged (design/ status.md project.md never
+#     go public)
+#   - no version drift between the manifests (Cargo.toml vs
+#     npm/package.json must always agree)
+#   - target/ stays under its storage ceiling (scripts/guard.sh:
+#     incremental caches, retired profiles, clean review worktrees)
+set -euo pipefail
+cd "$(git rev-parse --show-toplevel)"
+
+# CPU citizenship (status.md mechanic 5): the checks below are cargo
+# commands, so they ride the SAME budget wrapper as the Justfile
+# recipes. The wrapper is the cap: the whole process tree is pinned to a
+# quarter of the cores, niced and ionice-idle, and the job caps are
+# exported into build scripts. A bare `nice cargo ...` here was the old
+# "looks capped" form that still let rustc codegen threads and
+# boring-sys's make -j$(nproc) take every core.
+net() { sh scripts/budget.sh "$@"; }
+
+staged=$(git diff --cached --name-only; git diff --name-only origin/master..HEAD 2>/dev/null || true)
+if echo "$staged" | rg -q '^(design/|status\.md|project\.md)'; then
+  echo "pre-push: internal docs staged (design/ status.md project.md are gitignored and private)"
+  exit 1
+fi
+if rg -n '\[[a-z]probe\]' src/ --glob '!tests/**' -q; then
+  echo "pre-push: debug probes left in src/: $(rg -n '\[[a-z]probe\]' src/ -l)"
+  exit 1
+fi
+# --profile fast, not ci: the net has to cost seconds or it gets
+# bypassed, and the fast profile is the warm one every local recipe
+# uses. Both feature sets stay checked (the cfg-twin class is real and
+# cheap to keep): only this crate recompiles between them.
+# Storage ceiling (scripts/guard.sh): reclaims incremental caches,
+# retired profiles and CLEAN review worktrees when target/ is over; a
+# dirty worktree is kept and named. Still over after reclaim fails.
+sh scripts/guard.sh
+net cargo fmt --check >/dev/null
+net cargo check --locked -q --profile fast >/dev/null
+net cargo check --locked -q --profile fast --no-default-features >/dev/null
+node --check npm/install.js >/dev/null
+node --check npm/bin/donsetch.js >/dev/null
+
+crate=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+npmpkg=$(sed -n 's/^  "version": "\(.*\)",$/\1/p' npm/package.json)
+if [ "$crate" != "$npmpkg" ]; then
+  echo "pre-push: version drift: Cargo.toml=$crate npm/package.json=$npmpkg"
+  echo "run: just ship <version> to keep both in step"
+  exit 1
+fi
+echo "pre-push net ok (fmt, probes, dual-feature fast check, manifests in step, storage guard)"

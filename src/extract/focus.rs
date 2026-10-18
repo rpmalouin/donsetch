@@ -12,11 +12,10 @@ use super::language::{self, LanguageInfo};
 const K1: f64 = 1.2;
 const B: f64 = 0.75;
 
-/// Max blocks for semantic scoring. Pages with more blocks
-/// fall back to BM25-only — large pages are usually reference
-/// docs where keyword matching works well, and the latency
-/// of cross-encoder on 100+ blocks isn't worth it.
-const SEMANTIC_MAX_BLOCKS: usize = 80;
+/// Max blocks for semantic rescue when the lexical query has no hits.
+/// Larger pages keep the honest full-content fallback instead of paying
+/// cross-encoder inference over a reference manual.
+const SEMANTIC_MAX_BLOCKS: usize = 8;
 
 /// Cross-encoder relevance threshold (sigmoid output [0,1]).
 /// Blocks scoring above this are kept even if BM25 missed them.
@@ -618,7 +617,7 @@ fn stem_en_double(stem: &str) -> String {
     if n >= 2 && chars[n - 1] == chars[n - 2] {
         let c = chars[n - 1];
         // Only double consonants (not vowels, not 'l'/'s'/'z'
-        // which Porter treats specially — but we keep it simple).
+        // which Porter treats specially : but we keep it simple).
         if !"aeioulsz".contains(c) {
             return chars[..n - 1].iter().collect();
         }
@@ -627,7 +626,7 @@ fn stem_en_double(stem: &str) -> String {
 }
 
 /// Light suffix stripping for Romance languages. Not a full
-/// stemmer — just strips common inflectional endings to
+/// stemmer : just strips common inflectional endings to
 /// improve cross-form matching. Conservative: stem ≥ 3 chars.
 fn stem_romance(word: &str, lang: &str) -> String {
     let w = word;
@@ -776,15 +775,15 @@ fn tokenize_cjk(text: &str, lang: &str) -> Vec<String> {
     for c in text.chars() {
         let s = language::char_script(c);
         if language::needs_char_tokenize(s) {
-            // CJK/Kana/Hangul/Thai char — flush any Latin word.
+            // CJK/Kana/Hangul/Thai char : flush any Latin word.
             flush_word(&mut word_buf, &mut tokens);
             cjk_buf.push(c);
         } else if c.is_alphanumeric() {
-            // Latin/Cyrillic/etc — flush CJK buffer, collect word.
+            // Latin/Cyrillic/etc : flush CJK buffer, collect word.
             flush_cjk(&mut cjk_buf, &mut tokens);
             word_buf.push(c);
         } else {
-            // Whitespace/punctuation — flush both buffers.
+            // Whitespace/punctuation : flush both buffers.
             flush_cjk(&mut cjk_buf, &mut tokens);
             flush_word(&mut word_buf, &mut tokens);
         }
@@ -797,18 +796,39 @@ fn tokenize_cjk(text: &str, lang: &str) -> Vec<String> {
 
 // ── BM25 filter ─────────────────────────────────────────────
 
+// API identifiers and prose headings must agree: TaskGroup matches "task
+// groups", and ExceptionGroup matches "exception group". Keep the public
+// tokenizer's search/frontier contract unchanged; this is passage retrieval.
+fn passage_tokens(text: &str, lang: &LanguageInfo) -> Vec<String> {
+    let mut separated = String::with_capacity(text.len());
+    let mut lower = false;
+    for ch in text.chars() {
+        if lower && ch.is_uppercase() {
+            separated.push(' ');
+        }
+        separated.push(ch);
+        lower = ch.is_lowercase();
+    }
+    tokenize(&separated, lang)
+}
+
 /// Compute BM25 scores for each block against the query.
 /// Returns a vector of scores (one per block, 0.0 = no match).
 /// Used by both `filter` (BM25-only) and `filter_semantic`
 /// (BM25 + cross-encoder union).
 fn bm25_scores(blocks: &[Block], query: &str, lang: &LanguageInfo) -> Vec<f64> {
-    let qterms = tokenize(query, lang);
+    let mut qterms = passage_tokens(query, lang);
+    qterms.sort_unstable();
+    qterms.dedup();
     if qterms.is_empty() || blocks.is_empty() {
         return vec![0.0; blocks.len()];
     }
 
     // Document stats.
-    let docs: Vec<Vec<String>> = blocks.iter().map(|b| tokenize(&b.text(), lang)).collect();
+    let docs: Vec<Vec<String>> = blocks
+        .iter()
+        .map(|b| passage_tokens(&b.body_text(), lang))
+        .collect();
     let mut df: HashMap<&str, usize> = HashMap::new();
     for doc in &docs {
         let mut seen = std::collections::HashSet::new();
@@ -817,6 +837,15 @@ fn bm25_scores(blocks: &[Block], query: &str, lang: &LanguageInfo) -> Vec<f64> {
                 *df.entry(t.as_str()).or_insert(0) += 1;
             }
         }
+    }
+    // A document's subject is often repeated everywhere ("AI", "Rust").
+    // When the query also names a more selective detail, those ubiquitous
+    // terms cannot distinguish passages. Keep them for genuinely broad queries.
+    if qterms
+        .iter()
+        .any(|q| df.get(q.as_str()).is_some_and(|&n| n * 2 < docs.len()))
+    {
+        qterms.retain(|q| df.get(q.as_str()).is_none_or(|&n| n * 2 < docs.len()));
     }
     let n = blocks.len() as f64;
     let avgdl = docs.iter().map(|d| d.len()).sum::<usize>() as f64 / n.max(1.0);
@@ -829,16 +858,26 @@ fn bm25_scores(blocks: &[Block], query: &str, lang: &LanguageInfo) -> Vec<f64> {
             *tf.entry(t.as_str()).or_insert(0) += 1;
         }
         let dl = doc.len() as f64;
+        let mut query_weight = 0.0;
+        let mut matched_weight = 0.0;
         for q in &qterms {
             let Some(&term_df) = df.get(q.as_str()) else {
                 continue;
             };
             let idf = (1.0 + (n - term_df as f64 + 0.5) / (term_df as f64 + 0.5)).ln();
+            query_weight += idf;
             let f = tf.get(q.as_str()).copied().unwrap_or(0) as f64;
             if f > 0.0 {
+                matched_weight += idf;
                 scores[i] +=
                     idf * (f * (K1 + 1.0)) / (f + K1 * (1.0 - B + B * dl / avgdl.max(1.0)));
             }
+        }
+        // Prefer passages addressing the query together over disconnected
+        // singleton mentions. Weight coverage by IDF so the page subject
+        // cannot outweigh the distinctive detail. Unknown terms do not count.
+        if query_weight > 0.0 {
+            scores[i] *= matched_weight / query_weight;
         }
     }
     scores
@@ -846,7 +885,7 @@ fn bm25_scores(blocks: &[Block], query: &str, lang: &LanguageInfo) -> Vec<f64> {
 
 /// BM25 block filter. Returns (kept blocks, fell_back).
 /// fell_back = true when the query matched nothing and we
-/// returned the full page — the CALLER must signal this,
+/// returned the full page : the CALLER must signal this,
 /// or the agent mistakes full content for focus matches.
 ///
 /// BM25-only version. Production code uses `filter_semantic`
@@ -921,6 +960,31 @@ fn build_sections(blocks: &[Block]) -> Vec<Section> {
     sections
 }
 
+// A strong topic heading includes its subordinate sections, not just the
+// paragraphs before the next heading. The first heading is the page umbrella
+// and cannot select every descendant merely by repeating the query.
+fn topic_regions(blocks: &[Block], scores: &[f64], threshold: f64) -> HashSet<usize> {
+    let first = blocks
+        .iter()
+        .position(|b| matches!(b, Block::Heading { .. }));
+    let mut protected = HashSet::new();
+    for (i, block) in blocks.iter().enumerate() {
+        let Block::Heading { level, .. } = block else {
+            continue;
+        };
+        if Some(i) == first || scores[i] <= threshold * 2.0 {
+            continue;
+        }
+        for (j, descendant) in blocks.iter().enumerate().skip(i + 1) {
+            if matches!(descendant, Block::Heading { level: next, .. } if next <= level) {
+                break;
+            }
+            protected.insert(j);
+        }
+    }
+    protected
+}
+
 /// Section-aware block selection core.
 ///
 /// For each section:
@@ -930,6 +994,7 @@ fn build_sections(blocks: &[Block]) -> Vec<Section> {
 /// - Body score > threshold but heading does not (Inverse
 ///   Gravity): keep only the matching body blocks AND the
 ///   heading (the agent needs it for context).
+/// - Strong non-root topic headings also keep subordinate sections.
 /// - No match: drop the entire section.
 ///
 /// Returns kept block indices (unsorted) and whether any
@@ -937,7 +1002,8 @@ fn build_sections(blocks: &[Block]) -> Vec<Section> {
 fn select_sections_core(blocks: &[Block], scores: &[f64], threshold: f64) -> Vec<usize> {
     let sections = build_sections(blocks);
     let mut kept: Vec<usize> = Vec::new();
-    let mut kept_set: HashSet<usize> = HashSet::new();
+    let mut kept_set = topic_regions(blocks, scores, threshold);
+    kept.extend(kept_set.iter().copied());
 
     for s in &sections {
         let heading_score = s.heading_idx.map(|h| scores[h]).unwrap_or(0.0);
@@ -979,47 +1045,47 @@ fn select_sections_core(blocks: &[Block], scores: &[f64], threshold: f64) -> Vec
     kept
 }
 
-/// Breadcrumb Expansion: for each kept block, add all parent
-/// heading blocks from its path that are not already kept.
-/// This ensures the agent always sees structural context,
-/// never an orphaned block.
+/// Add the actual ancestor headings of selected passages in one traversal.
+/// Heading names can repeat: text equality is not ancestry.
 fn expand_breadcrumbs(blocks: &[Block], kept: &mut Vec<usize>, kept_set: &mut HashSet<usize>) {
-    let snapshot: Vec<usize> = kept.clone();
-    for (hi, b) in blocks.iter().enumerate() {
-        if let Block::Heading { text, .. } = b {
-            if kept_set.contains(&hi) {
-                continue;
+    let selected = kept_set.clone();
+    let mut ancestors: Vec<(u8, usize)> = Vec::new();
+    for (i, block) in blocks.iter().enumerate() {
+        if let Block::Heading { level, .. } = block {
+            while ancestors.last().is_some_and(|(l, _)| l >= level) {
+                ancestors.pop();
             }
-            let in_path = snapshot
-                .iter()
-                .any(|&bi| blocks[bi].path().iter().any(|p| p == text));
-            if in_path {
-                kept_set.insert(hi);
-                kept.push(hi);
+            ancestors.push((*level, i));
+        }
+        if selected.contains(&i) {
+            for &(_, heading) in &ancestors {
+                if kept_set.insert(heading) {
+                    kept.push(heading);
+                }
             }
         }
     }
 }
 
-/// Section-aware focus filter with Section Gravity.
-///
-/// Replaces flat BM25 block scoring with hierarchical section
-/// scoring. Four mechanisms:
-///
-/// 1. **Section Gravity**: A heading match pulls in its entire
-///    section. The heading defines the topic; all content under
-///    it is relevant.
-/// 2. **Inverse Gravity**: A body match pulls in its section
-///    heading. The agent needs the heading for context.
-/// 3. **Breadcrumb Expansion**: For each kept block, add all
-///    parent heading blocks from its path. Never orphan a
-///    block without structural context.
-/// 4. **Cross-encoder Augmentation**: When the model is cached,
-///    sections BM25 missed are checked by the cross-encoder.
-///
-/// The threshold for body-only matches is >0 (any keyword
-/// appearance), not max*0.15. This is intentional: never cut
-/// relevant info. Noise costs tokens; cut info is unrecoverable.
+/// Keep CPU-heavy optional inference off multi-thread Tokio workers.
+fn offload_inference<R: Send + 'static>(work: impl FnOnce() -> R + Send + 'static) -> R {
+    use tokio::runtime::RuntimeFlavor;
+    if let Ok(handle) = tokio::runtime::Handle::try_current()
+        && handle.runtime_flavor() == RuntimeFlavor::MultiThread
+    {
+        return tokio::task::block_in_place(work);
+    }
+    work()
+}
+
+fn xenc_scores(query: &str, docs: Vec<(String, String)>) -> Option<Vec<f64>> {
+    let q = query.to_string();
+    offload_inference(move || crate::search::rerank::cross_encoder_scores(&q, &docs))
+}
+
+/// Select lexical evidence with real heading ancestry and source order.
+/// A cached cross-encoder may rescue a lexical miss on a small page; inference
+/// never downloads a model. The boolean signals a full-content miss fallback.
 pub fn filter_semantic<'a>(
     blocks: &'a [Block],
     query: &str,
@@ -1037,9 +1103,11 @@ pub fn filter_semantic<'a>(
     if max_bm25 <= 0.0 {
         // BM25 found nothing. Try cross-encoder rescue.
         if blocks.len() <= SEMANTIC_MAX_BLOCKS && crate::search::rerank::is_model_cached() {
-            let docs: Vec<(String, String)> =
-                blocks.iter().map(|b| (b.text(), String::new())).collect();
-            if let Some(xenc_scores) = crate::search::rerank::cross_encoder_scores(query, &docs) {
+            let docs: Vec<(String, String)> = blocks
+                .iter()
+                .map(|b| (b.body_text(), String::new()))
+                .collect();
+            if let Some(xenc_scores) = xenc_scores(query, docs) {
                 let xenc_max = xenc_scores.iter().cloned().fold(0.0f64, f64::max);
                 if xenc_max >= XENC_THRESHOLD {
                     let mut kept = select_sections_core(blocks, &xenc_scores, XENC_THRESHOLD);
@@ -1056,7 +1124,10 @@ pub fn filter_semantic<'a>(
     }
 
     // Phase 2: Section-aware BM25 selection.
-    let mut kept = select_sections_core(blocks, &scores, 0.0);
+    // Relative evidence strength cuts incidental mentions without taking a
+    // fixed top-k (which would silently lose repeated facts or exceptions).
+    // A matching heading still carries its complete immediate section.
+    let mut kept = select_sections_core(blocks, &scores, max_bm25 * 0.20);
 
     if kept.is_empty() {
         return (blocks.iter().collect(), true);
@@ -1064,63 +1135,116 @@ pub fn filter_semantic<'a>(
 
     let mut kept_set: HashSet<usize> = kept.iter().copied().collect();
 
-    // Phase 3: Cross-encoder augmentation.
-    // For sections not selected by BM25, check if the cross-encoder
-    // finds them relevant. Catches semantic matches BM25 missed
-    // (different vocabulary, synonyms, paraphrase).
-    if blocks.len() <= SEMANTIC_MAX_BLOCKS && crate::search::rerank::is_model_cached() {
-        let docs: Vec<(String, String)> =
-            blocks.iter().map(|b| (b.text(), String::new())).collect();
-        if let Some(xenc_scores) = crate::search::rerank::cross_encoder_scores(query, &docs) {
-            let sections = build_sections(blocks);
-            for s in &sections {
-                let already = s
-                    .heading_idx
-                    .map(|h| kept_set.contains(&h))
-                    .unwrap_or(false)
-                    || s.body_idx.iter().any(|b| kept_set.contains(b));
-                if already {
-                    continue;
-                }
-                let heading_xenc = s.heading_idx.map(|h| xenc_scores[h]).unwrap_or(0.0);
-                let body_xenc_max = s
-                    .body_idx
-                    .iter()
-                    .map(|&b| xenc_scores[b])
-                    .fold(0.0f64, f64::max);
-                if heading_xenc >= XENC_THRESHOLD {
-                    if let Some(hi) = s.heading_idx
-                        && kept_set.insert(hi)
-                    {
-                        kept.push(hi);
-                    }
-                    for &bi in &s.body_idx {
-                        if kept_set.insert(bi) {
-                            kept.push(bi);
-                        }
-                    }
-                } else if body_xenc_max >= XENC_THRESHOLD {
-                    if let Some(hi) = s.heading_idx
-                        && kept_set.insert(hi)
-                    {
-                        kept.push(hi);
-                    }
-                    for &bi in &s.body_idx {
-                        if xenc_scores[bi] >= XENC_THRESHOLD && kept_set.insert(bi) {
-                            kept.push(bi);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Phase 4: Breadcrumb expansion.
+    // Phase 3: Breadcrumb expansion.
     expand_breadcrumbs(blocks, &mut kept, &mut kept_set);
 
     // Sort by index to preserve document order.
     kept.sort_unstable();
     (kept.into_iter().map(|i| &blocks[i]).collect(), false)
+}
+
+/// Narrow structured blocks at their evidence boundaries. Table headers and
+/// complete cells stay attached to each selected row; nested unordered items
+/// stay intact. Ordered procedures remain atomic so their numbering and
+/// prerequisites cannot silently change. No row/item hit leaves the block whole.
+pub fn refine_structured(
+    all: &[Block],
+    kept: &[&Block],
+    query: &str,
+    lang: &LanguageInfo,
+) -> (Vec<Block>, Option<String>) {
+    let scores = bm25_scores(all, query, lang);
+    let best = scores.iter().copied().fold(0.0_f64, f64::max);
+    let protected: HashSet<usize> = topic_regions(all, &scores, best * 0.20)
+        .into_iter()
+        .map(|i| std::ptr::from_ref(&all[i]) as usize)
+        .collect();
+    // Small enumerations stay atomic: adjacent conditions and comparisons
+    // usually matter more than the few tokens pruning them would save.
+    let mut dropped_rows = 0;
+    let mut dropped_items = 0;
+    let refined = kept
+        .iter()
+        .map(|block| {
+            let mut result = (*block).clone();
+            // A topic read promises its entire subordinate enumeration.
+            // Narrow rows/items only when the query selected them directly.
+            if protected.contains(&(std::ptr::from_ref(*block) as usize)) {
+                return result;
+            }
+            match &mut result {
+                Block::Table { rows, .. } if rows.len() > 6 => {
+                    let candidates: Vec<Block> = rows
+                        .iter()
+                        .map(|row| Block::Para {
+                            md: row.join(" "),
+                            link_density: 0.0,
+                            path: Vec::new(),
+                        })
+                        .collect();
+                    let selected = select_entries(&candidates, query, lang);
+                    if !selected.is_empty() && selected.len() < rows.len() {
+                        dropped_rows += rows.len() - selected.len();
+                        *rows = selected.into_iter().map(|i| rows[i].clone()).collect();
+                    }
+                }
+                Block::List {
+                    ordered: false,
+                    items,
+                    ..
+                } if items.len() > 6 => {
+                    // list_items stores nested entries as indented siblings.
+                    // Score each top-level subtree as one evidence unit so a
+                    // selected parent retains exceptions and a selected child
+                    // retains the parent that says what it qualifies.
+                    let mut starts: Vec<usize> = items
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(i, item)| (i == 0 || !item.starts_with(' ')).then_some(i))
+                        .collect();
+                    starts.push(items.len());
+                    let candidates: Vec<Block> = starts
+                        .windows(2)
+                        .map(|range| Block::Para {
+                            md: items[range[0]..range[1]].join(" "),
+                            link_density: 0.0,
+                            path: Vec::new(),
+                        })
+                        .collect();
+                    let selected = select_entries(&candidates, query, lang);
+                    if !selected.is_empty() && selected.len() < candidates.len() {
+                        let retained: Vec<String> = selected
+                            .into_iter()
+                            .flat_map(|i| items[starts[i]..starts[i + 1]].iter().cloned())
+                            .collect();
+                        dropped_items += items.len() - retained.len();
+                        *items = retained;
+                    }
+                }
+                _ => {}
+            }
+            result
+        })
+        .collect();
+    let mut omitted = Vec::new();
+    if dropped_rows > 0 {
+        omitted.push(format!("{dropped_rows} table rows"));
+    }
+    if dropped_items > 0 {
+        omitted.push(format!("{dropped_items} list items"));
+    }
+    let note = (!omitted.is_empty()).then(|| format!("dropped by focus: {}", omitted.join(", ")));
+    (refined, note)
+}
+
+fn select_entries(blocks: &[Block], query: &str, lang: &LanguageInfo) -> Vec<usize> {
+    let scores = bm25_scores(blocks, query, lang);
+    let best = scores.iter().copied().fold(0.0_f64, f64::max);
+    scores
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &score)| (score > 0.0 && score >= best * 0.20).then_some(i))
+        .collect()
 }
 
 // ── Code block fission ──────────────────────────────────────
@@ -1372,7 +1496,7 @@ mod tests {
         // Kanji unigrams.
         assert!(tokens.contains(&"機".to_string()));
         assert!(tokens.contains(&"械".to_string()));
-        // "の" is a stopword — should be filtered.
+        // "の" is a stopword : should be filtered.
         assert!(!tokens.contains(&"の".to_string()));
         // Non-stopword kana should be present.
         // "分" is a kanji (not kana), but let's test a non-stopword.
@@ -1823,5 +1947,73 @@ mod tests {
         ];
         let expanded = expand_code_blocks(blocks.clone());
         assert_eq!(expanded.len(), blocks.len());
+    }
+
+    #[test]
+    fn offload_inference_value_inline_outside_runtime() {
+        // Outside any Tokio runtime the work runs inline and passes through.
+        assert_eq!(offload_inference(|| 41u8), 41);
+    }
+
+    #[test]
+    fn offload_inference_ok_inside_multithread_worker() {
+        // block_in_place is the legal path here: it must run the work and
+        // never panic on a multi-thread worker.
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async move {
+            assert_eq!(offload_inference(|| 41u8), 41);
+        });
+    }
+
+    #[test]
+    fn offload_inference_inline_on_current_thread() {
+        // block_in_place panics on current-thread runtimes; the flavor guard
+        // must keep us inline there instead.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let tid = std::thread::current().id();
+            let inner_tid = offload_inference(|| std::thread::current().id());
+            assert_eq!(inner_tid, tid, "current_thread must stay inline");
+        });
+    }
+
+    #[test]
+    fn offload_timer_survives_inference_on_single_worker() {
+        // The discriminating test: on a one-worker runtime, a sync "inference"
+        // burst must not starve a small timer. Without the offload the timer
+        // waits for the whole burst; with it the runtime supplies a
+        // replacement worker and the timer fires on time.
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let started = std::time::Instant::now();
+            let timer = tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+                started.elapsed()
+            });
+            let burst = tokio::spawn(async move {
+                offload_inference(|| {
+                    std::thread::sleep(std::time::Duration::from_millis(150));
+                    7u8
+                })
+            });
+            assert_eq!(burst.await.unwrap(), 7);
+            let timer_elapsed = timer.await.unwrap();
+            assert!(
+                timer_elapsed < std::time::Duration::from_millis(140),
+                "timer starved: {:?}",
+                timer_elapsed
+            );
+        });
     }
 }

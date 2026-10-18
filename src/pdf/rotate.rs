@@ -1,10 +1,10 @@
 //! Orientation canonicalization: one pipeline for every orientation.
 //!
-//! Vertical CJK, rotated sidebars, sideways table headers — every extractor
+//! Vertical CJK, rotated sidebars, sideways table headers : every extractor
 //! special-cases these and loses. DonSheet takes a different position:
 //! a rotated page is the same document in a different coordinate frame.
 //! Glyph matrices already tell us the angle. So we ROTATE THE FRAME back
-//! to canonical horizontal — glyphs AND the rasterized bitmap together —
+//! to canonical horizontal : glyphs AND the rasterized bitmap together :
 //! and let the single unified pipeline run. There is no "vertical code
 //! path"; vertical documents just work.
 //!
@@ -16,14 +16,14 @@ use super::engine::PageChars;
 
 /// Decide and apply frame canonicalization. Returns Some(rotation degrees
 /// applied, clockwise) when the page was rotated, None when already
-/// canonical (or too mixed to decide — honesty lane).
+/// canonical (or too mixed to decide : honesty lane).
 pub fn canonicalize(pc: &mut PageChars) -> Option<f32> {
     if pc.chars.is_empty() {
         return None;
     }
 
     // Mass-weighted angle histogram. STRICT bucketing: only angles within
-    // 15° of a quarter count — floating noise in near-horizontal matrices
+    // 15° of a quarter count : floating noise in near-horizontal matrices
     // must never pick a quarter (round() at the 45° boundary breaks this
     // without the distance check).
     let mut mass = [0f32; 4]; // ccw quarters: 0,90,180,270
@@ -40,11 +40,14 @@ pub fn canonicalize(pc: &mut PageChars) -> Option<f32> {
         }
         mass[q as usize] += c.size.max(1.0);
     }
-    if std::env::var("DONSHEET_DEBUG_MATRIX").is_ok() {
+    if crate::config::cfg().debug.pdf_matrix {
         for (i, c) in pc.chars.iter().take(6).enumerate() {
-            eprintln!(
+            crate::diag!(
                 "[rot_dbg] i={i} cp={:?} angle={:.2} size={:.2} rt={}",
-                c.cp, c.angle, c.size, c.rt
+                c.cp,
+                c.angle,
+                c.size,
+                c.rt
             );
         }
     }
@@ -52,8 +55,8 @@ pub fn canonicalize(pc: &mut PageChars) -> Option<f32> {
     if total <= 0.0 {
         return None;
     }
-    if std::env::var("DONSHEET_DEBUG").is_ok() {
-        eprintln!(
+    if crate::config::cfg().debug.pdf {
+        crate::diag!(
             "[rotate] page {} mass: 0deg={:.0} 90deg={:.0} 180deg={:.0} 270deg={:.0} chars={} total={:.0}",
             pc.index,
             mass[0],
@@ -71,7 +74,7 @@ pub fn canonicalize(pc: &mut PageChars) -> Option<f32> {
         .map(|(i, m)| (i, *m))
         .unwrap();
     if winner == 0 || wmass / total < 0.6 {
-        // Already canonical, or mixed (rotated sidebar in landscape doc) —
+        // Already canonical, or mixed (rotated sidebar in landscape doc) :
         // leave it; mixed cases stay honest via the vertical note.
         return None;
     }

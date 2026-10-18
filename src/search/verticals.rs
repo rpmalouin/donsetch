@@ -1,4 +1,4 @@
-//! Verticals — keyless JSON APIs with near-100%
+//! Verticals : keyless JSON APIs with near-100%
 //! reliability. They feed the SAME merge as web engines:
 //! a GitHub repo that also ranks in Brave gets consensus.
 
@@ -57,7 +57,7 @@ pub fn endpoint(vertical: &str, query: &str) -> Option<String> {
             .any(|s| lower.contains(s))
                 || words <= 4;
             // Natural-language how-tos return spam repos from
-            // GitHub's loose matcher — skip the vertical.
+            // GitHub's loose matcher : skip the vertical.
             if !errorish && !repoish {
                 return None;
             }
@@ -112,6 +112,15 @@ pub async fn run(
         "arxiv" => parse_arxiv(&body),
         _ => parse_json(vertical, &body),
     })
+}
+
+/// Body → hits router, shared by run() and tests.
+pub fn parse(vertical: &str, body: &str) -> Vec<Hit> {
+    match vertical {
+        "news" => parse_rss(body),
+        "arxiv" => parse_arxiv(body),
+        _ => parse_json(vertical, body),
+    }
 }
 
 /// RFC-822-ish date from RSS pubDate -> ISO date string.
@@ -307,10 +316,23 @@ fn parse_rss(body: &str) -> Vec<Hit> {
         let date = grab("pubDate");
         let iso = rss_date_to_iso(&date);
         if !title.is_empty() && url.starts_with("http") {
+            // Google News titles end in " - Publisher"; a date
+            // alone is a snippet that says nothing about the
+            // story, so carry publisher + date instead.
+            let publisher = title
+                .rsplit_once(" - ")
+                .map(|(_, p)| p.trim())
+                .unwrap_or("")
+                .to_string();
+            let snippet = if publisher.is_empty() {
+                date.clone()
+            } else {
+                format!("{publisher} · {date}")
+            };
             hits.push(Hit {
                 title,
                 url,
-                snippet: date.clone(),
+                snippet,
                 rank,
                 published: iso,
             });

@@ -1,4 +1,4 @@
-//! Comprehensive integration tests for DonSift — the
+//! Comprehensive integration tests for DonSift : the
 //! extraction engine. Tests the full pipeline: HTML bytes in
 //! → agent-ready markdown out. Every language, every block
 //! type, every edge case. This is what makes DonSift
@@ -8,6 +8,103 @@ use super::language::{self, Script};
 use super::metadata;
 use super::*;
 use scraper::Html;
+
+#[test]
+fn wave450_wall_cannot_be_laundered_by_reading_modes() {
+    let html = "<html><head><title>Blocked</title></head><body><main><h1>You've been blocked by network security.</h1><p>To continue, log in to your Reddit account or use your developer token.</p></main></body></html>";
+    for opts in [
+        ExtractOptions::default(),
+        ExtractOptions {
+            must_contain: Some("pts".into()),
+            ..Default::default()
+        },
+        ExtractOptions {
+            toc: true,
+            ..Default::default()
+        },
+        ExtractOptions {
+            max_chars: Some(200),
+            offset: 150,
+            ..Default::default()
+        },
+    ] {
+        assert!(
+            extract(
+                html.as_bytes(),
+                "text/html",
+                "https://old.reddit.com/r/rust/",
+                &opts
+            )
+            .is_err(),
+            "a wall must fail before probe, outline or pagination"
+        );
+    }
+    let article = format!("<article><h1>Network security guide</h1>{}<p>The phrase You've been blocked by network security appears on Reddit's block screen.</p></article>", "<p>This guide explains secure connections, authentication and debugging with real application examples.</p>".repeat(25));
+    assert!(
+        extract(
+            article.as_bytes(),
+            "text/html",
+            "https://example.com",
+            &ExtractOptions::default()
+        )
+        .is_ok()
+    );
+}
+
+#[test]
+fn wave450_section_does_not_change_page_identity() {
+    let html = "<article><h1>Guide</h1><h2>Alpha</h2><p>Alpha is the first topic and has detailed instructions.</p><h2>Beta</h2><p>Beta is another topic with completely different instructions.</p></article>";
+    let full = extract_html(html);
+    let section = extract_html_opts(
+        html,
+        &ExtractOptions {
+            section: Some("Beta".into()),
+            ..Default::default()
+        },
+    );
+    assert_eq!(full.fingerprint, section.fingerprint);
+    assert!(!section.markdown.contains("Alpha is"));
+}
+
+#[test]
+fn wave450_sitemap_is_an_inventory_not_an_app_shell() {
+    let xml = b"<?xml version='1.0'?><urlset xmlns='http://www.sitemaps.org/schemas/sitemap/0.9'><url><loc>https://example.com/a?q=1&amp;p=2</loc></url><url><loc>https://example.com/b</loc></url></urlset>";
+    let ex = extract(
+        xml,
+        "application/xml",
+        "https://example.com/sitemap.xml",
+        &ExtractOptions::default(),
+    )
+    .unwrap();
+    assert!(ex.markdown.contains("https://example.com/a?q=1&p=2"));
+    assert!(!ex.markdown.contains("<urlset"));
+    assert!(!ex.thin);
+}
+
+#[test]
+fn wave450_focus_miss_keeps_its_warning() {
+    let html = "<article><h1>Guide</h1><p>Reliable storage records each write before acknowledging the operation and safely restores interrupted transactions after a power failure.</p></article>";
+    let ex = extract_html_opts(
+        html,
+        &ExtractOptions {
+            focus: Some("quasarzzzz".into()),
+            ..Default::default()
+        },
+    );
+    assert!(ex.markdown.contains("no matches"));
+    assert!(ex.markdown.contains("Reliable storage"));
+}
+
+#[test]
+fn wave450_pagination_never_skips_the_end_of_a_long_paragraph() {
+    let text = format!("{}END-OF-PARAGRAPH\n\nNext paragraph.", "a".repeat(210));
+    let (_, next) = paginate_public(&text, 0, 200);
+    let (second, _) = paginate_public(&text, next.unwrap(), 200);
+    assert!(
+        second.contains("END-OF-PARAGRAPH"),
+        "resumption skipped evidence: {second}"
+    );
+}
 
 // ── Helpers ───────────────────────────────────────────────
 
@@ -34,6 +131,48 @@ fn extract_html_opts(html: &str, opts: &ExtractOptions) -> Extracted {
 // ════════════════════════════════════════════════════════════
 // 1. MULTI-LANGUAGE EXTRACTION
 // ════════════════════════════════════════════════════════════
+
+// ════════════════════════════════════════════════════════════
+// 0. PAGE IDENTITY vs REQUEST PARAMETERS
+// ════════════════════════════════════════════════════════════
+
+/// The history fingerprint must describe the PAGE, not the request.
+/// It used to be taken over the rendered, focus-filtered slice with
+/// the request's own notices prepended, so two reads of one unchanged
+/// page with different reading parameters looked like a content
+/// change: an agent alternating a focused and a full read of the same
+/// URL got "changed"/"rewritten" on every call, and the parameters of
+/// one call became the baseline for the next.
+#[test]
+fn fingerprint_describes_the_page_not_the_request() {
+    // Enough paragraphs that a focus match has to drop some, which is
+    // what emits the dropped-content manifest.
+    let body: String = (0..12)
+        .map(|i| format!("<p>Paragraph {i} about generic topics and filler text.</p>"))
+        .collect();
+    let html = format!(
+        "<!DOCTYPE html><html><head><title>Identity</title></head><body>\
+         <article><h1>Identity</h1>{body}\
+         <p>The needle marker paragraph talks about rotating a deque.</p>\
+         </article></body></html>"
+    );
+
+    let plain = extract_html_opts(&html, &ExtractOptions::default());
+    let opts = ExtractOptions {
+        focus: Some("needle marker".into()),
+        ..Default::default()
+    };
+    let focused = extract_html_opts(&html, &opts);
+
+    assert_ne!(
+        plain.markdown, focused.markdown,
+        "focus must still change what the caller sees"
+    );
+    assert_eq!(
+        plain.fingerprint, focused.fingerprint,
+        "the fingerprint must not move with the reading parameters"
+    );
+}
 
 #[test]
 fn extract_english_article() {
@@ -214,7 +353,7 @@ fn extract_russian_article() {
     let html = r#"<html lang="ru"><head><title>Машинное обучение</title></head>
 <body><article>
 <h1>Машинное обучение</h1>
-<p>Машинное обучение — это раздел искусственного интеллекта,
+<p>Машинное обучение : это раздел искусственного интеллекта,
 который позволяет компьютерам учиться на данных.</p>
 <h2>Контролируемое обучение</h2>
 <p>При контролируемом обучении используются размеченные данные
@@ -306,7 +445,7 @@ fn focus_english_stemming() {
             ..Default::default()
         },
     );
-    assert!(!r.markdown.contains("*[focus"));
+    assert!(!r.markdown.contains("no matches"), "{}", r.markdown);
     assert!(r.markdown.contains("running") || r.markdown.contains("runner"));
 }
 
@@ -324,7 +463,7 @@ fn focus_chinese_bigram() {
             ..Default::default()
         },
     );
-    assert!(!r.markdown.contains("*[focus"));
+    assert!(!r.markdown.contains("no matches"), "{}", r.markdown);
     assert!(r.markdown.contains("机器学习"));
 }
 
@@ -342,7 +481,7 @@ fn focus_japanese() {
             ..Default::default()
         },
     );
-    assert!(!r.markdown.contains("*[focus"));
+    assert!(!r.markdown.contains("no matches"), "{}", r.markdown);
     assert!(r.markdown.contains("機械学習"));
 }
 
@@ -359,7 +498,7 @@ fn focus_accent_folding() {
             ..Default::default()
         },
     );
-    assert!(!r.markdown.contains("*[focus"));
+    assert!(!r.markdown.contains("no matches"), "{}", r.markdown);
 }
 
 #[test]
@@ -376,7 +515,7 @@ fn focus_german_umlaut() {
         },
     );
     // Should find the content regardless of umlaut folding.
-    assert!(!r.markdown.contains("*[focus"));
+    assert!(!r.markdown.contains("no matches"), "{}", r.markdown);
 }
 
 #[test]
@@ -502,6 +641,31 @@ fn block_code_pre() {
     assert!(r.markdown.contains("println!"));
 }
 
+// A <pre> that itself contains a markdown fence (every "how to
+// write markdown" page, every README rendered in a docs site)
+// used to be wrapped in a bare ``` fence: the inner ``` closed
+// the block early and the rest of the code spilled out as prose.
+#[test]
+fn block_code_containing_backtick_fence_is_wrapped_in_a_longer_fence() {
+    let html = "<html><body><article>
+<pre><code>Use a fence:
+
+```rust
+fn main() {}
+```
+
+Then prose.</code></pre>
+</article></body></html>";
+    let r = extract_html(html);
+    let md = &r.markdown;
+    let open = md.find("````\n").expect("longer opening fence");
+    let close = md.rfind("\n````\n").expect("longer closing fence");
+    assert!(open < close);
+    let inside = &md[open..close];
+    assert!(inside.contains("```rust\nfn main() {}\n```"), "{md}");
+    assert!(inside.contains("Then prose."), "{md}");
+}
+
 #[test]
 fn block_code_whitespace_preserved() {
     let html = r#"<html><body><article>
@@ -568,6 +732,53 @@ fn block_nested_list() {
     let r = extract_html(html);
     assert!(r.markdown.contains("Top level"));
     assert!(r.markdown.contains("Nested item"));
+}
+
+// The outer <li>'s inline render used to descend into the nested
+// <ul> as well, so every nested item appeared twice: fused into
+// its parent's line ("Has nested Nested item") and again as its
+// own indented bullet.
+#[test]
+fn block_nested_list_items_are_not_duplicated() {
+    let html = r#"<html><body><article>
+<p>Intro paragraph long enough to keep the article.</p>
+<ul>
+<li>Top level</li>
+<li>Has nested
+  <ul>
+    <li>Nested item</li>
+    <li>Second nested</li>
+  </ul>
+</li>
+<li>Last</li>
+</ul>
+</article></body></html>"#;
+    let r = extract_html(html);
+    let md = &r.markdown;
+    assert_eq!(md.matches("Nested item").count(), 1, "{md}");
+    assert_eq!(md.matches("Second nested").count(), 1, "{md}");
+    assert!(
+        md.contains("- Has nested\n  - Nested item\n  - Second nested\n- Last"),
+        "{md}"
+    );
+}
+
+// Past the indentation cap the nested list is flattened into its
+// parent's line (as before), never dropped; and text on either
+// side of a nested list keeps its word boundary.
+#[test]
+fn block_nested_list_deep_levels_and_trailing_text_survive() {
+    let html = r#"<html><body><article>
+<p>Intro paragraph long enough to keep the article.</p>
+<ul><li>L0<ul><li>L1<ul><li>L2<ul><li>L3<ul><li>L4<ul><li>L5 deep text<ul><li>L6 deeper</li></ul></li></ul></li></ul></li></ul></li></ul></li></ul></li>
+<li>Before<ul><li>Inner</li></ul>After text</li>
+</ul>
+</article></body></html>"#;
+    let r = extract_html(html);
+    let md = &r.markdown;
+    assert!(md.contains("        - L4 L5 deep text L6 deeper\n"), "{md}");
+    assert_eq!(md.matches("deep text").count(), 1, "{md}");
+    assert!(md.contains("- Before After text\n  - Inner\n"), "{md}");
 }
 
 #[test]
@@ -763,13 +974,13 @@ fn edge_only_nav_and_footer() {
 <footer>© 2026 Site. All rights reserved.</footer>
 </body></html>"#;
     let r = extract_html(html);
-    // Should have minimal content — nav and footer are junk.
+    // Should have minimal content : nav and footer are junk.
     assert!(r.blocks_shown < 5);
 }
 
 #[test]
 fn edge_div_soup() {
-    // No semantic tags — just divs with text.
+    // No semantic tags : just divs with text.
     let html = r#"<html><body>
 <div class="wrapper">
 <div class="content">This is the main content paragraph with enough text to be extracted properly.</div>
@@ -864,7 +1075,7 @@ fn pagination_utf8_boundary_safe() {
     );
     // Should not panic on UTF-8 boundaries.
     assert!(!r.markdown.is_empty());
-    // The slice should be valid UTF-8 (implicit — if it wasn't, the String would be invalid).
+    // The slice should be valid UTF-8 (implicit : if it wasn't, the String would be invalid).
 }
 
 #[test]
@@ -929,6 +1140,25 @@ fn toc_mode_flat_page() {
         },
     );
     assert!(r.markdown.contains("no headings"));
+}
+
+#[test]
+fn toc_mode_is_not_replaced_by_raw_text_fallback() {
+    let body = "This paragraph belongs to the page body, not to its requested outline. ".repeat(20);
+    let html = format!(
+        r#"<html><head><title>Small guide</title></head><body><article>
+<h1>Small guide</h1><p>{body}</p>
+</article></body></html>"#
+    );
+    let r = extract_html_opts(
+        &html,
+        &ExtractOptions {
+            toc: true,
+            ..Default::default()
+        },
+    );
+    assert!(r.markdown.contains("[s1] Small guide"), "{}", r.markdown);
+    assert!(!r.markdown.contains("This paragraph belongs"));
 }
 
 // ════════════════════════════════════════════════════════════
@@ -1145,16 +1375,57 @@ fn content_density_large_page_many_chars_not_thin() {
     );
 }
 
+#[test]
+fn short_pdf_is_not_classified_as_an_html_shell() {
+    let doc = Html::parse_document("<html lang=\"en\"><title>Receipt</title></html>");
+    let meta = metadata::metadata(&doc);
+    let blocks = vec![blocks::Block::Para {
+        md: "Total due: EUR 12".to_string(),
+        link_density: 0.0,
+        path: Vec::new(),
+    }];
+    let pages = vec![crate::pdf::PageMeta {
+        page: 0,
+        chars: 17,
+        ocr: false,
+        confidence: 1.0,
+    }];
+    let lang = language::detect(&doc);
+
+    let out = downstream(
+        &meta,
+        blocks,
+        25_000,
+        false,
+        false,
+        Vec::new(),
+        lang,
+        Some(pages),
+        "https://example.com/receipt.pdf",
+        &ExtractOptions::default(),
+        16_000,
+        None,
+    )
+    .unwrap();
+
+    assert!(!out.thin);
+    assert!(!out.markdown.contains("JS-rendered"));
+    assert_eq!(out.pdf_pages.as_ref().map(Vec::len), Some(1));
+}
+
 // ════════════════════════════════════════════════════════════
 // 12. CROSS-BLOCK DEDUP
 // ════════════════════════════════════════════════════════════
 
 #[test]
 fn dedup_identical_paragraphs() {
+    // Paragraph-sized on purpose: a marker only stands in for a
+    // block it is much shorter than, so a fixture trimmed to a few
+    // words would be kept verbatim and test nothing.
     let html = r#"<html><body><article>
-<p>Duplicate content that appears multiple times.</p>
-<p>Duplicate content that appears multiple times.</p>
-<p>Unique content that only appears once.</p>
+<p>Duplicate content that appears multiple times on this page, long enough that a marker standing in for it is the cheaper of the two.</p>
+<p>Duplicate content that appears multiple times on this page, long enough that a marker standing in for it is the cheaper of the two.</p>
+<p>Unique content that only appears once, and stays whatever the duplicate above it does.</p>
 </article></body></html>"#;
     let r = extract_html(html);
     // "Duplicate content" should appear only once.
@@ -1236,7 +1507,7 @@ fn junk_script_style_stripped() {
 #[test]
 fn junk_sidebar_size_gated() {
     // A "sidebar" class on a LARGE container should NOT be
-    // stripped (false positive — could be the main content).
+    // stripped (false positive : could be the main content).
     let html = r#"<html><body>
 <div class="sidebar">
 <p>This is actually the main content despite the class name. It has substantial text content that makes it clearly the primary content of the page, not a sidebar at all. The size-gating should prevent this from being stripped by the junk filter even though the class name says sidebar.</p>
@@ -1422,6 +1693,65 @@ fn css_selector_bad_returns_error() {
     assert!(r.is_err());
 }
 
+#[test]
+fn report_audit_selector_never_widens_short_or_missing_scope() {
+    let html = format!(
+        "<html><body><article><p>{}</p><table class='infobox'><tr><th>Founded</th><td>2021</td></tr></table></article></body></html>",
+        "Outside scope. ".repeat(300)
+    );
+    let opts = ExtractOptions {
+        selector: Some("table.infobox".into()),
+        ..Default::default()
+    };
+    let scoped = extract(
+        html.as_bytes(),
+        "text/html",
+        "https://en.wikipedia.org/wiki/Anthropic",
+        &opts,
+    )
+    .unwrap();
+    assert!(
+        scoped.markdown.contains("Founded"),
+        "selected table must survive"
+    );
+    assert!(
+        !scoped.markdown.contains("Outside scope"),
+        "short selector must never activate a whole-page rescue"
+    );
+    assert!(!scoped.thin, "intentional small scope is not an SPA");
+    let missing = ExtractOptions {
+        selector: Some("#absent".into()),
+        ..Default::default()
+    };
+    assert!(
+        extract(
+            html.as_bytes(),
+            "text/html",
+            "https://example.com/",
+            &missing
+        )
+        .is_err(),
+        "missing selector must fail instead of widening scope"
+    );
+}
+
+#[test]
+fn css_selector_matching_nothing_returns_an_error() {
+    let html = "<html><body><article><p>Real evidence.</p></article></body></html>";
+    let result = extract(
+        html.as_bytes(),
+        "text/html",
+        "https://example.com/",
+        &ExtractOptions {
+            selector: Some("#absent".into()),
+            ..Default::default()
+        },
+    );
+    assert!(
+        matches!(result, Err(ExtractError::SelectorNoMatch { inspected, .. }) if inspected > 0)
+    );
+}
+
 // ════════════════════════════════════════════════════════════
 // 17. MIXED LANGUAGE PAGES
 // ════════════════════════════════════════════════════════════
@@ -1457,8 +1787,8 @@ fn mixed_language_focus_cjk() {
             ..Default::default()
         },
     );
-    // "React" is Latin mixed into CJK — should still match.
-    assert!(!r.markdown.contains("*[focus"));
+    // "React" is Latin mixed into CJK : should still match.
+    assert!(!r.markdown.contains("no matches"), "{}", r.markdown);
     assert!(r.markdown.contains("React") || r.markdown.contains("Facebook"));
 }
 
@@ -1563,7 +1893,7 @@ fn focus_french_stemming() {
         },
     );
     // "ordinateurs" → stem "ordinateur" should match query.
-    assert!(!r.markdown.contains("*[focus"));
+    assert!(!r.markdown.contains("no matches"), "{}", r.markdown);
 }
 
 // ════════════════════════════════════════════════════════════
@@ -1583,9 +1913,101 @@ fn jsonld_unicode_escape_decoded() {
     assert_eq!(meta.byline.as_deref(), Some("维基媒体"));
 }
 
+// html5ever's tree builder scans the open-element stack per tag: the
+// parse is O(n²) in nesting depth (8 000 nested <div> 0.4 s, 32 000
+// 6.6 s measured here) and nothing capped the depth (browsers stop at
+// 512). The gate refuses such a body before the parse; a wide page of
+// the same size is untouched.
+#[test]
+fn a_page_nested_thousands_deep_is_refused_before_the_parse() {
+    let n = 50_000;
+    let html = format!(
+        "<html><body><article>{}x{}</article></body></html>",
+        "<div>".repeat(n),
+        "</div>".repeat(n)
+    );
+    let started = std::time::Instant::now();
+    let err = extract(
+        html.as_bytes(),
+        "text/html",
+        "https://ex.com/",
+        &ExtractOptions::default(),
+    )
+    .err()
+    .expect("refused");
+    assert!(err.to_string().contains("nested deeper"), "{err}");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(20),
+        "took {:?}",
+        started.elapsed()
+    );
+    // The self-closing slash is ignored by the HTML parser, so this
+    // shape nests for real too and is refused the same way.
+    let html = format!(
+        "<html><body><article>{}x</article></body></html>",
+        "<div/>".repeat(n)
+    );
+    let err = extract(
+        html.as_bytes(),
+        "text/html",
+        "https://ex.com/",
+        &ExtractOptions::default(),
+    )
+    .err()
+    .expect("refused");
+    assert!(err.to_string().contains("nested deeper"), "{err}");
+    // Same byte count, wide instead of deep: extracted as usual.
+    let html = format!(
+        "<html><body><article>{}</article></body></html>",
+        "<p>a paragraph with enough words to be kept by the extractor here</p>".repeat(n / 10)
+    );
+    let r = extract_html(&html);
+    assert!(r.markdown.contains("a paragraph"));
+}
+
 // ════════════════════════════════════════════════════════════
-// 24. TABLE WITHOUT <th> — FIRST ROW PROMOTED TO HEADERS
+// 24. TABLE WITHOUT <th> : FIRST ROW PROMOTED TO HEADERS
 // ════════════════════════════════════════════════════════════
+
+// Tables nested d deep: the table scans used descendant selects, so
+// every level re-scanned every nested cell below it, quadratic per
+// level and the walk recursed a level and repeated it. 1000 levels
+// (18 KB) took minutes on the tokio worker.
+#[test]
+fn deeply_nested_tables_extract_in_linear_time() {
+    let d = 1000;
+    let html = format!(
+        "<html><body><article>{}x{}</article></body></html>",
+        "<table><tr><td>".repeat(d),
+        "</td></tr></table>".repeat(d)
+    );
+    let started = std::time::Instant::now();
+    let r = extract_html(&html);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(20),
+        "took {:?}",
+        started.elapsed()
+    );
+    assert!(r.markdown.contains('x'));
+}
+
+// A table nested in a cell is that cell's content, not extra rows of
+// the outer table.
+#[test]
+fn nested_table_rows_are_not_merged_into_the_outer_table() {
+    let html = r#"<html><body><article>
+<table>
+<tr><th>Key</th><th>Value</th></tr>
+<tr><td>inner</td><td><table><tr><td>a</td></tr><tr><td>b</td></tr><tr><td>c</td></tr></table></td></tr>
+<tr><td>after</td><td>done</td></tr>
+</table>
+</article></body></html>"#;
+    let r = extract_html(html);
+    assert!(r.markdown.contains("| Key | Value |"), "{}", r.markdown);
+    assert!(r.markdown.contains("| after | done |"), "{}", r.markdown);
+    // The inner rows do not become `| a |` rows of the outer table.
+    assert!(!r.markdown.contains("| a |"), "{}", r.markdown);
+}
 
 #[test]
 fn table_without_th_promotes_first_row() {
@@ -1605,7 +2027,58 @@ fn table_without_th_promotes_first_row() {
 }
 
 // ════════════════════════════════════════════════════════════
-// 25. TABLE CELL TRUNCATION — CHAR-BASED (CJK)
+// 24b. TABLE ROW HEADERS (<th scope="row">) ARE KEPT
+// ════════════════════════════════════════════════════════════
+
+// The standard accessible markup for a data table labels each row
+// with a <th scope="row">. table_block collected <th> and <td> with
+// two separate selects and only ever used <th> cells for the single
+// header row, so every later row silently lost its label and its
+// remaining cells shifted one column left.
+#[test]
+fn table_row_header_cells_are_kept_in_data_rows() {
+    let html = r#"<html><body><article>
+<table>
+<tr><th></th><th>2022</th><th>2023</th></tr>
+<tr><th scope="row">Revenue</th><td>10</td><td>20</td></tr>
+<tr><th scope="row">Costs</th><td>7</td><td>9</td></tr>
+</table>
+</article></body></html>"#;
+    let r = extract_html(html);
+    assert!(
+        r.markdown.contains("| Revenue | 10 | 20 |"),
+        "row label dropped:\n{}",
+        r.markdown
+    );
+    assert!(r.markdown.contains("| Costs | 7 | 9 |"));
+}
+
+// A first row that mixes <th> and <td> is a data row, not a header
+// row; its <td> cells must not be thrown away.
+#[test]
+fn table_mixed_first_row_keeps_td_cells() {
+    let html = r#"<html><body><article>
+<table>
+<tr><th>Language</th><td>Rust</td></tr>
+<tr><th>License</th><td>MIT</td></tr>
+<tr><th>Since</th><td>2015</td></tr>
+</table>
+</article></body></html>"#;
+    let r = extract_html(html);
+    assert!(
+        r.markdown.contains("Rust") && r.markdown.contains("MIT") && r.markdown.contains("2015"),
+        "td cells dropped:\n{}",
+        r.markdown
+    );
+    assert!(
+        r.markdown.contains("| License | MIT |"),
+        "label/value pairing lost:\n{}",
+        r.markdown
+    );
+}
+
+// ════════════════════════════════════════════════════════════
+// 25. TABLE CELL TRUNCATION : CHAR-BASED (CJK)
 // ════════════════════════════════════════════════════════════
 
 #[test]
@@ -1688,7 +2161,7 @@ fn details_summary_as_heading() {
 }
 
 // ════════════════════════════════════════════════════════════
-// 28. CODE BLOCK LANGUAGE DETECTION — MULTIPLE PATTERNS
+// 28. CODE BLOCK LANGUAGE DETECTION : MULTIPLE PATTERNS
 // ════════════════════════════════════════════════════════════
 
 #[test]
@@ -1710,7 +2183,7 @@ fn code_lang_detection_patterns() {
 }
 
 // ════════════════════════════════════════════════════════════
-// 29. PAGINATE START — RESUMES AT BLOCK BOUNDARY
+// 29. PAGINATE START : RESUMES AT BLOCK BOUNDARY
 // ════════════════════════════════════════════════════════════
 
 #[test]
@@ -1757,7 +2230,7 @@ fn paginate_resume_starts_at_block_boundary() {
 }
 
 // ════════════════════════════════════════════════════════════
-// 30. DESCRIPTION CAP — 500 CHARS MAX
+// 30. DESCRIPTION CAP : 500 CHARS MAX
 // ════════════════════════════════════════════════════════════
 
 #[test]
@@ -1834,7 +2307,7 @@ fn hn_extractor_fires_on_live_thread_shape() {
 }
 
 // ════════════════════════════════════════════════════════════
-// 30. PAGINATE — HOSTILE ARGS MUST NOT PANIC
+// 30. PAGINATE : HOSTILE ARGS MUST NOT PANIC
 // ════════════════════════════════════════════════════════════
 
 #[test]
@@ -1977,7 +2450,7 @@ fn v3_probe_regex_mode() {
         },
     );
     assert!(
-        r.markdown.starts_with("probe: MATCH — 2 hits"),
+        r.markdown.starts_with("probe: MATCH : 2 hits"),
         "{}",
         r.markdown
     );
@@ -1994,6 +2467,106 @@ fn v3_probe_invalid_regex_is_honest_not_panic() {
         },
     );
     assert!(r.markdown.contains("invalid regex"), "{}", r.markdown);
+}
+#[test]
+fn must_contain_regex_with_trailing_flags_is_still_regex() {
+    // A trailing flag like /i must not downgrade the probe to a
+    // literal search.
+    let hit = extract_html_opts(
+        "cve-2026-1234 hatchling",
+        &ExtractOptions {
+            must_contain: Some("/CVE-2026-\\d{4}/i".into()),
+            ..Default::default()
+        },
+    );
+    assert!(hit.markdown.contains("probe: MATCH"), "{}", hit.markdown);
+    let miss = extract_html_opts(
+        "nothing here",
+        &ExtractOptions {
+            must_contain: Some("/CVE-2026-\\d{4}/i".into()),
+            ..Default::default()
+        },
+    );
+    assert!(
+        miss.markdown.contains("probe: NO MATCH"),
+        "{}",
+        miss.markdown
+    );
+}
+
+#[test]
+fn must_contain_probe_applies_to_plain_text_passthrough() {
+    let body = b"HTTP/1.1 Semantics and Content\r\nFielding, Ed.\r\n";
+    let out = extract(
+        body,
+        "text/plain",
+        "https://example.com/rfc",
+        &ExtractOptions {
+            must_contain: Some("Fielding".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(out.markdown.contains("probe: MATCH"), "{}", out.markdown);
+    // The probe must replace the body, not dump it: a probe block is
+    // a handful of lines, the raw passthrough would carry the full
+    // document text.
+    assert!(out.markdown.len() < 400, "len {}", out.markdown.len());
+}
+
+// Hits were BYTE offsets (regex m.start(), or offsets into a
+// separately lowercased haystack), but context_around treated them
+// as CHAR indices. On any page with non-ASCII text before the match
+// the excerpt window landed after the real hit -- "MATCH: 1 hit"
+// followed by an excerpt that doesn't contain the pattern.
+fn probe_excerpt(text: &str, pattern: &str) -> String {
+    let opts = ExtractOptions {
+        must_contain: Some(pattern.into()),
+        ..Default::default()
+    };
+    let out = probe_render(text, opts.probe_pattern(), opts.probe_is_regex());
+    assert!(out.starts_with("probe: MATCH"), "{out}");
+    out.lines()
+        .find(|l| l.starts_with("[1]"))
+        .unwrap_or_else(|| panic!("no excerpt line:\n{out}"))
+        .to_string()
+}
+
+#[test]
+fn probe_excerpt_points_at_the_hit_on_non_ascii_pages() {
+    let prefix = "Асинхронная среда выполнения для языка Rust. ".repeat(6);
+    let text = format!("{prefix}The tokio runtime schedules tasks. {prefix}");
+    let sub = probe_excerpt(&text, "tokio runtime");
+    assert!(sub.contains("tokio runtime"), "substring excerpt: {sub}");
+    let re = probe_excerpt(&text, "/tokio\\s+runtime/");
+    assert!(re.contains("tokio runtime"), "regex excerpt: {re}");
+}
+
+#[test]
+fn probe_excerpt_survives_case_folding_that_changes_byte_length() {
+    // 'İ' (2 bytes) lowercases to "i̇" (3 bytes): the old lowercased
+    // haystack drifted further from the real text with every one.
+    let prefix = "İSTANBUL İZMİR İÇEL ".repeat(40);
+    let text = format!("{prefix}Needle here. {prefix}");
+    let sub = probe_excerpt(&text, "needle");
+    assert!(sub.contains("Needle"), "excerpt: {sub}");
+}
+
+// A multi-KB substring pattern expands past the regex size limit
+// under (?i); it must still be searched as a literal, not reported
+// as an "invalid regex".
+#[test]
+fn probe_substring_longer_than_the_regex_size_limit_still_matches() {
+    let needle = "проверка ".repeat(800); // ~14 KB, Cyrillic
+    let text = format!("intro {needle} outro");
+    let out = probe_render(&text, needle.trim_end(), false);
+    assert!(
+        out.starts_with("probe: MATCH : 1 hit"),
+        "{}",
+        &out[..out.len().min(120)]
+    );
+    let miss = probe_render("nothing here", needle.trim_end(), false);
+    assert!(miss.starts_with("probe: NO MATCH"), "{miss}");
 }
 
 /// Issue #49: links and formatting nested inside em/strong were
@@ -2035,4 +2608,324 @@ fn v3_nested_inline_formatting_preserves_links() {
     assert!(m.contains("*G [H](https://example.com/h) I*"), "G: {}", m);
     // Case J: strong > link.
     assert!(m.contains("**[J](https://example.com/j)**"), "J: {}", m);
+}
+
+/// Issue #227 (2026-09-15): pages whose text layout is bare text
+/// separated by <br> tags (no <p> elements) came back as one single
+/// flattened paragraph on the tier-2 ghost path (and every other
+/// path: loose_text is the shared conversion site). The exact source
+/// sequence from the live repro (69shuba): emsp text, `<br />` plus
+/// \r, a second `<br />` plus \r\n. A br/whitespace/br run must
+/// yield a paragraph break (blank line), matching browser rendering.
+/// loose_text used to trim the br sentinel away; the direct br
+/// sentinel push plus the shared collapse_to_markdown post-processing
+/// are covered here.
+#[test]
+fn br_paragraphs_survive_across_paths() {
+    // 1. The exact byte sequence reported in #227 (CDP outerHTML
+    //    form: self-closing <br />, \r separators).
+    let html = "<html><body><div class=\"txtnav\">\r\n&emsp;&emsp;Paragraph one text<br />\r\n<br />\r\n&emsp;&emsp;Paragraph two text<br />\r\n<br /></div></body></html>";
+    let m = extract_html(html).markdown;
+    assert!(
+        m.contains("Paragraph one text\n\nParagraph two text"),
+        "CDP form must produce a paragraph break (blank line), got: {m:?}"
+    );
+
+    // 2. Plain form (`<br>` + \n). Same contract.
+    let html2 = "<html><body><div>&emsp;&emsp;Paragraph one text<br>\n<br>\n&emsp;&emsp;Paragraph two text<br>\n<br></div></body></html>";
+    let m2 = extract_html(html2).markdown;
+    assert!(
+        m2.contains("Paragraph one text\n\nParagraph two text"),
+        "plain form must keep paragraph structure, got: {m2:?}"
+    );
+}
+
+#[test]
+fn br_single_line_break_and_downstream() {
+    // A single br inside flowing text = one newline.
+    let m = extract_html("<html><body><div>alpha<br>beta</div></body></html>").markdown;
+    assert!(
+        m.contains("alpha\nbeta"),
+        "single br = one newline, got: {m:?}"
+    );
+
+    // Downstream excerpt renderers inherit the structure: focus
+    // receives the same converted text, breaks intact.
+    let html = "<html><body><div>&emsp;&emsp;Paragraph one text<br />\r\n<br />\r\n&emsp;&emsp;Paragraph two text<br />\r\n<br /></div></body></html>";
+    let r = extract_html_opts(
+        html,
+        &ExtractOptions {
+            focus: Some("paragraph".into()),
+            ..Default::default()
+        },
+    );
+    assert!(
+        r.markdown.contains("Paragraph one text\n"),
+        "focus path must inherit paragraph breaks, got: {:?}",
+        r.markdown
+    );
+}
+
+/// Issue #227 class, fallback path: the last-resort walker used to
+/// flush a paragraph at EVERY br (splitting prose at every line
+/// break) and add a space after each br's newline. Now one br = a
+/// line break inside the paragraph, two in a row = the paragraph
+/// break, matching the main converter and browser rendering.
+#[test]
+fn fallback_br_line_and_paragraph_breaks() {
+    let long = "lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor incididunt ut labore et dolore magna aliqua ut enim ad minim veniam quis nostrud exercitation ullamco laboris nisi ut aliquip";
+    let html = format!(
+        "<html><body><div>{long}<br>{long} beta</div><div>{long} one<br><br>{long} two</div></body></html>",
+    );
+    let meta = metadata::metadata(&Html::parse_fragment("<div></div>"));
+    let r = fallback::text_fallback(
+        &html,
+        &meta,
+        "https://x.invalid",
+        &Default::default(),
+        10_000,
+    )
+    .expect("fallback must extract");
+    let m = &r.markdown;
+    assert!(
+        m.contains("aliquip\nlorem"),
+        "single br = one newline, got: {m:?}"
+    );
+    assert!(
+        m.contains("one\n\nlorem"),
+        "br/blank/br = paragraph break, got: {m:?}"
+    );
+    assert!(
+        !m.contains("\n "),
+        "no leading space after any br newline, got: {m:?}"
+    );
+}
+
+// The fetch tool parsed a PDF inline on the tokio worker; the crawl
+// used the blocking pool. One helper now serves both: a PDF body is
+// parsed off the worker under a budget, HTML goes straight through.
+#[tokio::test]
+async fn extract_off_worker_parses_pdf_off_the_runtime_and_html_inline() {
+    let html = b"<html><head><title>T</title></head><body><article><p>Hello there, a paragraph long enough to keep.</p></article></body></html>";
+    let opts = ExtractOptions::default();
+    let out = super::extract_off_worker(html, "text/html", "https://ex.com/", &opts)
+        .await
+        .expect("html");
+    assert!(out.markdown.contains("Hello there"));
+    // A PDF body: routed through spawn_blocking; pdfium rejects the
+    // truncated bytes, and the error must come back typed, not as a
+    // join panic.
+    let pdf = b"%PDF-1.4\ngarbage";
+    let err = super::extract_off_worker(pdf, "application/pdf", "https://ex.com/x.pdf", &opts)
+        .await
+        .err();
+    // Either a typed failure or, on a lenient pdfium, an empty doc;
+    // never a panic.
+    let _ = err;
+}
+
+#[test]
+fn wave450_outline_respects_the_output_budget() {
+    let headings = (0..100)
+        .map(|n| {
+            format!("<h2>Section number {n}</h2><p>Some actual section content for readers.</p>")
+        })
+        .collect::<String>();
+    let html = format!("<html><title>Outline test</title><main>{headings}</main></html>");
+    let opts = ExtractOptions {
+        toc: true,
+        max_chars: Some(300),
+        ..Default::default()
+    };
+    let ex = super::extract(html.as_bytes(), "text/html", "https://example.org/", &opts).unwrap();
+    assert!(
+        ex.markdown.len() < 450,
+        "outline leaked {} chars",
+        ex.markdown.len()
+    );
+    assert!(ex.next_offset.is_some());
+}
+
+#[test]
+fn wave450_adapter_token_estimate_measures_the_returned_slice() {
+    let body = "real post body with details. ".repeat(100);
+    let html = format!(
+        "<html><body><div class='thing link' data-author='a' data-score='5'><a class='title'>A real post</a><div class='usertext-body'><div class='md'><p>{body}</p></div></div></div></body></html>"
+    );
+    let ex = super::reddit::extract(
+        &html,
+        "https://old.reddit.com/r/rust/",
+        &ExtractOptions {
+            max_chars: Some(200),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(ex.next_offset.is_some());
+    assert_eq!(ex.tokens_est, ex.markdown.len() / 4);
+}
+
+#[test]
+fn report_audit_pagination_caps_markers_and_reassembles_unicode_exactly() {
+    let text = format!(
+        "{}END\n\n{}",
+        "日本語 evidence ".repeat(70),
+        "tail ".repeat(60)
+    );
+    let mut offset = 0;
+    let mut rebuilt = String::new();
+    for _ in 0..100 {
+        let (slice, next) = paginate_public(&text, offset, 200);
+        assert!(slice.len() <= 200, "marker must fit the byte budget");
+        if let Some(next) = next {
+            assert!(next > offset && text.is_char_boundary(next));
+            rebuilt.push_str(slice.split("\n\n*[truncated : continue").next().unwrap());
+            offset = next;
+        } else {
+            rebuilt.push_str(&slice);
+            break;
+        }
+    }
+    assert_eq!(
+        rebuilt, text,
+        "continuations cannot omit or repeat evidence"
+    );
+}
+
+#[test]
+fn report_audit_tiny_pagination_never_overruns_or_loses_unicode() {
+    let text = "日本語 😀 evidence";
+    for cap in 4..60 {
+        let mut offset = 0;
+        let mut rebuilt = String::new();
+        loop {
+            let (slice, next) = paginate_public(text, offset, cap);
+            assert!(slice.len() <= cap);
+            rebuilt.push_str(slice.split("\n\n*[truncated : continue").next().unwrap());
+            match next {
+                Some(next) => {
+                    assert!(next > offset);
+                    offset = next;
+                }
+                None => break,
+            }
+        }
+        assert_eq!(rebuilt, text);
+    }
+    assert_eq!(paginate_public(text, 0, 0), (String::new(), Some(0)));
+}
+
+#[test]
+fn report_audit_focus_fallback_retains_lead_table_and_source_order() {
+    let html = r#"<html><title>Company</title><script type="application/ld+json">{"author":{"name":"Contributors to Wikimedia projects"},"datePublished":"2006-08-01"}</script><body><article><p>Company founding funding valuation lead describes the company.</p><table><tr><th>Founder</th><th>Year</th></tr><tr><td>Ada</td><td>2021</td></tr><tr><td>Bob</td><td>2022</td></tr></table><h2>Funding</h2><p>Company founding funding valuation funding round one.</p><h2>History</h2><p>Company founding funding valuation history passage.</p></article></body></html>"#;
+    let options = ExtractOptions {
+        focus: Some("company founding funding valuation".into()),
+        ..Default::default()
+    };
+    let ex = extract(
+        html.as_bytes(),
+        "text/html",
+        "https://en.wikipedia.org/wiki/Company",
+        &options,
+    )
+    .unwrap();
+    assert!(ex.markdown.contains("less than 20% saving"));
+    assert!(!ex.markdown.contains("Contributors to Wikimedia"));
+    for (earlier, later) in [
+        ("lead describes", "Ada"),
+        ("Ada", "round one"),
+        ("round one", "history passage"),
+    ] {
+        assert!(ex.markdown.find(earlier).unwrap() < ex.markdown.find(later).unwrap());
+    }
+    let other = extract(
+        html.as_bytes(),
+        "text/html",
+        "https://example.com/",
+        &options,
+    )
+    .unwrap();
+    assert!(
+        other.markdown.contains("Contributors to Wikimedia"),
+        "host-specific metadata must not remove other authors"
+    );
+}
+
+#[test]
+fn report_audit_selector_cannot_be_ignored_by_json_or_pdf() {
+    for (body, ct) in [
+        (
+            b"{\"text\":\"real content\"}".as_slice(),
+            "application/json",
+        ),
+        (b"%PDF-1.7".as_slice(), "application/pdf"),
+    ] {
+        let opts = ExtractOptions {
+            selector: Some("article".into()),
+            ..Default::default()
+        };
+        assert!(matches!(
+            extract(body, ct, "https://example.com/document", &opts),
+            Err(ExtractError::SelectorNoMatch { inspected: 0, .. })
+        ));
+    }
+}
+
+#[test]
+fn reliability_links_survive_loose_content_headings_and_table_cells() {
+    let html = r#"<html><body><main><h1>Evidence</h1>
+    <div>Research cites <a href="https://loose.example/report">the original report</a> for verification and factual context.</div>
+    <h2><a href="https://heading.example/spec">Specification source</a></h2>
+    <p>The evidence has ample descriptive content, including <a href="https://prose.example/data">the official dataset</a> with verifiable results.</p>
+    <table><tr><th>Source</th><th>Claim</th></tr><tr><td><a href="https://table.example/study">Original study</a></td><td>Verified data</td></tr></table>
+    </main></body></html>"#;
+    let r = extract_html_opts(
+        html,
+        &ExtractOptions {
+            include_links: true,
+            ..Default::default()
+        },
+    );
+    for host in ["loose", "heading", "prose", "table"] {
+        assert!(
+            r.markdown.contains(&format!("https://{host}.example/")),
+            "{host}: {}",
+            r.markdown
+        );
+    }
+}
+
+#[test]
+fn reliability_link_projection_does_not_change_source_fingerprint() {
+    let html = r#"<main><h1>Evidence</h1><p>This research links to <a href='https://source.example/spec'>the specification</a> for complete supporting evidence and context.</p><div>Loose <a href='https://other.example/data'>data source</a> is useful too.</div></main>"#;
+    let plain = extract_html_opts(html, &ExtractOptions::default());
+    let links = extract_html_opts(
+        html,
+        &ExtractOptions {
+            include_links: true,
+            ..Default::default()
+        },
+    );
+    assert_eq!(plain.fingerprint, links.fingerprint);
+    assert_ne!(plain.markdown, links.markdown);
+}
+
+#[test]
+fn reliability_short_article_focus_preserves_specific_evidence() {
+    let html = format!(
+        "<main><h1>Deployment handbook</h1><h2>Retries</h2><p>On HTTP 503, retry with exponential backoff and jitter; honor Retry-After.</p><h2>Storage</h2><p>{}</p><h2>Logging</h2><p>{}</p></main>",
+        "Storage retains encrypted snapshots. ".repeat(22),
+        "Logging records errors without tokens. ".repeat(22)
+    );
+    let full = extract_html_opts(&html, &ExtractOptions::default());
+    let focused = extract_html_opts(
+        &html,
+        &ExtractOptions {
+            focus: Some("HTTP 503 retry backoff".into()),
+            ..Default::default()
+        },
+    );
+    assert!(focused.markdown.contains("Retry-After"));
+    assert!(!focused.markdown.contains("showing full content"));
+    assert!(focused.markdown.len() * 2 < full.markdown.len());
 }

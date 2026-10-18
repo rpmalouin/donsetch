@@ -1,0 +1,25 @@
+# cargo-nextest config: https://nexte.st/docs/configuration/
+#
+# NEXTEST 0.9.x IGNORES config-level `cargo-profile` (verified on
+# 0.9.143). The ONLY working pin is the CLI flag: `--cargo-profile ci`
+# in the Justfile and CI recipes. An unprotected `cargo nextest run`
+# compiles the whole dependency graph under the DEBUG profile (21G
+# of target/debug in two days, the 110G catch before that, and 4.6G
+# in one scoped run today). Scoped local runs go through
+# `just t <filter>`; raw nextest calls must carry the flag.
+#
+# Local: `cargo nextest run`           → fail-fast, stop at first red
+# CI:    `cargo nextest run --profile ci` → run everything, show all
+
+[profile.default]
+fail-fast = true
+# A hung test must fail locally too, not wedge the terminal forever.
+# Slightly longer than ci: local runs often share the box with a build.
+slow-timeout = { period = "60s", terminate-after = 1 }
+[profile.ci]
+fail-fast = false
+# A hung test (native code deadlock inside PDFium/ONNX has
+# happened before on aarch64) must fail the job in a bounded
+# time, not wedge it until the workflow timeout. 30s per test
+# then hard-terminate.
+slow-timeout = { period = "30s", terminate-after = 1 }

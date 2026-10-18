@@ -1,6 +1,6 @@
 //! Language + script detection. Drives tokenization strategy
 //! (CJK bigrams vs word-split), stopword filtering, and
-//! stemming. No external model — pure Unicode-range analysis
+//! stemming. No external model : pure Unicode-range analysis
 //! + HTML hints. Good enough to route tokenization correctly;
 //!
 //! The focus filter degrades gracefully on wrong calls.
@@ -130,7 +130,7 @@ pub fn detect_from_text(text: &str) -> LanguageInfo {
         }
     }
     // Count threshold: long samples need c>5 to matter, but a
-    // 4-char CJK query (机器学习) must still detect — 4 < 6
+    // 4-char CJK query (机器学习) must still detect : 4 < 6
     // would wrongly fall through to Latin.
     let min_count = if sampled < 30 { 1 } else { 5 };
     let mut scripts: Vec<Script> = counts
@@ -165,7 +165,7 @@ pub fn detect_from_text(text: &str) -> LanguageInfo {
 /// `<html lang>`, `<meta http-equiv=content-language>`,
 /// then falls back to script analysis of text content.
 pub fn detect(doc: &Html) -> LanguageInfo {
-    // 1. HTML lang attribute — most reliable.
+    // 1. HTML lang attribute : most reliable.
     if let Some(lang) = html_lang(doc) {
         let script = lang_to_script(&lang);
         return LanguageInfo {

@@ -1,4 +1,4 @@
-//! DonSheet — the PDF extraction engine.
+//! DonSheet : the PDF extraction engine.
 //!
 //! Bytes in, DonSift blocks out. See `design/pdf.md` for the full
 //! architecture. This module owns: the PDFium FFI boundary (`sys` +
@@ -26,7 +26,6 @@ use crate::extract::metadata::Meta;
 pub use engine::{LoadError, OutlineItem};
 
 /// Hard input ceiling (server-side fetched PDFs can be huge).
-const DEFAULT_MAX_BYTES: usize = 100 * 1024 * 1024;
 
 #[derive(Debug)]
 pub enum PdfFailure {
@@ -72,7 +71,7 @@ pub struct ParsedPdf {
     pub fonts: Vec<String>,
     /// Per-page extraction stats. Block merging deliberately
     /// flows paragraphs across page breaks for reading
-    /// continuity — this is where page boundaries (and
+    /// continuity : this is where page boundaries (and
     /// per-page text trust) are preserved instead.
     pub pages_meta: Vec<PageMeta>,
 }
@@ -95,7 +94,15 @@ pub struct PageMeta {
 fn pdf_date(raw: &Option<String>) -> Option<String> {
     let r = raw.as_ref()?;
     let d = r.strip_prefix("D:").unwrap_or(r);
-    if d.len() >= 8 && d[..8].chars().all(|c| c.is_ascii_digit()) {
+    // Check the bytes, not a str slice: the Info dict is
+    // producer-controlled and a localized date puts a multibyte
+    // char inside the first 8 bytes, where `d[..8]` would panic.
+    // All-ASCII-digit bytes make the slices below boundary-safe.
+    let leading_digits = d
+        .as_bytes()
+        .get(..8)
+        .is_some_and(|b| b.iter().all(u8::is_ascii_digit));
+    if leading_digits {
         Some(format!("{}-{}-{}", &d[..4], &d[4..6], &d[6..8]))
     } else if r.trim().is_empty() {
         None
@@ -106,11 +113,14 @@ fn pdf_date(raw: &Option<String>) -> Option<String> {
 
 /// Parse `bytes` into DonSift blocks with full honesty flags.
 pub fn parse(bytes: &[u8]) -> Result<ParsedPdf, PdfFailure> {
-    let limit = std::env::var("DONSETCH_PDF_MAX_MB")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .map(|mb| mb * 1024 * 1024)
-        .unwrap_or(DEFAULT_MAX_BYTES);
+    parse_with(bytes, engine::MAX_PAGES)
+}
+
+/// `parse` with the per-document page cap chosen by the caller.
+pub(crate) fn parse_with(bytes: &[u8], max_pages: usize) -> Result<ParsedPdf, PdfFailure> {
+    // [fetch] pdf_max_mb (legacy DONSETCH_PDF_MAX_MB); validation
+    // enforces 1..=4096 at load, so this is always >= 1 MB.
+    let limit = crate::config::cfg().fetch.pdf_max_mb * 1024 * 1024;
     if bytes.len() > limit {
         return Err(PdfFailure::TooLarge(bytes.len()));
     }
@@ -119,6 +129,7 @@ pub fn parse(bytes: &[u8]) -> Result<ParsedPdf, PdfFailure> {
         want_pixels: true,
         want_forms: true,
         dpi: 96.0,
+        max_pages,
     };
     let mut pages: Vec<layout::PageLines> = Vec::new();
     let mut raw_chars_total = 0usize;
@@ -168,7 +179,7 @@ pub fn parse(bytes: &[u8]) -> Result<ParsedPdf, PdfFailure> {
                 f
             })
             .or_else(|| {
-                // No pixels (text-rich page) — still track glyph trust
+                // No pixels (text-rich page) : still track glyph trust
                 // for garbage detection (PUA glyph soup pages).
                 Some(fusion::FusionData {
                     garbage_ratio: trust,
@@ -284,8 +295,8 @@ pub fn parse(bytes: &[u8]) -> Result<ParsedPdf, PdfFailure> {
     let mut decided_hint: Option<&'static str> = None;
     // Per-page OCR confidence for PageMeta (final-text trust).
     let mut ocr_page_conf: std::collections::HashMap<usize, f32> = std::collections::HashMap::new();
-    if std::env::var("DONSHEET_DEBUG").is_ok() {
-        eprintln!(
+    if crate::config::cfg().debug.pdf {
+        crate::diag!(
             "[ocr] candidates: {:?} (enabled={})",
             needs_ocr,
             ocr::enabled()
@@ -306,12 +317,12 @@ pub fn parse(bytes: &[u8]) -> Result<ParsedPdf, PdfFailure> {
                             // First page of a cascaded doc locks the winner.
                             if decided_hint.is_none() {
                                 decided_hint = Some(kind);
-                                if std::env::var("DONSHEET_DEBUG").is_ok() {
-                                    eprintln!("[ocr] recognizer locked: {kind}");
+                                if crate::config::cfg().debug.pdf {
+                                    crate::diag!("[ocr] recognizer locked: {kind}");
                                 }
                             }
-                            if std::env::var("DONSHEET_DEBUG").is_ok() {
-                                eprintln!(
+                            if crate::config::cfg().debug.pdf {
+                                crate::diag!(
                                     "[ocr] page {pi}: {} lines in {:?}",
                                     olines.len(),
                                     t0.elapsed()
@@ -333,8 +344,8 @@ pub fn parse(bytes: &[u8]) -> Result<ParsedPdf, PdfFailure> {
                             ocr_pages += 1;
                         }
                         Ok((_olines, _kind)) => {
-                            if std::env::var("DONSHEET_DEBUG").is_ok() {
-                                eprintln!(
+                            if crate::config::cfg().debug.pdf {
+                                crate::diag!(
                                     "[ocr] page {pi}: zero usable lines in {:?}",
                                     t0.elapsed()
                                 );
@@ -342,8 +353,8 @@ pub fn parse(bytes: &[u8]) -> Result<ParsedPdf, PdfFailure> {
                         }
                         Err(e) => {
                             ocr_failed = true;
-                            if std::env::var("DONSHEET_DEBUG").is_ok() {
-                                eprintln!("[ocr] page {pi} failed: {e}");
+                            if crate::config::cfg().debug.pdf {
+                                crate::diag!("[ocr] page {pi} failed: {e}");
                             }
                             break;
                         }
@@ -351,14 +362,20 @@ pub fn parse(bytes: &[u8]) -> Result<ParsedPdf, PdfFailure> {
                 }
             }
             Err(e) => {
-                if std::env::var("DONSHEET_DEBUG").is_ok() {
-                    eprintln!("[ocr] rasterize_pages failed: {e:?}");
+                if crate::config::cfg().debug.pdf {
+                    crate::diag!("[ocr] rasterize_pages failed: {e:?}");
                 }
             }
         }
     }
 
     let mut notes: Vec<String> = Vec::new();
+    if raw.pages_read < raw.page_count {
+        notes.push(format!(
+            "document has {} pages; the first {} were read (per-document page cap)",
+            raw.page_count, raw.pages_read
+        ));
+    }
     if ocr_pages > 0 {
         let mean = if ocr_conf_pages > 0 {
             ocr_conf_sum / ocr_conf_pages as f32
@@ -366,7 +383,7 @@ pub fn parse(bytes: &[u8]) -> Result<ParsedPdf, PdfFailure> {
             0.0
         };
         notes.push(format!(
-            "{ocr_pages} page(s) were OCR'd (no usable text layer); mean recognition confidence {:.0}% — read numbers and proper nouns with care",
+            "{ocr_pages} page(s) were OCR'd (no usable text layer); mean recognition confidence {:.0}% : read numbers and proper nouns with care",
             mean * 100.0
         ));
     } else if ocr_failed && !needs_ocr.is_empty() {
@@ -429,9 +446,9 @@ pub fn parse(bytes: &[u8]) -> Result<ParsedPdf, PdfFailure> {
 
     // Reading order per page. Vertical/rotated pages are an honest
     // flagged lane (best-effort; no column reconstruction in v1).
-    let dbg = std::env::var("DONSHEET_DEBUG").is_ok();
+    let dbg = crate::config::cfg().debug.pdf;
     if dbg {
-        eprintln!("[parse] reading order start: {} pages", pages.len());
+        crate::diag!("[parse] reading order start: {} pages", pages.len());
     }
     let mut vertical_pages = 0usize;
     let mut ordered_by_page: Vec<Vec<layout::Line>> = Vec::with_capacity(pages.len());
@@ -443,7 +460,7 @@ pub fn parse(bytes: &[u8]) -> Result<ParsedPdf, PdfFailure> {
             vertical_pages += 1;
         }
         if dbg {
-            eprintln!(
+            crate::diag!(
                 "[parse] page {} ordering ({} lines)",
                 p.index,
                 p.lines.len()
@@ -454,7 +471,7 @@ pub fn parse(bytes: &[u8]) -> Result<ParsedPdf, PdfFailure> {
             _ => reading::page_order(p.lines.clone()),
         };
         // Splice form widgets at their visual position (they render as
-        // list items — the markdown_line() already starts with "- ").
+        // list items : the markdown_line() already starts with "- ").
         let pw = p.height;
         for (wi, w) in all_widgets.iter().enumerate() {
             if w.0 != p.index {
@@ -493,7 +510,7 @@ pub fn parse(bytes: &[u8]) -> Result<ParsedPdf, PdfFailure> {
     }
     if vertical_pages > 0 {
         notes.push(format!(
-            "{vertical_pages} of {} page(s) contain vertical or rotated text — vertical text extraction is best-effort and may be out of order",
+            "{vertical_pages} of {} page(s) contain vertical or rotated text : vertical text extraction is best-effort and may be out of order",
             raw.page_count
         ));
     }
@@ -504,11 +521,11 @@ pub fn parse(bytes: &[u8]) -> Result<ParsedPdf, PdfFailure> {
 
     // Semantic blocks.
     if dbg {
-        eprintln!("[parse] classify start");
+        crate::diag!("[parse] classify start");
     }
     let doc_blocks = blocks::classify(&pages, &ordered_by_page, &ctx);
     if dbg {
-        eprintln!("[parse] classify end: {} blocks", doc_blocks.len());
+        crate::diag!("[parse] classify end: {} blocks", doc_blocks.len());
     }
 
     // Language sniff on the produced text.
@@ -534,7 +551,7 @@ pub fn parse(bytes: &[u8]) -> Result<ParsedPdf, PdfFailure> {
     // Per-page stats from the FINAL text state (post-OCR):
     // chars, ocr flag, and the trust of whichever engine
     // produced the text. Glyph pages without fusion data are
-    // ordinary text pages — trust 1.0.
+    // ordinary text pages : trust 1.0.
     let pages_meta = pages
         .iter()
         .map(|p| {

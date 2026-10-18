@@ -1,0 +1,1821 @@
+{
+ "meta": {
+  "label": "baseline-d5ff7f1",
+  "date": "2026-09-21 17:39:43",
+  "host": "Devoid",
+  "binary": {
+   "path": "/home/dondai/Projects/donsetch/target/ci/donsetch",
+   "sha256": "07d9cf672df373eb3961a60a2c96460629281e5c16395e18063821d4f4cff9ad",
+   "version_line": [
+    "DonSeTch 4.2.9",
+    "\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500",
+    "  binary     /home/dondai/Projects/donsetch/target/ci/donsetch",
+    "  target     x86_64-unknown-linux-gnu",
+    "  profile    chrome-151 (detected)",
+    "  features   ocr, rerank"
+   ]
+  },
+  "runs": 5,
+  "targets": [
+   {
+    "label": "example",
+    "url": "https://example.com/",
+    "tier": "auto"
+   },
+   {
+    "label": "hn",
+    "url": "https://news.ycombinator.com/",
+    "tier": "auto"
+   },
+   {
+    "label": "wikipedia",
+    "url": "https://en.wikipedia.org/wiki/Markdown",
+    "tier": "auto"
+   },
+   {
+    "label": "peet",
+    "url": "https://tls.peet.ws/api/all",
+    "tier": "auto"
+   },
+   {
+    "label": "mdn",
+    "url": "https://developer.mozilla.org/en-US/docs/Web/JavaScript",
+    "tier": "auto"
+   },
+   {
+    "label": "reddit",
+    "url": "https://www.reddit.com/r/rust/",
+    "tier": "auto"
+   },
+   {
+    "label": "reddit-t1",
+    "url": "https://www.reddit.com/r/rust/",
+    "tier": "1"
+   },
+   {
+    "label": "example-t2",
+    "url": "https://example.com/",
+    "tier": "2"
+   }
+  ],
+  "argv": [
+   "bench/fetch/latency.py",
+   "--binary",
+   "target/ci/donsetch",
+   "--mode",
+   "both",
+   "--runs",
+   "5",
+   "--label",
+   "baseline-d5ff7f1",
+   "--cli-cache-dir",
+   "target/perf/cache-cli",
+   "--cli-fresh",
+   "--out",
+   "bench/fetch/results/baseline-d5ff7f1.json"
+  ]
+ },
+ "runs": {
+  "mcp": {
+   "example": [
+    {
+     "ok": true,
+     "is_error": false,
+     "error_kind": null,
+     "chars": 140,
+     "content_ok": true,
+     "tier": "1",
+     "verdict": "ContentOk",
+     "status": 200,
+     "tokens_est": 35,
+     "elapsed_ms": 136,
+     "via": null,
+     "total_chars": 142,
+     "escalation": [
+      {
+       "action": "domain-profile",
+       "ms": 0,
+       "outcome": "cold",
+       "tier": "route"
+      },
+      {
+       "action": "http-fetch",
+       "ms": 115,
+       "outcome": "ContentOk status=200",
+       "tier": "1"
+      }
+     ],
+     "escalation_ms": 115,
+     "run": 0,
+     "wall_ms": 192.9
+    },
+    {
+     "ok": true,
+     "is_error": false,
+     "error_kind": null,
+     "chars": 140,
+     "content_ok": true,
+     "tier": "1",
+     "verdict": "ContentOk",
+     "status": 200,
+     "tokens_est": 35,
+     "elapsed_ms": 31,
+     "via": null,
+     "total_chars": 142,
+     "escalation": [
+      {
+       "action": "domain-profile",
+       "ms": 0,
+       "outcome": "cold",
+       "tier": "route"
+      },
+      {
+       "action": "http-fetch",
+       "ms": 14,
+       "outcome": "ContentOk status=200",
+       "tier": "1"
+      }
+     ],
+     "escalation_ms": 14,
+     "run": 1,
+     "wall_ms": 102.3
+    },
+    {
+     "ok": true,
+     "is_error": false,
+     "error_kind": null,
+     "chars": 140,
+     "content_ok": true,
+     "tier": "1",
+     "verdict": "ContentOk",
+     "status": 200,
+     "tokens_est": 35,
+     "elapsed_ms": 44,
+     "via": null,
+     "total_chars": 142,
+     "escalation": [
+      {
+       "action": "domain-profile",
+       "ms": 0,
+       "outcome": "cold",
+       "tier": "route"
+      },
+      {
+       "action": "http-fetch",
+       "ms": 14,
+       "outcome": "ContentOk status=200",
+       "tier": "1"
+      }
+     ],
+     "escalation_ms": 14,
+     "run": 2,
+     "wall_ms": 98.3
+    },
+    {
+     "ok": true,
+     "is_error": false,
+     "error_kind": null,
+     "chars": 140,
+     "content_ok": true,
+     "tier": "1",
+     "verdict": "ContentOk",
+     "status": 200,
+     "tokens_est": 35,
+     "elapsed_ms": 47,
+     "via": null,
+     "total_chars": 142,
+     "escalation": [
+      {
+       "action": "domain-profile",
+       "ms": 0,
+       "outcome": "cold",
+       "tier": "route"
+      },
+      {
+       "action": "http-fetch",
+       "ms": 14,
+       "outcome": "ContentOk status=200",
+       "tier": "1"
+      }
+     ],
+     "escalation_ms": 14,
+     "run": 3,
+     "wall_ms": 72.9
+    },
+    {
+     "ok": true,
+     "is_error": false,
+     "error_kind": null,
+     "chars": 140,
+     "content_ok": true,
+     "tier": "1",
+     "verdict": "ContentOk",
+     "status": 200,
+     "tokens_est": 35,
+     "elapsed_ms": 47,
+     "via": null,
+     "total_chars": 142,
+     "escalation": [
+      {
+       "action": "domain-profile",
+       "ms": 0,
+       "outcome": "cold",
+       "tier": "route"
+      },
+      {
+       "action": "http-fetch",
+       "ms": 15,
+       "outcome": "ContentOk status=200",
+       "tier": "1"
+      }
+     ],
+     "escalation_ms": 15,
+     "run": 4,
+     "wall_ms": 73.7
+    }
+   ],
+   "hn": [
+    {
+     "ok": true,
+     "is_error": false,
+     "error_kind": null,
+     "chars": 2288,
+     "content_ok": true,
+     "tier": "1",
+     "verdict": "ContentOk",
+     "status": 200,
+     "tokens_est": 558,
+     "elapsed_ms": 914,
+     "via": null,
+     "total_chars": 2233,
+     "escalation": [
+      {
+       "action": "domain-profile",
+       "ms": 0,
+       "outcome": "cold",
+       "tier": "route"
+      },
+      {
+       "action": "http-fetch",
+       "ms": 865,
+       "outcome": "ContentOk status=200",
+       "tier": "1"
+      }
+     ],
+     "escalation_ms": 865,
+     "run": 0,
+     "wall_ms": 942.4
+    },
+    {
+     "ok": true,
+     "is_error": false,
+     "error_kind": null,
+     "chars": 2226,
+     "content_ok": true,
+     "tier": "1",
+     "verdict": "ContentOk",
+     "status": 200,
+     "tokens_est": 558,
+     "elapsed_ms": 288,
+     "via": null,
+     "total_chars": 2233,
+     "escalation": [
+      {
+       "action": "domain-profile",
+       "ms": 0,
+       "outcome": "cold",
+       "tier": "route"
+      },
+      {
+       "action": "http-fetch",
+       "ms": 260,
+       "outcome": "ContentOk status=200",
+       "tier": "1"
+      }
+     ],
+     "escalation_ms": 260,
+     "run": 1,
+     "wall_ms": 331.0
+    },
+    {
+     "ok": true,
+     "is_error": false,
+     "error_kind": null,
+     "chars": 2226,
+     "content_ok": true,
+     "tier": "1",
+     "verdict": "ContentOk",
+     "status": 200,
+     "tokens_est": 558,
+     "elapsed_ms": 294,
+     "via": null,
+     "total_chars": 2233,
+     "escalation": [
+      {
+       "action": "domain-profile",
+       "ms": 0,
+       "outcome": "cold",
+       "tier": "route"
+      },
+      {
+       "action": "http-fetch",
+       "ms": 261,
+       "outcome": "ContentOk status=200",
+       "tier": "1"
+      }
+     ],
+     "escalation_ms": 261,
+     "run": 2,
+     "wall_ms": 360.9
+    },
+    {
+     "ok": true,
+     "is_error": false,
+     "error_kind": null,
+     "chars": 2226,
+     "content_ok": true,
+     "tier": "1",
+     "verdict": "ContentOk",
+     "status": 200,
+     "tokens_est": 558,
+     "elapsed_ms": 296,
+     "via": null,
+     "total_chars": 2233,
+     "escalation": [
+      {
+       "action": "domain-profile",
+       "ms": 0,
+       "outcome": "cold",
+       "tier": "route"
+      },
+      {
+       "action": "http-fetch",
+       "ms": 259,
+       "outcome": "ContentOk status=200",
+       "tier": "1"
+      }
+     ],
+     "escalation_ms": 259,
+     "run": 3,
+     "wall_ms": 345.8
+    },
+    {
+     "ok": true,
+     "is_error": false,
+     "error_kind": null,
+     "chars": 2226,
+     "content_ok": true,
+     "tier": "1",
+     "verdict": "ContentOk",
+     "status": 200,
+     "tokens_est": 558,
+     "elapsed_ms": 292,
+     "via": null,
+     "total_chars": 2233,
+     "escalation": [
+      {
+       "action": "domain-profile",
+       "ms": 0,
+       "outcome": "cold",
+       "tier": "route"
+      },
+      {
+       "action": "http-fetch",
+       "ms": 260,
+       "outcome": "ContentOk status=200",
+       "tier": "1"
+      }
+     ],
+     "escalation_ms": 260,
+     "run": 4,
+     "wall_ms": 336.4
+    }
+   ],
+   "wikipedia": [
+    {
+     "ok": true,
+     "is_error": false,
+     "error_kind": null,
+     "chars": 11714,
+     "content_ok": true,
+     "next_offset": 15053,
+     "tier": "1",
+     "verdict": "ContentOk",
+     "status": 200,
+     "tokens_est": 9841,
+     "elapsed_ms": 616,
+     "via": "adapter:wikipedia-infobox",
+     "total_chars": 39366,
+     "escalation": [
+      {
+       "action": "domain-profile",
+       "ms": 0,
+       "outcome": "cold",
+       "tier": "route"
+      },
+      {
+       "action": "http-fetch",
+       "ms": 522,
+       "outcome": "ContentOk status=200",
+       "tier": "1"
+      }
+     ],
+     "escalation_ms": 522,
+     "run": 0,
+     "wall_ms": 628.5
+    },
+    {
+     "ok": true,
+     "is_error": false,
+     "error_kind": null,
+     "chars": 11714,
+     "content_ok": true,
+     "next_offset": 15053,
+     "tier": "1",
+     "verdict": "ContentOk",
+     "status": 200,
+     "tokens_est": 9841,
+     "elapsed_ms": 542,
+     "via": "adapter:wikipedia-infobox",
+     "total_chars": 39366,
+     "escalation": [
+      {
+       "action": "domain-profile",
+       "ms": 0,
+       "outcome": "cold",
+       "tier": "route"
+      },
+      {
+       "action": "http-fetch",
+       "ms": 439,
+       "outcome": "ContentOk status=200",
+       "tier": "1"
+      }
+     ],
+     "escalation_ms": 439,
+     "run": 1,
+     "wall_ms": 557.1
+    },
+    {
+     "ok": true,
+     "is_error": false,
+     "error_kind": null,
+     "chars": 11714,
+     "content_ok": true,
+     "next_offset": 15053,
+     "tier": "1",
+     "verdict": "ContentOk",
+     "status": 200,
+     "tokens_est": 9841,
+     "elapsed_ms": 488,
+     "via": "adapter:wikipedia-infobox",
+     "total_chars": 39366,
+     "escalation": [
+      {
+       "action": "domain-profile",
+       "ms": 0,
+       "outcome": "cold",
+       "tier": "route"
+      },
+      {
+       "action": "http-fetch",
+       "ms": 432,
+       "outcome": "ContentOk status=200",
+       "tier": "1"
+      }
+     ],
+     "escalation_ms": 432,
+     "run": 2,
+     "wall_ms": 499.9
+    },
+    {
+     "ok": true,
+     "is_error": false,
+     "error_kind": null,
+     "chars": 11714,
+     "content_ok": true,
+     "next_offset": 15053,
+     "tier": "1",
+     "verdict": "ContentOk",
+     "status": 200,
+     "tokens_est": 9841,
+     "elapsed_ms": 556,
+     "via": "adapter:wikipedia-infobox",
+     "total_chars": 39366,
+     "escalation": [
+      {
+       "action": "domain-profile",
+       "ms": 0,
+       "outcome": "cold",
+       "tier": "route"
+      },
+      {
+       "action": "http-fetch",
+       "ms": 448,
+       "outcome": "ContentOk status=200",
+       "tier": "1"
+      }
+     ],
+     "escalation_ms": 448,
+     "run": 3,
+     "wall_ms": 578.8
+    },
+    {
+     "ok": true,
+     "is_error": false,
+     "error_kind": null,
+     "chars": 11714,
+     "content_ok": true,
+     "next_offset": 15053,
+     "tier": "1",
+     "verdict": "ContentOk",
+     "status": 200,
+     "tokens_est": 9841,
+     "elapsed_ms": 525,
+     "via": "adapter:wikipedia-infobox",
+     "total_chars": 39366,
+     "escalation": [
+      {
+       "action": "domain-profile",
+       "ms": 0,
+       "outcome": "cold",
+       "tier": "route"
+      },
+      {
+       "action": "http-fetch",
+       "ms": 426,
+       "outcome": "ContentOk status=200",
+       "tier": "1"
+      }
+     ],
+     "escalation_ms": 426,
+     "run": 4,
+     "wall_ms": 528.6
+    }
+   ],
+   "peet": [
+    {
+     "ok": true,
+     "is_error": false,
+     "error_kind": null,
+     "chars": 10572,
+     "content_ok": true,
+     "tier": "1",
+     "verdict": "ContentOk",
+     "status": 200,
+     "tokens_est": 2635,
+     "elapsed_ms": 1300,
+     "via": null,
+     "total_chars": 10543,
+     "escalation": [
+      {
+       "action": "domain-profile",
+       "ms": 0,
+       "outcome": "cold",
+       "tier": "route"
+      },
+      {
+       "action": "http-fetch",
+       "ms": 1261,
+       "outcome": "ContentOk status=200",
+       "tier": "1"
+      }
+     ],
+     "escalation_ms": 1261,
+     "run": 0,
+     "wall_ms": 1308.9
+    },
+    {
+     "ok": true,
+     "is_error": false,
+     "error_kind": null,
+     "chars": 10576,
+     "content_ok": true,
+     "tier": "1",
+     "verdict": "ContentOk",
+     "status": 200,
+     "tokens_est": 2636,
+     "elapsed_ms": 1068,
+     "via": null,
+     "total_chars": 10547,
+     "escalation": [
+      {
+       "action": "domain-profile",
+       "ms": 0,
+       "outcome": "cold",
+       "tier": "route"
+      },
+      {
+       "action": "http-fetch",
+       "ms": 1010,
+       "outcome": "ContentOk status=200",
+       "tier": "1"
+      }
+     ],
+     "escalation_ms": 1010,
+     "run": 1,
+     "wall_ms": 1074.8
+    },
+    {
+     "ok": true,
+     "is_error": false,
+     "error_kind": null,
+     "chars": 10618,
+     "content_ok": true,
+     "tier": "1",
+     "verdict": "ContentOk",
+     "status": 200,
+     "tokens_est": 2647,
+     "elapsed_ms": 1097,
+     "via": null,
+     "total_chars": 10589,
+     "escalation": [
+      {
+       "action": "domain-profile",
+       "ms": 0,
+       "outcome": "cold",
+       "tier": "route"
+      },
+      {
+       "action": "http-fetch",
+       "ms": 1079,
+       "outcome": "ContentOk status=200",
+       "tier": "1"
+      }
+     ],
+     "escalation_ms": 1079,
+     "run": 2,
+     "wall_ms": 1104.7
+    },
+    {
+     "ok": true,
+     "is_error": false,
+     "error_kind": null,
+     "chars": 10746,
+     "content_ok": true,
+     "tier": "1",
+     "verdict": "ContentOk",
+     "status": 200,
+     "tokens_est": 2679,
+     "elapsed_ms": 1093,
+     "via": null,
+     "total_chars": 10717,
+     "escalation": [
+      {
+       "action": "domain-profile",
+       "ms": 0,
+       "outcome": "cold",
+       "tier": "route"
+      },
+      {
+       "action": "http-fetch",
+       "ms": 1080,
+       "outcome": "ContentOk status=200",
+       "tier": "1"
+      }
+     ],
+     "escalation_ms": 1080,
+     "run": 3,
+     "wall_ms": 1099.2
+    },
+    {
+     "ok": true,
+     "is_error": false,
+     "error_kind": null,
+     "chars": 10742,
+     "content_ok": true,
+     "tier": "1",
+     "verdict": "ContentOk",
+     "status": 200,
+     "tokens_est": 2678,
+     "elapsed_ms": 1073,
+     "via": null,
+     "total_chars": 10713,
+     "escalation": [
+      {
+       "action": "domain-profile",
+       "ms": 0,
+       "outcome": "cold",
+       "tier": "route"
+      },
+      {
+       "action": "http-fetch",
+       "ms": 1047,
+       "outcome": "ContentOk status=200",
+       "tier": "1"
+      }
+     ],
+     "escalation_ms": 1047,
+     "run": 4,
+     "wall_ms": 1078.3
+    }
+   ],
+   "mdn": [
+    {
+     "ok": true,
+     "is_error": false,
+     "error_kind": null,
+     "chars": 6494,
+     "content_ok": true,
+     "tier": "1",
+     "verdict": "ContentOk",
+     "status": 200,
+     "tokens_est": 1625,
+     "elapsed_ms": 343,
+     "via": null,
+     "total_chars": 6500,
+     "escalation": [
+      {
+       "action": "domain-profile",
+       "ms": 0,
+       "outcome": "cold",
+       "tier": "route"
+      },
+      {
+       "action": "http-fetch",
+       "ms": 298,
+       "outcome": "ContentOk status=200",
+       "tier": "1"
+      }
+     ],
+     "escalation_ms": 298,
+     "run": 0,
+     "wall_ms": 366.8
+    },
+    {
+     "ok": true,
+     "is_error": false,
+     "error_kind": null,
+     "chars": 6494,
+     "content_ok": true,
+     "tier": "1",
+     "verdict": "ContentOk",
+     "status": 200,
+     "tokens_est": 1625,
+     "elapsed_ms": 97,
+     "via": null,
+     "total_chars": 6500,
+     "escalation": [
+      {
+       "action": "domain-profile",
+       "ms": 0,
+       "outcome": "cold",
+       "tier": "route"
+      },
+      {
+       "action": "http-fetch",
+       "ms": 68,
+       "outcome": "ContentOk status=200",
+       "tier": "1"
+      }
+     ],
+     "escalation_ms": 68,
+     "run": 1,
+     "wall_ms": 117.9
+    },
+    {
+     "ok": true,
+     "is_error": false,
+     "error_kind": null,
+     "chars": 6494,
+     "content_ok": true,
+     "tier": "1",
+     "verdict": "ContentOk",
+     "status": 200,
+     "tokens_est": 1625,
+     "elapsed_ms": 116,
+     "via": null,
+     "total_chars": 6500,
+     "escalation": [
+      {
+       "action": "domain-profile",
+       "ms": 0,
+       "outcome": "cold",
+       "tier": "route"
+      },
+      {
+       "action": "http-fetch",
+       "ms": 67,
+       "outcome": "ContentOk status=200",
+       "tier": "1"
+      }
+     ],
+     "escalation_ms": 67,
+     "run": 2,
+     "wall_ms": 182.2
+    },
+    {
+     "ok": true,
+     "is_error": false,
+     "error_kind": null,
+     "chars": 6494,
+     "content_ok": true,
+     "tier": "1",
+     "verdict": "ContentOk",
+     "status": 200,
+     "tokens_est": 1625,
+     "elapsed_ms": 110,
+     "via": null,
+     "total_chars": 6500,
+     "escalation": [
+      {
+       "action": "domain-profile",
+       "ms": 0,
+       "outcome": "cold",
+       "tier": "route"
+      },
+      {
+       "action": "http-fetch",
+       "ms": 67,
+       "outcome": "ContentOk status=200",
+       "tier": "1"
+      }
+     ],
+     "escalation_ms": 67,
+     "run": 3,
+     "wall_ms": 143.3
+    },
+    {
+     "ok": true,
+     "is_error": false,
+     "error_kind": null,
+     "chars": 6494,
+     "content_ok": true,
+     "tier": "1",
+     "verdict": "ContentOk",
+     "status": 200,
+     "tokens_est": 1625,
+     "elapsed_ms": 111,
+     "via": null,
+     "total_chars": 6500,
+     "escalation": [
+      {
+       "action": "domain-profile",
+       "ms": 0,
+       "outcome": "cold",
+       "tier": "route"
+      },
+      {
+       "action": "http-fetch",
+       "ms": 69,
+       "outcome": "ContentOk status=200",
+       "tier": "1"
+      }
+     ],
+     "escalation_ms": 69,
+     "run": 4,
+     "wall_ms": 174.6
+    }
+   ],
+   "reddit": [
+    {
+     "ok": true,
+     "is_error": false,
+     "error_kind": null,
+     "chars": 6052,
+     "content_ok": true,
+     "tier": "1",
+     "verdict": "ContentOk",
+     "status": 200,
+     "tokens_est": 1519,
+     "elapsed_ms": 1434,
+     "via": null,
+     "total_chars": 6079,
+     "escalation": [
+      {
+       "action": "domain-profile",
+       "ms": 0,
+       "outcome": "cold",
+       "tier": "route"
+      },
+      {
+       "action": "http-fetch",
+       "ms": 1344,
+       "outcome": "ContentOk status=200",
+       "tier": "1"
+      }
+     ],
+     "escalation_ms": 1344,
+     "run": 0,
+     "wall_ms": 2632.6
+    },
+    {
+     "ok": true,
+     "is_error": false,
+     "error_kind": null,
+     "chars": 6052,
+     "content_ok": true,
+     "tier": "1",
+     "verdict": "ContentOk",
+     "status": 200,
+     "tokens_est": 1519,
+     "elapsed_ms": 1302,
+     "via": null,
+     "total_chars": 6079,
+     "escalation": [
+      {
+       "action": "domain-profile",
+       "ms": 0,
+       "outcome": "cold",
+       "tier": "route"
+      },
+      {
+       "action": "http-fetch",
+       "ms": 1238,
+       "outcome": "ContentOk status=200",
+       "tier": "1"
+      }
+     ],
+     "escalation_ms": 1238,
+     "run": 1,
+     "wall_ms": 2243.3
+    },
+    {
+     "ok": true,
+     "is_error": false,
+     "error_kind": null,
+     "chars": 6072,
+     "content_ok": true,
+     "tier": "1",
+     "verdict": "ContentOk",
+     "status": 200,
+     "tokens_est": 1524,
+     "elapsed_ms": 1343,
+     "via": null,
+     "total_chars": 6099,
+     "escalation": [
+      {
+       "action": "domain-profile",
+       "ms": 0,
+       "outcome": "cold",
+       "tier": "route"
+      },
+      {
+       "action": "http-fetch",
+       "ms": 1267,
+       "outcome": "ContentOk status=200",
+       "tier": "1"
+      }
+     ],
+     "escalation_ms": 1267,
+     "run": 2,
+     "wall_ms": 2297.4
+    },
+    {
+     "ok": true,
+     "is_error": false,
+     "error_kind": null,
+     "chars": 6029,
+     "content_ok": true,
+     "tier": "1",
+     "verdict": "ContentOk",
+     "status": 200,
+     "tokens_est": 1514,
+     "elapsed_ms": 1367,
+     "via": null,
+     "total_chars": 6056,
+     "escalation": [
+      {
+       "action": "domain-profile",
+       "ms": 0,
+       "outcome": "cold",
+       "tier": "route"
+      },
+      {
+       "action": "http-fetch",
+       "ms": 1208,
+       "outcome": "ContentOk status=200",
+       "tier": "1"
+      }
+     ],
+     "escalation_ms": 1208,
+     "run": 3,
+     "wall_ms": 2316.0
+    },
+    {
+     "ok": true,
+     "is_error": false,
+     "error_kind": null,
+     "chars": 6052,
+     "content_ok": true,
+     "tier": "1",
+     "verdict": "ContentOk",
+     "status": 200,
+     "tokens_est": 1519,
+     "elapsed_ms": 1320,
+     "via": null,
+     "total_chars": 6079,
+     "escalation": [
+      {
+       "action": "domain-profile",
+       "ms": 0,
+       "outcome": "cold",
+       "tier": "route"
+      },
+      {
+       "action": "http-fetch",
+       "ms": 1213,
+       "outcome": "ContentOk status=200",
+       "tier": "1"
+      }
+     ],
+     "escalation_ms": 1213,
+     "run": 4,
+     "wall_ms": 2294.4
+    }
+   ],
+   "reddit-t1": [
+    {
+     "ok": true,
+     "is_error": false,
+     "error_kind": null,
+     "chars": 6145,
+     "content_ok": true,
+     "tier": "1",
+     "verdict": "ContentOk",
+     "status": 200,
+     "tokens_est": 1544,
+     "elapsed_ms": 1023,
+     "via": null,
+     "total_chars": 6176,
+     "escalation": [
+      {
+       "action": "domain-profile",
+       "ms": 0,
+       "outcome": "cold",
+       "tier": "route"
+      },
+      {
+       "action": "http-fetch",
+       "ms": 937,
+       "outcome": "ContentOk status=200",
+       "tier": "1"
+      }
+     ],
+     "escalation_ms": 937,
+     "run": 0,
+     "wall_ms": 2798.4
+    },
+    {
+     "ok": true,
+     "is_error": false,
+     "error_kind": null,
+     "chars": 6052,
+     "content_ok": true,
+     "tier": "1",
+     "verdict": "ContentOk",
+     "status": 200,
+     "tokens_est": 1519,
+     "elapsed_ms": 2426,
+     "via": null,
+     "total_chars": 6079,
+     "escalation": [
+      {
+       "action": "domain-profile",
+       "ms": 0,
+       "outcome": "cold",
+       "tier": "route"
+      },
+      {
+       "action": "http-fetch",
+       "ms": 2287,
+       "outcome": "ContentOk status=200",
+       "tier": "1"
+      }
+     ],
+     "escalation_ms": 2287,
+     "run": 1,
+     "wall_ms": 2880.0
+    },
+    {
+     "ok": true,
+     "is_error": false,
+     "error_kind": null,
+     "chars": 6072,
+     "content_ok": true,
+     "tier": "1",
+     "verdict": "ContentOk",
+     "status": 200,
+     "tokens_est": 1524,
+     "elapsed_ms": 1346,
+     "via": null,
+     "total_chars": 6099,
+     "escalation": [
+      {
+       "action": "domain-profile",
+       "ms": 0,
+       "outcome": "cold",
+       "tier": "route"
+      },
+      {
+       "action": "http-fetch",
+       "ms": 1212,
+       "outcome": "ContentOk status=200",
+       "tier": "1"
+      }
+     ],
+     "escalation_ms": 1212,
+     "run": 2,
+     "wall_ms": 2347.9
+    },
+    {
+     "ok": true,
+     "is_error": false,
+     "error_kind": null,
+     "chars": 6072,
+     "content_ok": true,
+     "tier": "1",
+     "verdict": "ContentOk",
+     "status": 200,
+     "tokens_est": 1524,
+     "elapsed_ms": 1291,
+     "via": null,
+     "total_chars": 6099,
+     "escalation": [
+      {
+       "action": "domain-profile",
+       "ms": 0,
+       "outcome": "cold",
+       "tier": "route"
+      },
+      {
+       "action": "http-fetch",
+       "ms": 1159,
+       "outcome": "ContentOk status=200",
+       "tier": "1"
+      }
+     ],
+     "escalation_ms": 1159,
+     "run": 3,
+     "wall_ms": 1743.3
+    },
+    {
+     "ok": true,
+     "is_error": false,
+     "error_kind": null,
+     "chars": 6052,
+     "content_ok": true,
+     "tier": "1",
+     "verdict": "ContentOk",
+     "status": 200,
+     "tokens_est": 1519,
+     "elapsed_ms": 979,
+     "via": null,
+     "total_chars": 6079,
+     "escalation": [
+      {
+       "action": "domain-profile",
+       "ms": 0,
+       "outcome": "cold",
+       "tier": "route"
+      },
+      {
+       "action": "http-fetch",
+       "ms": 844,
+       "outcome": "ContentOk status=200",
+       "tier": "1"
+      }
+     ],
+     "escalation_ms": 844,
+     "run": 4,
+     "wall_ms": 1452.5
+    }
+   ],
+   "example-t2": [
+    {
+     "ok": true,
+     "is_error": false,
+     "error_kind": null,
+     "chars": 140,
+     "content_ok": true,
+     "tier": "1+ghost-solve",
+     "verdict": "ContentOk",
+     "status": 200,
+     "tokens_est": 35,
+     "elapsed_ms": 11002,
+     "via": null,
+     "total_chars": 142,
+     "escalation": [
+      {
+       "action": "domain-profile",
+       "ms": 0,
+       "outcome": "skip-to-solve",
+       "tier": "route"
+      },
+      {
+       "action": "browser-launch",
+       "ms": 4889,
+       "outcome": "ok",
+       "tier": "2"
+      },
+      {
+       "action": "ghost-render",
+       "ms": 4350,
+       "outcome": "captcha=false dom=0KB",
+       "tier": "2"
+      },
+      {
+       "action": "http-retry-with-ghost-cookies",
+       "ms": 1644,
+       "outcome": "cookies=673 status=200",
+       "tier": "1"
+      }
+     ],
+     "escalation_ms": 10883,
+     "run": 0,
+     "wall_ms": 11124.4
+    },
+    {
+     "ok": true,
+     "is_error": false,
+     "error_kind": null,
+     "chars": 140,
+     "content_ok": true,
+     "tier": "1+ghost-solve",
+     "verdict": "ContentOk",
+     "status": 200,
+     "tokens_est": 35,
+     "elapsed_ms": 7927,
+     "via": null,
+     "total_chars": 142,
+     "escalation": [
+      {
+       "action": "domain-profile",
+       "ms": 0,
+       "outcome": "skip-to-solve",
+       "tier": "route"
+      },
+      {
+       "action": "browser-launch",
+       "ms": 3252,
+       "outcome": "ok",
+       "tier": "2"
+      },
+      {
+       "action": "ghost-render",
+       "ms": 4337,
+       "outcome": "captcha=false dom=0KB",
+       "tier": "2"
+      },
+      {
+       "action": "http-retry-with-ghost-cookies",
+       "ms": 278,
+       "outcome": "cookies=673 status=200",
+       "tier": "1"
+      }
+     ],
+     "escalation_ms": 7867,
+     "run": 1,
+     "wall_ms": 7984.9
+    },
+    {
+     "ok": true,
+     "is_error": false,
+     "error_kind": null,
+     "chars": 140,
+     "content_ok": true,
+     "tier": "1+ghost-solve",
+     "verdict": "ContentOk",
+     "status": 200,
+     "tokens_est": 35,
+     "elapsed_ms": 4661,
+     "via": null,
+     "total_chars": 142,
+     "escalation": [
+      {
+       "action": "domain-profile",
+       "ms": 0,
+       "outcome": "skip-to-solve",
+       "tier": "route"
+      },
+      {
+       "action": "browser-launch",
+       "ms": 9,
+       "outcome": "ok",
+       "tier": "2"
+      },
+      {
+       "action": "ghost-render",
+       "ms": 4324,
+       "outcome": "captcha=false dom=0KB",
+       "tier": "2"
+      },
+      {
+       "action": "http-retry-with-ghost-cookies",
+       "ms": 279,
+       "outcome": "cookies=673 status=200",
+       "tier": "1"
+      }
+     ],
+     "escalation_ms": 4612,
+     "run": 2,
+     "wall_ms": 4733.0
+    },
+    {
+     "ok": true,
+     "is_error": false,
+     "error_kind": null,
+     "chars": 140,
+     "content_ok": true,
+     "tier": "1+ghost-solve",
+     "verdict": "ContentOk",
+     "status": 200,
+     "tokens_est": 35,
+     "elapsed_ms": 4698,
+     "via": null,
+     "total_chars": 142,
+     "escalation": [
+      {
+       "action": "domain-profile",
+       "ms": 0,
+       "outcome": "skip-to-solve",
+       "tier": "route"
+      },
+      {
+       "action": "browser-launch",
+       "ms": 10,
+       "outcome": "ok",
+       "tier": "2"
+      },
+      {
+       "action": "ghost-render",
+       "ms": 4321,
+       "outcome": "captcha=false dom=0KB",
+       "tier": "2"
+      },
+      {
+       "action": "http-retry-with-ghost-cookies",
+       "ms": 278,
+       "outcome": "cookies=673 status=200",
+       "tier": "1"
+      }
+     ],
+     "escalation_ms": 4609,
+     "run": 3,
+     "wall_ms": 4781.5
+    },
+    {
+     "ok": true,
+     "is_error": false,
+     "error_kind": null,
+     "chars": 140,
+     "content_ok": true,
+     "tier": "1+ghost-solve",
+     "verdict": "ContentOk",
+     "status": 200,
+     "tokens_est": 35,
+     "elapsed_ms": 4738,
+     "via": null,
+     "total_chars": 142,
+     "escalation": [
+      {
+       "action": "domain-profile",
+       "ms": 0,
+       "outcome": "skip-to-solve",
+       "tier": "route"
+      },
+      {
+       "action": "browser-launch",
+       "ms": 21,
+       "outcome": "ok",
+       "tier": "2"
+      },
+      {
+       "action": "ghost-render",
+       "ms": 4334,
+       "outcome": "captcha=false dom=0KB",
+       "tier": "2"
+      },
+      {
+       "action": "http-retry-with-ghost-cookies",
+       "ms": 279,
+       "outcome": "cookies=673 status=200",
+       "tier": "1"
+      }
+     ],
+     "escalation_ms": 4634,
+     "run": 4,
+     "wall_ms": 4758.3
+    }
+   ]
+  },
+  "cli": {
+   "example": [
+    {
+     "ok": true,
+     "chars": 140,
+     "tokens_est": 35,
+     "tier": "1",
+     "verdict": "ContentOk",
+     "exit": 0,
+     "run": 0,
+     "wall_ms": 476.7
+    },
+    {
+     "ok": true,
+     "chars": 140,
+     "tokens_est": 35,
+     "tier": "1",
+     "verdict": "ContentOk",
+     "exit": 0,
+     "run": 1,
+     "wall_ms": 347.8
+    },
+    {
+     "ok": true,
+     "chars": 140,
+     "tokens_est": 35,
+     "tier": "1",
+     "verdict": "ContentOk",
+     "exit": 0,
+     "run": 2,
+     "wall_ms": 332.1
+    },
+    {
+     "ok": true,
+     "chars": 140,
+     "tokens_est": 35,
+     "tier": "1",
+     "verdict": "ContentOk",
+     "exit": 0,
+     "run": 3,
+     "wall_ms": 316.0
+    },
+    {
+     "ok": true,
+     "chars": 140,
+     "tokens_est": 35,
+     "tier": "1",
+     "verdict": "ContentOk",
+     "exit": 0,
+     "run": 4,
+     "wall_ms": 341.6
+    }
+   ],
+   "hn": [
+    {
+     "ok": true,
+     "chars": 2273,
+     "tokens_est": 568,
+     "tier": "1",
+     "verdict": "ContentOk",
+     "exit": 0,
+     "run": 0,
+     "wall_ms": 1061.7
+    },
+    {
+     "ok": true,
+     "chars": 2273,
+     "tokens_est": 568,
+     "tier": "1",
+     "verdict": "ContentOk",
+     "exit": 0,
+     "run": 1,
+     "wall_ms": 1746.7
+    },
+    {
+     "ok": true,
+     "chars": 2273,
+     "tokens_est": 568,
+     "tier": "1",
+     "verdict": "ContentOk",
+     "exit": 0,
+     "run": 2,
+     "wall_ms": 966.6
+    },
+    {
+     "ok": true,
+     "chars": 2273,
+     "tokens_est": 568,
+     "tier": "1",
+     "verdict": "ContentOk",
+     "exit": 0,
+     "run": 3,
+     "wall_ms": 1003.5
+    },
+    {
+     "ok": true,
+     "chars": 2273,
+     "tokens_est": 568,
+     "tier": "1",
+     "verdict": "ContentOk",
+     "exit": 0,
+     "run": 4,
+     "wall_ms": 1030.9
+    }
+   ],
+   "wikipedia": [
+    {
+     "ok": true,
+     "chars": 11725,
+     "tokens_est": 9841,
+     "tier": "1",
+     "verdict": "next_offset 15053",
+     "exit": 0,
+     "run": 0,
+     "wall_ms": 621.0
+    },
+    {
+     "ok": true,
+     "chars": 11725,
+     "tokens_est": 9841,
+     "tier": "1",
+     "verdict": "next_offset 15053",
+     "exit": 0,
+     "run": 1,
+     "wall_ms": 624.4
+    },
+    {
+     "ok": true,
+     "chars": 11725,
+     "tokens_est": 9841,
+     "tier": "1",
+     "verdict": "next_offset 15053",
+     "exit": 0,
+     "run": 2,
+     "wall_ms": 943.8
+    },
+    {
+     "ok": true,
+     "chars": 11725,
+     "tokens_est": 9841,
+     "tier": "1",
+     "verdict": "next_offset 15053",
+     "exit": 0,
+     "run": 3,
+     "wall_ms": 700.2
+    },
+    {
+     "ok": true,
+     "chars": 11725,
+     "tokens_est": 9841,
+     "tier": "1",
+     "verdict": "next_offset 15053",
+     "exit": 0,
+     "run": 4,
+     "wall_ms": 755.9
+    }
+   ],
+   "peet": [
+    {
+     "ok": true,
+     "chars": 10657,
+     "tokens_est": 2657,
+     "tier": "1",
+     "verdict": "ContentOk",
+     "exit": 0,
+     "run": 0,
+     "wall_ms": 1285.8
+    },
+    {
+     "ok": true,
+     "chars": 10525,
+     "tokens_est": 2624,
+     "tier": "1",
+     "verdict": "ContentOk",
+     "exit": 0,
+     "run": 1,
+     "wall_ms": 1651.1
+    },
+    {
+     "ok": true,
+     "chars": 10591,
+     "tokens_est": 2640,
+     "tier": "1",
+     "verdict": "ContentOk",
+     "exit": 0,
+     "run": 2,
+     "wall_ms": 1262.6
+    },
+    {
+     "ok": true,
+     "chars": 10525,
+     "tokens_est": 2624,
+     "tier": "1",
+     "verdict": "ContentOk",
+     "exit": 0,
+     "run": 3,
+     "wall_ms": 1266.9
+    },
+    {
+     "ok": true,
+     "chars": 10657,
+     "tokens_est": 2657,
+     "tier": "1",
+     "verdict": "ContentOk",
+     "exit": 0,
+     "run": 4,
+     "wall_ms": 1225.9
+    }
+   ],
+   "mdn": [
+    {
+     "ok": true,
+     "chars": 6500,
+     "tokens_est": 1625,
+     "tier": "1",
+     "verdict": "ContentOk",
+     "exit": 0,
+     "run": 0,
+     "wall_ms": 362.7
+    },
+    {
+     "ok": true,
+     "chars": 6500,
+     "tokens_est": 1625,
+     "tier": "1",
+     "verdict": "ContentOk",
+     "exit": 0,
+     "run": 1,
+     "wall_ms": 388.5
+    },
+    {
+     "ok": true,
+     "chars": 6500,
+     "tokens_est": 1625,
+     "tier": "1",
+     "verdict": "ContentOk",
+     "exit": 0,
+     "run": 2,
+     "wall_ms": 388.3
+    },
+    {
+     "ok": true,
+     "chars": 6500,
+     "tokens_est": 1625,
+     "tier": "1",
+     "verdict": "ContentOk",
+     "exit": 0,
+     "run": 3,
+     "wall_ms": 420.7
+    },
+    {
+     "ok": true,
+     "chars": 6500,
+     "tokens_est": 1625,
+     "tier": "1",
+     "verdict": "ContentOk",
+     "exit": 0,
+     "run": 4,
+     "wall_ms": 367.2
+    }
+   ],
+   "reddit": [
+    {
+     "ok": true,
+     "chars": 6997,
+     "tokens_est": 1749,
+     "tier": "1",
+     "verdict": "ContentOk",
+     "exit": 0,
+     "run": 0,
+     "wall_ms": 3594.9
+    },
+    {
+     "ok": true,
+     "chars": 6078,
+     "tokens_est": 1519,
+     "tier": "1",
+     "verdict": "ContentOk",
+     "exit": 0,
+     "run": 1,
+     "wall_ms": 2867.8
+    },
+    {
+     "ok": true,
+     "chars": 6078,
+     "tokens_est": 1519,
+     "tier": "1",
+     "verdict": "ContentOk",
+     "exit": 0,
+     "run": 2,
+     "wall_ms": 2205.1
+    },
+    {
+     "ok": true,
+     "chars": 6098,
+     "tokens_est": 1524,
+     "tier": "1",
+     "verdict": "ContentOk",
+     "exit": 0,
+     "run": 3,
+     "wall_ms": 2964.8
+    },
+    {
+     "ok": true,
+     "chars": 6098,
+     "tokens_est": 1524,
+     "tier": "1",
+     "verdict": "ContentOk",
+     "exit": 0,
+     "run": 4,
+     "wall_ms": 2720.2
+    }
+   ],
+   "reddit-t1": [
+    {
+     "ok": true,
+     "chars": 6078,
+     "tokens_est": 1519,
+     "tier": "1",
+     "verdict": "ContentOk",
+     "exit": 0,
+     "run": 0,
+     "wall_ms": 2245.0
+    },
+    {
+     "ok": true,
+     "chars": 6078,
+     "tokens_est": 1519,
+     "tier": "1",
+     "verdict": "ContentOk",
+     "exit": 0,
+     "run": 1,
+     "wall_ms": 1954.6
+    },
+    {
+     "ok": true,
+     "chars": 6098,
+     "tokens_est": 1524,
+     "tier": "1",
+     "verdict": "ContentOk",
+     "exit": 0,
+     "run": 2,
+     "wall_ms": 2513.3
+    },
+    {
+     "ok": true,
+     "chars": 6098,
+     "tokens_est": 1524,
+     "tier": "1",
+     "verdict": "ContentOk",
+     "exit": 0,
+     "run": 3,
+     "wall_ms": 3024.1
+    },
+    {
+     "ok": true,
+     "chars": 6078,
+     "tokens_est": 1519,
+     "tier": "1",
+     "verdict": "ContentOk",
+     "exit": 0,
+     "run": 4,
+     "wall_ms": 3133.0
+    }
+   ],
+   "example-t2": [
+    {
+     "ok": true,
+     "chars": 140,
+     "tokens_est": 35,
+     "tier": "ghost-dom",
+     "verdict": "ContentOk",
+     "exit": 0,
+     "run": 0,
+     "wall_ms": 5780.8
+    },
+    {
+     "ok": true,
+     "chars": 140,
+     "tokens_est": 35,
+     "tier": "ghost-dom",
+     "verdict": "ContentOk",
+     "exit": 0,
+     "run": 1,
+     "wall_ms": 5444.6
+    },
+    {
+     "ok": true,
+     "chars": 140,
+     "tokens_est": 35,
+     "tier": "ghost-dom",
+     "verdict": "ContentOk",
+     "exit": 0,
+     "run": 2,
+     "wall_ms": 5454.7
+    },
+    {
+     "ok": true,
+     "chars": 140,
+     "tokens_est": 35,
+     "tier": "ghost-dom",
+     "verdict": "ContentOk",
+     "exit": 0,
+     "run": 3,
+     "wall_ms": 5709.1
+    },
+    {
+     "ok": true,
+     "chars": 140,
+     "tokens_est": 35,
+     "tier": "ghost-dom",
+     "verdict": "ContentOk",
+     "exit": 0,
+     "run": 4,
+     "wall_ms": 5984.0
+    }
+   ]
+  }
+ }
+}
